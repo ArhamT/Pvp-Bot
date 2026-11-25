@@ -140,6 +140,8 @@ class PvPBotController {
     this.loginAttempted = false;
     this.loginSentAt = 0;
     this.loginFallbackTimer = null;
+    this.duelsLoginJoinTimer = null;
+    this.duelsLoginJoinDone = false;
     this.duelsRejoinTimer = null;
     this.lastDuelsRejoinSentAt = 0;
     this.duelAcceptTimer = null;
@@ -221,6 +223,7 @@ class PvPBotController {
     this.initializedOnSpawn = false;
     this.loginAttempted = false;
     this.loginSentAt = 0;
+    this.duelsLoginJoinDone = false;
 
     bot.on('spawn', () => {
       this.reconnectDelayMs = this.config.bot.reconnect.initialDelayMs || 5000;
@@ -268,11 +271,16 @@ class PvPBotController {
               this._sendLoginCommand('login', 'spawn fallback');
             }
           }, 3000);
+        } else {
+          // Proxy / auto-login hub with no password prompt: auto-join /server duels after proxy settle delay
+          this._scheduleDuelsLoginJoin('initial spawn');
         }
       } else {
         // Backend server transfer (e.g. /server duels) or arena teleport:
         // Stay quiet in IDLE so locked lobby GUI items never trigger packet-rate kicks,
         // and never attack players in spawn after a duel ends.
+        this.duelsLoginJoinDone = true;
+        this._clearDuelsLoginJoinTimer('server/world switch');
         this.log(`Switched world/server — spawned at ${bot.entity.position.floored()}.`);
         this.activeTargetName = null;
         this.activeTargetEntityId = null;
@@ -381,6 +389,7 @@ class PvPBotController {
       this.log(`Disconnected (${reason || 'unknown'}).`);
       this._stopTickLoop();
       this._clearLoginFallbackTimer();
+      this._clearDuelsLoginJoinTimer('disconnected');
       this._clearDuelsRejoinTimer('disconnected');
       this._clearDuelAcceptTimer();
       this._clearAdvertiseTimer();
@@ -400,6 +409,47 @@ class PvPBotController {
       clearTimeout(this.loginFallbackTimer);
       this.loginFallbackTimer = null;
     }
+  }
+
+  _clearDuelsLoginJoinTimer(reason = '') {
+    if (this.duelsLoginJoinTimer) {
+      clearTimeout(this.duelsLoginJoinTimer);
+      this.duelsLoginJoinTimer = null;
+      if (reason) {
+        this.log(`[DUELS] Cancelled auto-join /server timer (${reason}).`);
+      }
+    }
+  }
+
+  /**
+   * Automatically transfers from the proxy hub to /server duels after logging in
+   * (waiting duelsLoginJoinDelayMs, default 15s, so chunk loading & handshake complete cleanly).
+   */
+  _scheduleDuelsLoginJoin(reason = 'login') {
+    const botCfg = this.config.bot || {};
+    if (botCfg.autoJoinDuelsOnLogin === false) return false;
+    if (this.shuttingDown || !this.bot || this.duelsLoginJoinDone || this.duelsLoginJoinTimer) {
+      return false;
+    }
+
+    const duelsServer = (botCfg.duelsServerName || 'duels').trim() || 'duels';
+    const configuredDelay = Number(botCfg.duelsLoginJoinDelayMs);
+    const delayMs = Number.isFinite(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : 15000;
+
+    this.log(`[DUELS] Auto-joining /server ${duelsServer} in ${(delayMs / 1000).toFixed(1)}s (${reason}).`);
+    this.duelsLoginJoinTimer = setTimeout(() => {
+      this.duelsLoginJoinTimer = null;
+      if (this.shuttingDown || !this.bot || this.duelsLoginJoinDone) return;
+
+      this.duelsLoginJoinDone = true;
+      const cmd = `/server ${duelsServer}`;
+      this.lastDuelsRejoinSentAt = Date.now();
+      this.bot.chat(cmd);
+      this.log(`[DUELS] Auto-joined ${cmd} after proxy login.`);
+    }, delayMs);
+    return true;
   }
 
   _clearDuelsRejoinTimer(reason = '') {
@@ -432,11 +482,11 @@ class PvPBotController {
       this.bot.chat(`/login ${this.loginPassword}`);
       this.log(`[AUTH] Sent /login ********${reason ? ` (${reason})` : ''}`);
     }
+    this._scheduleDuelsLoginJoin(mode);
     return true;
   }
 
   _handleServerAuthPrompt(text) {
-    if (!this.loginPassword) return;
     const lower = text.toLowerCase();
 
     if (
@@ -447,10 +497,11 @@ class PvPBotController {
     ) {
       this.loginAttempted = true;
       this._clearLoginFallbackTimer();
+      this._scheduleDuelsLoginJoin('authenticated');
       return;
     }
 
-    if (this.loginAttempted) return;
+    if (!this.loginPassword || this.loginAttempted) return;
 
     if (lower.includes('/register') || lower.includes('please register')) {
       this._clearLoginFallbackTimer();
@@ -516,6 +567,8 @@ class PvPBotController {
       )
     ) {
       this._clearDuelsRejoinTimer(`already on ${duelsServer}`);
+      this.duelsLoginJoinDone = true;
+      this._clearDuelsLoginJoinTimer(`already on ${duelsServer}`);
       return false;
     }
 
@@ -956,6 +1009,8 @@ class PvPBotController {
     }
 
     if (/^\/server(?:\s|$)/i.test(line)) {
+      this.duelsLoginJoinDone = true;
+      this._clearDuelsLoginJoinTimer('manual /server command');
       this._clearDuelsRejoinTimer('manual /server command');
       if (line.toLowerCase().startsWith('/server ') && this.loginSentAt > 0) {
         const sinceLoginMs = Date.now() - this.loginSentAt;
@@ -1230,6 +1285,7 @@ class PvPBotController {
   _clearTimers() {
     this._stopTickLoop();
     this._clearLoginFallbackTimer();
+    this._clearDuelsLoginJoinTimer();
     this._clearDuelsRejoinTimer();
     this._clearDuelAcceptTimer();
     this._clearAdvertiseTimer();
@@ -1292,7 +1348,11 @@ class PvPBotController {
     }
     this.lastAdvertiseIndex = idx;
 
-    const text = messages[idx].replace(/\{name\}/g, this.bot.username || 'me');
+    let text = messages[idx].replace(/\{name\}/g, this.bot.username || 'me').trim();
+    const colorPrefix = typeof advCfg.colorPrefix === 'string' ? advCfg.colorPrefix : '&b';
+    if (colorPrefix && !/^&[0-9a-fk-orx]/i.test(text)) {
+      text = `${colorPrefix}${text}`;
+    }
     this.bot.chat(text);
     this.log(`[ADS] ${text}`);
     return true;

@@ -14,6 +14,8 @@
     "autoStartDuel": true,
     "autoAcceptDuels": true,
     "duelAcceptDelayMs": 750,
+    "autoJoinDuelsOnLogin": true,
+    "duelsLoginJoinDelayMs": 15000,
     "autoRejoinDuels": true,
     "duelsServerName": "duels",
     "duelsRejoinDelayMs": 15000,
@@ -25,16 +27,17 @@
     "roamPauseMaxMs": 4800,
     "advertise": {
       "enabled": true,
+      "colorPrefix": "&b",
       "minDelayMs": 10000,
       "maxDelayMs": 30000,
       "messages": [
-        "I'm a PvP bot - think you can beat me? Send me a duel!",
-        "Bored? Duel me! I'm a bot and I accept every challenge.",
-        "Beep boop, I'm a bot. Type /duel {name} if you're brave enough.",
-        "Need a sparring partner? I'm a bot - duel me anytime!",
-        "Practice your PvP against a bot! Just /duel {name} and I'll accept.",
-        "I never sleep and I never say no. Duel me! (I'm a bot)",
-        "Free PvP practice here - I'm a bot, send a duel and I'll be there."
+        "&bI'm a PvP bot - think you can beat me? Send me a duel!",
+        "&bBored? Duel me! I'm a bot and I accept every challenge.",
+        "&bBeep boop, I'm a bot. Type /duel {name} if you're brave enough.",
+        "&bNeed a sparring partner? I'm a bot - duel me anytime!",
+        "&bPractice your PvP against a bot! Just /duel {name} and I'll accept.",
+        "&bI never sleep and I never say no. Duel me! (I'm a bot)",
+        "&bFree PvP practice here - I'm a bot, send a duel and I'll be there."
       ]
     },
     "reconnect": {
