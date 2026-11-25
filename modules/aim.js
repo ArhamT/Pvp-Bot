@@ -55,6 +55,7 @@ class SmoothAimer {
     this.smoothing = clamp(physicsConfig.aimSmoothing || 0.35, 0.05, 0.9);
     this.jitterRad = (physicsConfig.aimJitterDeg || 0.35) * DEG_TO_RAD;
     this.toleranceRad = (physicsConfig.aimToleranceDeg || 6) * DEG_TO_RAD;
+    this.combatForceLook = Boolean(physicsConfig && physicsConfig.combatForceLook);
   }
 
   /**
@@ -73,6 +74,16 @@ class SmoothAimer {
   stepTowardsAngles(targetYaw, targetPitch, options = {}) {
     if (!this.bot.entity) {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
+    }
+
+    const useForce = options.force !== undefined ? Boolean(options.force) : this.combatForceLook;
+    if (useForce) {
+      const nextYaw = normalizeAngle(targetYaw);
+      const nextPitch = clamp(targetPitch, -Math.PI / 2, Math.PI / 2);
+      if (typeof this.bot.look === 'function') {
+        Promise.resolve(this.bot.look(nextYaw, nextPitch, true)).catch(() => {});
+      }
+      return { aligned: true, yawErrorDeg: 0, pitchErrorDeg: 0 };
     }
 
     const currentYaw = this.bot.entity.yaw;
@@ -155,6 +166,20 @@ class SmoothAimer {
     );
 
     return this.stepTowardsPoint(aimPoint, options);
+  }
+
+  /**
+   * Immediately snaps head orientation using `bot.look(yaw, pitch, true)`.
+   */
+  lookImmediate(yaw, pitch) {
+    return this.stepTowardsAngles(yaw, pitch, { force: true });
+  }
+
+  /**
+   * Immediately snaps head orientation toward a world position using `force = true`.
+   */
+  lookAtPointImmediate(targetPos) {
+    return this.stepTowardsPoint(targetPos, { force: true });
   }
 
   /**

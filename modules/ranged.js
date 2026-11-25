@@ -291,6 +291,10 @@ class RangedModule {
 
   shouldUseRangedWeapon(target) {
     if (!this.rangedCfg.enabled || !target || !target.isValid || !this.bot.entity) return false;
+    const allowBow = this.rangedCfg.bowEnabled !== false;
+    const allowCrossbow = this.rangedCfg.crossbowEnabled === true;
+    if (!allowBow && !allowCrossbow) return false;
+
     const dist = this.bot.entity.position.distanceTo(target.position);
     const minRange = this.rangedCfg.bowMinRange || 8.0;
     const maxRange = this.rangedCfg.bowMaxRange || 28.0;
@@ -300,7 +304,9 @@ class RangedModule {
       return false;
     }
     if (!this._hasArrows()) return false;
-    if (!this._findItem('bow') && !this._findItem('crossbow')) return false;
+    const hasBow = allowBow && Boolean(this._findItem('bow'));
+    const hasCrossbow = allowCrossbow && Boolean(this._findItem('crossbow'));
+    if (!hasBow && !hasCrossbow) return false;
 
     const aimTarget = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
     if (!this.isDrawing && !this.hasClearLineOfSight(aimTarget)) return false;
@@ -839,7 +845,7 @@ class RangedModule {
 
     const escapeHp = typeof this.rangedCfg.enderPearlEscapeHealth === 'number'
       ? this.rangedCfg.enderPearlEscapeHealth
-      : 6;
+      : 9;
     if (this.bot.health > escapeHp) return false;
 
     const inHazard = this.isInCobweb() || this.isInLava();
@@ -1364,8 +1370,10 @@ class RangedModule {
 
   _startRangedShot(target) {
     if (this.startingDraw || this.isDrawing) return true;
-    const bow = this._findItem('bow');
-    const crossbow = this._findItem('crossbow');
+    const allowBow = this.rangedCfg.bowEnabled !== false;
+    const allowCrossbow = this.rangedCfg.crossbowEnabled === true;
+    const bow = allowBow ? this._findItem('bow') : null;
+    const crossbow = allowCrossbow ? this._findItem('crossbow') : null;
     const weapon = bow || crossbow;
     if (!weapon) return false;
 

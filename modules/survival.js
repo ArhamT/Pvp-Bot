@@ -11,6 +11,7 @@ const {
   clearMovementControls,
   getItemMetadataText
 } = require('./constants');
+const { parseItemEnchantments, validateArmorInventory } = require('./mace_elytra');
 
 const GAPPLE_PRIORITY = [
   'enchanted_golden_apple',
@@ -199,6 +200,8 @@ class SurvivalModule {
     this._disposed = false;
     this.totemEquipInFlight = false;
     this.totemSwapPending = false;
+    this.totemPopReplenishPending = false;
+    this.totemPoppedAt = 0;
     this._totemMovementPaused = false;
     this.totemDelayTimer = null;
     this._totemDelayResolve = null;
@@ -248,12 +251,38 @@ class SurvivalModule {
     this._onEntityEffect = this._handleEntityEffect.bind(this);
     this._onEntityEffectEnd = this._handleEntityEffectEnd.bind(this);
     this._onClearBuffs = this._handleClearBuffs.bind(this);
+    this._onClientEntityStatus = (packet) => {
+      if (
+        packet &&
+        packet.entityStatus === 35 &&
+        this.bot &&
+        this.bot.entity &&
+        packet.entityId === this.bot.entity.id
+      ) {
+        this._handleTotemPop();
+      }
+    };
+    this._onBotEntityStatus = (entity, status) => {
+      if (
+        status === 35 &&
+        entity &&
+        this.bot &&
+        this.bot.entity &&
+        entity.id === this.bot.entity.id
+      ) {
+        this._handleTotemPop();
+      }
+    };
 
     if (this.bot.inventory && typeof this.bot.inventory.on === 'function') {
       this.bot.inventory.on('updateSlot', this._onUpdateSlot);
     }
+    if (this.bot._client && typeof this.bot._client.on === 'function') {
+      this.bot._client.on('entity_status', this._onClientEntityStatus);
+    }
     if (typeof this.bot.on === 'function') {
       this.bot.on('health', this._onHealth);
+      this.bot.on('entityStatus', this._onBotEntityStatus);
       this.bot.on('entityEffect', this._onEntityEffect);
       this.bot.on('entityEffectEnd', this._onEntityEffectEnd);
       this.bot.on('death', this._onClearBuffs);
@@ -267,6 +296,7 @@ class SurvivalModule {
   dispose() {
     this._disposed = true;
     this.activeInCombat = false;
+    this.totemPopReplenishPending = false;
     this._cancelPendingTotemTimers();
     this.totemEquipInFlight = false;
     this.totemEquipPromise = null;
@@ -274,8 +304,12 @@ class SurvivalModule {
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
       this.bot.inventory.removeListener('updateSlot', this._onUpdateSlot);
     }
+    if (this.bot && this.bot._client && typeof this.bot._client.removeListener === 'function') {
+      this.bot._client.removeListener('entity_status', this._onClientEntityStatus);
+    }
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('health', this._onHealth);
+      this.bot.removeListener('entityStatus', this._onBotEntityStatus);
       this.bot.removeListener('entityEffect', this._onEntityEffect);
       this.bot.removeListener('entityEffectEnd', this._onEntityEffectEnd);
       this.bot.removeListener('death', this._onClearBuffs);
@@ -373,6 +407,21 @@ class SurvivalModule {
   _handleHealth() {
     if (!this.activeInCombat || this._disposed) return;
     this.ensureTotemPriority();
+  }
+
+  /**
+   * Totem pop hook (entityStatus === 35): immediately trigger priority off-hand replenish
+   * before any crystal or anchor placement is allowed to proceed.
+   */
+  _handleTotemPop() {
+    if (!this.activeInCombat || this._disposed) return;
+    this.totemPopReplenishPending = true;
+    this.totemPoppedAt = Date.now();
+    this.totemRetryBackoffMs = 0;
+    if (this.totemDelayTimer) {
+      this._cancelPendingTotemTimers();
+    }
+    this.ensureTotemPriority({ immediate: true });
   }
 
   _getOffhandSlotIndex() {
@@ -491,6 +540,7 @@ class SurvivalModule {
 
       const after = this.getOffhandItem();
       if (after && after.name === 'totem_of_undying') {
+        this.totemPopReplenishPending = false;
         this.totemRetryBackoffMs = 0;
       } else {
         // Server reverted or rejected the click (e.g. locked inventory) -> back off to prevent packet kicks
@@ -509,16 +559,17 @@ class SurvivalModule {
 
   /**
    * HIGHEST PRIORITY: Schedules a human-paced Totem of Undying re-equip to offhand (slot 45).
-   * Non-blocking and strictly deduplicated (never queues duplicate timers or 0ms instant clicks).
-   * Returns true ONLY while actively executing the brief movement-pause + equip window (`totemSwapPending` / `totemEquipInFlight`).
+   * Non-blocking and strictly deduplicated (never queues duplicate timers or 0ms instant clicks unless totemPopDelayMs === 0).
+   * Returns true whenever off-hand lacks a totem and a replenish swap is pending or in-flight, blocking offensive actions.
    */
-  ensureTotemPriority() {
+  ensureTotemPriority(opts = {}) {
     if (this._disposed || !this.activeInCombat || !this.survCfg.totemAutoEquip || !this.bot || !this.bot.inventory) {
       return false;
     }
 
     const offhand = this.getOffhandItem();
     if (offhand && offhand.name === 'totem_of_undying') {
+      this.totemPopReplenishPending = false;
       this.totemRetryBackoffMs = 0;
       this._cancelPendingTotemTimers();
       return false;
@@ -533,28 +584,47 @@ class SurvivalModule {
 
     const totem = this.findTotemInInventory();
     if (!totem) {
+      this.totemPopReplenishPending = false;
       this._cancelPendingTotemTimers();
       return false;
     }
 
-    // Already waiting on the human reaction delay timer — skip duplicate scheduling
+    // Already waiting on the reaction delay timer — block offensive placements until slot 45 is replenished
     if (this.totemDelayTimer) {
-      return false;
+      return true;
     }
 
     const now = Date.now();
-    if (this.totemRetryBackoffMs > 0 && (now - this.lastTotemAttemptAt) < this.totemRetryBackoffMs) {
+    if (!opts.immediate && !this.totemPopReplenishPending && this.totemRetryBackoffMs > 0 && (now - this.lastTotemAttemptAt) < this.totemRetryBackoffMs) {
       return false;
     }
 
-    const minDelayMs = (typeof this.survCfg.totemEquipDelayMinMs === 'number' && this.survCfg.totemEquipDelayMinMs >= 0)
-      ? this.survCfg.totemEquipDelayMinMs
-      : 140;
-    const maxDelayRaw = (typeof this.survCfg.totemEquipDelayMaxMs === 'number' && this.survCfg.totemEquipDelayMaxMs >= 0)
-      ? this.survCfg.totemEquipDelayMaxMs
-      : 260;
-    const maxDelayMs = Math.max(minDelayMs, maxDelayRaw);
-    const delayMs = minDelayMs + Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1));
+    let delayMs;
+    if (opts.immediate || this.totemPopReplenishPending) {
+      delayMs = (typeof this.survCfg.totemPopDelayMs === 'number' && this.survCfg.totemPopDelayMs >= 0)
+        ? this.survCfg.totemPopDelayMs
+        : 50;
+    } else {
+      const minDelayMs = (typeof this.survCfg.totemEquipDelayMinMs === 'number' && this.survCfg.totemEquipDelayMinMs >= 0)
+        ? this.survCfg.totemEquipDelayMinMs
+        : 50;
+      const maxDelayRaw = (typeof this.survCfg.totemEquipDelayMaxMs === 'number' && this.survCfg.totemEquipDelayMaxMs >= 0)
+        ? this.survCfg.totemEquipDelayMaxMs
+        : 100;
+      const maxDelayMs = Math.max(minDelayMs, maxDelayRaw);
+      delayMs = minDelayMs + Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1));
+    }
+
+    if (delayMs === 0) {
+      this.totemEquipPromise = this._executeTotemSwap()
+        .catch(() => {})
+        .finally(() => {
+          if (!this.totemDelayTimer && !this.totemEquipInFlight) {
+            this.totemEquipPromise = null;
+          }
+        });
+      return true;
+    }
 
     this.totemEquipPromise = new Promise((resolve) => {
       this._totemDelayResolve = resolve;
@@ -574,16 +644,16 @@ class SurvivalModule {
       }, delayMs);
     });
 
-    return false;
+    return true;
   }
 
   /**
    * Ensures offhand safety every tick during active combat:
    * - Priority 1: Totem of Undying in slot 45 (human-paced reaction + anti-InventoryMove pause)
-   * - Priority 2: Shield in slot 45 if no totems remain in inventory (with failure backoff)
+   * - Priority 2: Shield in slot 45 ONLY when grounded or opponent is out of totems
    * Returns true while an emergency totem movement-pause/equip swap is actively in progress.
    */
-  ensureOffhandSafety() {
+  ensureOffhandSafety(target = null) {
     if (!this.activeInCombat || this._disposed) return false;
     if (this.ensureTotemPriority()) return true;
 
@@ -603,6 +673,16 @@ class SurvivalModule {
     if (offhand && offhand.name === 'totem_of_undying') return false;
 
     if (this.survCfg.shieldEnabled) {
+      const isGrounded = Boolean(this.bot.entity && this.bot.entity.onGround && !this.bot.entity.elytraFlying);
+      const targetHasTotem = Boolean(
+        target &&
+        Array.isArray(target.equipment) &&
+        target.equipment.some((e) => e && e.name === 'totem_of_undying')
+      );
+      if (!isGrounded && targetHasTotem) {
+        return false;
+      }
+
       if (offhand && offhand.name === 'shield') {
         this.offhandRetryBackoffMs = 0;
         return false;
@@ -667,20 +747,13 @@ class SurvivalModule {
   }
 
   /**
-   * Returns true ONLY when critically low (<= 6 HP / 3 hearts) with NO offhand Totem
-   * and NO instant splash healing potion ready — prevents cowardly running away at 5+ hearts!
+   * Critical HP Reset trigger (Priority 2): returns true at <= 9 HP so the bot steps back
+   * behind Obsidian cover and consumes an Enchanted Golden Apple / Golden Apple or Pearls out.
    */
   needsRetreat() {
     if (!this.bot.entity) return false;
-    const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 6;
-    if (this.bot.health > retreatHp) return false;
-
-    // If holding a Totem in offhand and we still have splash healing pots, quick-pot inline instead of fleeing!
-    const offhand = this.getOffhandItem();
-    const hasTotemEquipped = Boolean(offhand && offhand.name === 'totem_of_undying');
-    if (hasTotemEquipped && this.findHealingPotion()) return false;
-
-    return true;
+    const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 9;
+    return this.bot.health <= retreatHp;
   }
 
   /**
@@ -1529,10 +1602,18 @@ class SurvivalModule {
 
   /**
    * Finds a suitable solid building block for breaking line-of-sight during retreat.
+   * Strictly prefers `obsidian` (then `glowstone`) for blast-resistant cover.
    */
   findLosBuildingBlock() {
     if (!this.bot.inventory) return null;
-    return this.bot.inventory.items().find((i) => LOS_BLOCK_NAMES.has(i.name)) || null;
+    const items = this.bot.inventory.items();
+    const obsHotbar = items.find((i) => i.name === 'obsidian' && this._isHotbarSlot(i.slot));
+    if (obsHotbar) return obsHotbar;
+    const obsAny = items.find((i) => i.name === 'obsidian');
+    if (obsAny) return obsAny;
+    const glow = items.find((i) => i.name === 'glowstone');
+    if (glow) return glow;
+    return items.find((i) => LOS_BLOCK_NAMES.has(i.name)) || null;
   }
 
   async _equipSafe(item, destination) {
@@ -1844,8 +1925,31 @@ class SurvivalModule {
   }
 
   /**
-   * Queues a building block placement directly behind the bot (between bot and pursuer)
-   * to break line of sight during retreat.
+   * Returns true if a solid block already stands at feet or torso height between bot and target.
+   */
+  _hasCoverBetween(target) {
+    if (!target || !target.isValid || !this.bot.entity || typeof this.bot.blockAt !== 'function') return false;
+    const botPos = this.bot.entity.position;
+    const toTarget = target.position.minus(botPos);
+    const len = Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z);
+    if (len < 0.2) return false;
+
+    const ux = toTarget.x / len;
+    const uz = toTarget.z / len;
+    for (const d of [1.0, 1.5]) {
+      const feetCheck = botPos.offset(ux * d, 0, uz * d).floored();
+      const b0 = this.bot.blockAt(feetCheck);
+      const b1 = this.bot.blockAt(feetCheck.offset(0, 1, 0));
+      if ((b0 && b0.boundingBox === 'block') || (b1 && b1.boundingBox === 'block')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Queues an Obsidian / solid cover block placement directly between the bot and opponent
+   * before stepping back to eat a Golden Apple at <= 9 HP.
    */
   _tryQueueLosBlock(target) {
     if (!target || !target.isValid || !this.bot.entity) return false;
@@ -1855,12 +1959,12 @@ class SurvivalModule {
     if ((now - this.lastLosBlockTime) < (this.survCfg.losBlockCooldownMs || 950)) return false;
 
     const dist = this.bot.entity.position.distanceTo(target.position);
-    if (dist < 2.5 || dist > 9.0) return false;
+    if (dist < 1.8 || dist > 7.5) return false;
+    if (this._hasCoverBetween(target)) return false;
 
     const blockItem = this.findLosBuildingBlock();
     if (!blockItem) return false;
 
-    // Pick a spot ~1.4 blocks behind the bot toward the enemy
     const toTarget = target.position.minus(this.bot.entity.position);
     const len = Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z);
     if (len < 0.1) return false;
@@ -1875,13 +1979,26 @@ class SurvivalModule {
       return false;
     }
 
+    let swappedThisTick = false;
+    if (this._isHotbarSlot(blockItem.slot) && typeof this.bot.setQuickBarSlot === 'function') {
+      const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+      const qb = blockItem.slot - hotbarStart;
+      if (this.bot.quickBarSlot !== qb) {
+        this.bot.setQuickBarSlot(qb);
+        swappedThisTick = true;
+      }
+    } else {
+      this._equipSafe(blockItem, 'hand');
+      swappedThisTick = true;
+    }
+
     this.pendingLosBlock = {
       item: blockItem,
       refPos: refBlock.position,
       aimPos: refBlock.position.offset(0.5, 1.0, 0.5),
+      settleTicks: swappedThisTick ? 1 : 0,
       createdAt: now
     };
-    this._equipSafe(blockItem, 'hand');
     return true;
   }
 
@@ -1896,9 +2013,27 @@ class SurvivalModule {
 
     this.bot.setControlState('sprint', false);
     const aimStatus = this.aimer.stepTowardsPoint(action.aimPos, {
-      speedMultiplier: 1.25,
-      toleranceRad: 0.16
+      speedMultiplier: 1.35,
+      toleranceRad: 0.18
     });
+
+    if (action.settleTicks > 0) {
+      action.settleTicks--;
+      return true;
+    }
+
+    const held = this.bot.heldItem;
+    if (!held || held.name !== action.item.name) {
+      if (this._isHotbarSlot(action.item.slot) && typeof this.bot.setQuickBarSlot === 'function') {
+        const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+        this.bot.setQuickBarSlot(action.item.slot - hotbarStart);
+        action.settleTicks = 1;
+      } else {
+        this._equipSafe(action.item, 'hand');
+        action.settleTicks = 1;
+      }
+      return true;
+    }
 
     if (aimStatus.aligned) {
       this.pendingLosBlock = null;
@@ -1910,7 +2045,8 @@ class SurvivalModule {
   async _placeLosBlock(action) {
     if (this.totemEquipInFlight || this.totemSwapPending) return;
     try {
-      await this.bot.equip(action.item, 'hand');
+      const held = this.bot.heldItem;
+      if (!held || held.name !== action.item.name) return;
       const refBlock = this.bot.blockAt(action.refPos);
       if (refBlock && refBlock.boundingBox === 'block') {
         await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
@@ -1922,12 +2058,11 @@ class SurvivalModule {
   }
 
   /**
-   * 20-TPS tick handler for RETREATING state (entered when bot.health <= 11):
+   * 20-TPS tick handler for RETREATING state (triggered at <= 9 HP):
    * 1. Highest-priority Totem check
-   * 2. Throw Splash Potions of Instant Health II downward (pitch = -90°) while moving forward
-   * 3. Eat Golden Apple / Enchanted Golden Apple while retreating safely
-   * 4. Place blocks behind to break line of sight
-   * 5. Smoothly turn 180° away from enemy and sprint-jump with serpentine strafing
+   * 2. Place Obsidian cover between bot and opponent before eating
+   * 3. Step back behind Obsidian cover and consume Enchanted Golden Apple / Golden Apple
+   * 4. Smoothly retreat away from enemy if no gapples/cover remain
    */
   tickRetreating(target) {
     if (this.totemSwapPending || this.ensureOffhandSafety()) {
@@ -1943,10 +2078,15 @@ class SurvivalModule {
     // 1. Complete any active downward splash healing potion throw while moving forward
     if (this._tickSplashPotionDownward(target)) return;
 
-    // 2. Complete any active line-of-sight block placement behind us
-    if (this._tickPendingLosBlock()) return;
+    // 2. Complete any active Obsidian cover placement between bot and opponent
+    if (this._tickPendingLosBlock()) {
+      this.bot.setControlState('forward', false);
+      this.bot.setControlState('back', true);
+      this.bot.setControlState('sprint', false);
+      return;
+    }
 
-    // 3. If currently eating a Golden Apple, keep walking away smoothly (no sprint -> no NoSlow)
+    // 3. If currently eating a Golden Apple, keep stepping back behind cover (no sprint -> no NoSlow)
     if (this.isConsuming) {
       this._moveAwayWalk(target);
       if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500)) {
@@ -1957,12 +2097,31 @@ class SurvivalModule {
       return;
     }
 
-    // 4. Priority Instant Health II splash potion while moving forward
+    // 4. Priority Obsidian cover FIRST before starting gapple consumption when target is close
+    if (target && target.isValid) {
+      const dist = this.bot.entity.position.distanceTo(target.position);
+      if (dist < 6.5 && !this._hasCoverBetween(target) && this._tryQueueLosBlock(target)) {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('back', true);
+        this.bot.setControlState('sprint', false);
+        return;
+      }
+    }
+
+    // 5. Consume Enchanted Golden Apple / Golden Apple behind cover
+    const gapple = this.findGoldenApple() || this.findBestHealFood();
+    if (gapple && this.bot.health < (this.survCfg.safeHealthThreshold || 15)) {
+      this._startEatingFood(gapple);
+      this._moveAwayWalk(target);
+      return;
+    }
+
+    // 6. Fallback Instant Health II splash potion if out of gapples
     const potionCooldown = this.survCfg.potionCooldownMs || 450;
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.retreatHealthThreshold || 6) &&
+      this.bot.health <= (this.survCfg.retreatHealthThreshold || 9) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this._queueSplashPotion(healPotion, false, null);
@@ -1970,15 +2129,7 @@ class SurvivalModule {
       return;
     }
 
-    // 5. Immediately eat a Golden Apple if available (don't wait to run 5.5b away without eating!)
-    const gapple = this.findGoldenApple() || this.findBestHealFood();
-    if (gapple && !healPotion && this.bot.health < (this.survCfg.safeHealthThreshold || 15)) {
-      this._startEatingFood(gapple);
-      this._moveAwayWalk(target);
-      return;
-    }
-
-    // 6. Smooth 180-degree turn away from target & sprint-jump escape
+    // 7. Smooth 180-degree turn away from target & sprint-jump escape
     const awayYaw = this._getAwayYaw(target);
     const aimStatus = this.aimer.stepTowardsAngles(awayYaw, 0.0, { speedMultiplier: 1.25 });
 
@@ -2088,7 +2239,15 @@ class SurvivalModule {
   }
 
   /**
-   * Scores an armor item by material tier + protection enchantments.
+   * Validates worn and carried armor against full Protection IV and Blast Protection rejection.
+   */
+  validateArmor() {
+    return validateArmorInventory(this.bot);
+  }
+
+  /**
+   * Scores an armor item by material tier + Protection IV enchantments.
+   * Rejects Blast Protection pieces (-1) because Wind Charges / Wind Burst lose launch height.
    */
   scoreArmorItem(item) {
     if (!item || !item.name) return -1;
@@ -2102,16 +2261,17 @@ class SurvivalModule {
     }
     if (score === 0) return -1;
 
-    // Inspect enchantments across legacy NBT and 1.20.5+ item components
-    const raw = getItemMetadataText(item);
-    const protMatch = raw.match(/protection[^0-9]{0,20}(\d+)/);
-    if (protMatch) {
-      score += Math.min(5, parseInt(protMatch[1], 10)) * 6;
-    } else if (raw.includes('protection')) {
-      score += 8;
+    const ench = parseItemEnchantments(item);
+    if (ench.blast_protection > 0 && this.survCfg.rejectBlastProtection !== false) {
+      return -1;
     }
-    if (raw.includes('unbreaking')) score += 2;
-    if (raw.includes('thorns')) score += 1;
+
+    if (ench.protection > 0) {
+      score += Math.min(5, ench.protection) * 10;
+      if (ench.protection >= 4) score += 15;
+    }
+    if (ench.unbreaking > 0) score += 2;
+    if (ench.mending > 0) score += 2;
 
     return score;
   }
@@ -2207,17 +2367,55 @@ class SurvivalModule {
       return null;
     };
 
-    const layoutPlan = [
-      { quickbarIndex: 0, picker: () => findByPriority(SWORD_PRIORITY) },
-      { quickbarIndex: 1, picker: () => findByPriority(AXE_PRIORITY) },
-      { quickbarIndex: 2, picker: () => findByPriority(GAPPLE_PRIORITY) },
-      { quickbarIndex: 3, picker: () => findByPriority(['ender_pearl']) },
-      { quickbarIndex: 4, picker: () => findByPriority(['bow', 'crossbow']) },
-      { quickbarIndex: 5, picker: () => findByPriority(['cobweb', 'water_bucket']) },
-      { quickbarIndex: 6, picker: () => this.findHealingPotion(claimedSlots) },
-      { quickbarIndex: 7, picker: () => this.findHealingPotion(claimedSlots) },
-      { quickbarIndex: 8, picker: () => this.findHealingPotion(claimedSlots) }
-    ];
+    const allInv = this.bot.inventory.items();
+    const isMaceElytraKit = allInv.some((i) =>
+      i && (i.name === 'mace' || i.name === 'wind_charge' || (i.name === 'elytra' && allInv.some((r) => r && r.name === 'firework_rocket')))
+    );
+
+    const findMaceByEnchant = (preferKey) => {
+      const candidates = this.bot.inventory.items().filter((i) => i && i.name === 'mace' && !claimedSlots.has(i.slot));
+      if (candidates.length === 0) return null;
+      candidates.sort((a, b) => {
+        const ea = parseItemEnchantments(a);
+        const eb = parseItemEnchantments(b);
+        return (eb[preferKey] - ea[preferKey]) || (eb.wind_burst - ea.wind_burst);
+      });
+      return candidates[0];
+    };
+
+    const findChestOrElytra = () => {
+      const wornTorso = this.bot.inventory.slots ? this.bot.inventory.slots[6] : null;
+      const items = this.bot.inventory.items().filter((i) => !claimedSlots.has(i.slot));
+      if (wornTorso && wornTorso.name === 'elytra') {
+        return items.find((i) => i && i.name.endsWith('_chestplate')) || items.find((i) => i && i.name === 'elytra') || null;
+      }
+      return items.find((i) => i && i.name === 'elytra') || items.find((i) => i && i.name.endsWith('_chestplate')) || null;
+    };
+
+    const layoutPlan = isMaceElytraKit
+      ? [
+          { quickbarIndex: 0, picker: () => findByPriority(SWORD_PRIORITY) },
+          { quickbarIndex: 1, picker: () => findMaceByEnchant('density') },
+          { quickbarIndex: 2, picker: () => findMaceByEnchant('breach') || findByPriority(GAPPLE_PRIORITY) },
+          // Enforce Axe strictly at a higher hotbar index (right of) Maces for stun-slam attribute swapping
+          { quickbarIndex: 3, picker: () => findByPriority(AXE_PRIORITY) },
+          { quickbarIndex: 4, picker: () => findByPriority(['wind_charge']) || findByPriority(GAPPLE_PRIORITY) },
+          { quickbarIndex: 5, picker: () => findByPriority(['firework_rocket']) || findByPriority(GAPPLE_PRIORITY) },
+          { quickbarIndex: 6, picker: () => findByPriority(['ender_pearl']) || this.findHealingPotion(claimedSlots) },
+          { quickbarIndex: 7, picker: () => findChestOrElytra() || findByPriority(GAPPLE_PRIORITY) },
+          { quickbarIndex: 8, picker: () => findByPriority(['totem_of_undying']) || findByPriority(GAPPLE_PRIORITY) || findByPriority(['water_bucket']) || this.findHealingPotion(claimedSlots) }
+        ]
+      : [
+          { quickbarIndex: 0, picker: () => findByPriority(SWORD_PRIORITY) },
+          { quickbarIndex: 1, picker: () => findByPriority(['obsidian']) || findByPriority(AXE_PRIORITY) },
+          { quickbarIndex: 2, picker: () => findByPriority(['end_crystal']) || findByPriority(GAPPLE_PRIORITY) },
+          { quickbarIndex: 3, picker: () => findByPriority(['respawn_anchor']) || findByPriority(['ender_pearl']) },
+          { quickbarIndex: 4, picker: () => findByPriority(['glowstone', 'water_bucket', 'cobweb']) },
+          { quickbarIndex: 5, picker: () => findByPriority(GAPPLE_PRIORITY) || this.findHealingPotion(claimedSlots) },
+          { quickbarIndex: 6, picker: () => findByPriority(['ender_pearl']) || this.findHealingPotion(claimedSlots) },
+          { quickbarIndex: 7, picker: () => findByPriority(AXE_PRIORITY) || this.findHealingPotion(claimedSlots) },
+          { quickbarIndex: 8, picker: () => findByPriority(['totem_of_undying']) || this.findHealingPotion(claimedSlots) || findByPriority(['water_bucket']) }
+        ];
 
     const clickDelayMs = this.survCfg.inventoryClickDelayMs !== undefined ? this.survCfg.inventoryClickDelayMs : 120;
     let consecutiveFailures = 0;

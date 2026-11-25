@@ -5,30 +5,25 @@ const { clamp, normalizeAngle } = require('./aim');
 const {
   HOTBAR_START,
   OFFHAND_SLOT,
+  SWORD_PRIORITY,
   getItemMetadataText,
   hasItemEnchant
 } = require('./constants');
+const {
+  BLAST_SHIELD_BLOCK_PRIORITY,
+  isTargetInSurround,
+  hasExistingCrystalAt,
+  findFeetBlastShieldSpot,
+  planHitCrystalTrajectory,
+  planSurroundPressurePlacement
+} = require('./cpvp_tactics');
 
 const HOTBAR_END = 44;
 
 const CRYSTAL_POWER = 6.0;
 const ANCHOR_POWER = 5.0;
 
-const COVER_BLOCK_PRIORITY = [
-  'obsidian',
-  'cobweb',
-  'cobbled_deepslate',
-  'cobblestone',
-  'stone',
-  'deepslate',
-  'netherrack',
-  'dirt',
-  'oak_planks',
-  'spruce_planks',
-  'birch_planks',
-  'stone_bricks',
-  'end_stone'
-];
+const COVER_BLOCK_PRIORITY = BLAST_SHIELD_BLOCK_PRIORITY;
 
 const DEFENSE_BLOCK_PRIORITY = [
   'cobweb',
@@ -132,6 +127,8 @@ class BurstModule {
 
     // Cooldowns
     this.lastCrystalTime = 0;
+    this.lastHitCrystalTime = 0;
+    this.hitCrystalTarget = null;
     this.lastAnchorTime = 0;
     this.lastWindChargeTime = 0;
 
@@ -302,8 +299,22 @@ class BurstModule {
   }
 
   _handleEntitySpawn(entity) {
-    if (this.burstCfg.antiExplosiveEnabled === false) return;
     if (!isCrystalEntity(entity) || !entity.position || !this.bot || !this.bot.entity) return;
+
+    // Immediate spawn-tick crystal registration for our own offensive crystal sequence
+    if (
+      this.activePlan &&
+      this.activePlan.kind === 'crystal' &&
+      this.activePlan.blastPos &&
+      (this.state === 'CRYSTAL_DETONATE' || this.state === 'CRYSTAL_PLACE_CRYSTAL') &&
+      entity.position.distanceTo(this.activePlan.blastPos) <= 2.5
+    ) {
+      this.activePlan.spawnedCrystal = entity;
+      this.stepDelayTicks = 0;
+      return;
+    }
+
+    if (this.burstCfg.antiExplosiveEnabled === false) return;
 
     const crystalFloor = entity.position.floored();
     if (this._isOwnPlacement(crystalFloor) || this._isOwnPlacement(crystalFloor.offset(0, -1, 0))) {
@@ -447,7 +458,7 @@ class BurstModule {
     return blastProt * 2 + genericProt;
   }
 
-  _isRayOccluded(fromPos, toPos) {
+  _isRayOccluded(fromPos, toPos, virtualSolidKeys = null) {
     if (!this.bot || typeof this.bot.blockAt !== 'function') return false;
 
     const delta = toPos.minus(fromPos);
@@ -468,6 +479,10 @@ class BurstModule {
       );
       const key = posKey(sample);
       if (key === originVoxel || key === destVoxel) continue;
+      if (virtualSolidKeys) {
+        if (typeof virtualSolidKeys === 'string' && key === virtualSolidKeys) return true;
+        if (typeof virtualSolidKeys.has === 'function' && virtualSolidKeys.has(key)) return true;
+      }
 
       const block = this.bot.blockAt(sample);
       if (block && block.boundingBox === 'block') {
@@ -484,7 +499,7 @@ class BurstModule {
    * - Lower Y-level blast reduction (feet below blast plane take substantially less damage)
    * - Worn armor defense points, armor toughness, and Blast Protection / Protection EPF
    */
-  estimateBlastDamage(blastPos, entityPos, entity = null, power = CRYSTAL_POWER) {
+  estimateBlastDamage(blastPos, entityPos, entity = null, power = CRYSTAL_POWER, virtualSolidPos = null) {
     if (!blastPos || !entityPos) return 0;
 
     const doubleRadius = power * 2.0;
@@ -493,6 +508,16 @@ class BurstModule {
 
     const height = (entity && entity.height) || 1.8;
     const halfW = 0.25;
+    let virtualSolidKeys = null;
+    if (Array.isArray(virtualSolidPos)) {
+      const set = new Set();
+      for (const v of virtualSolidPos) {
+        if (v) set.add(posKey(v));
+      }
+      if (set.size > 0) virtualSolidKeys = set;
+    } else if (virtualSolidPos) {
+      virtualSolidKeys = posKey(virtualSolidPos);
+    }
 
     // Sample points across feet, lower torso, upper torso, and head
     const samplePoints = [
@@ -508,7 +533,7 @@ class BurstModule {
 
     let visibleCount = 0;
     for (const pt of samplePoints) {
-      if (!this._isRayOccluded(blastPos, pt)) {
+      if (!this._isRayOccluded(blastPos, pt, virtualSolidKeys)) {
         visibleCount++;
       }
     }
@@ -634,31 +659,85 @@ class BurstModule {
     return this._findItem('mace', hotbarOnly);
   }
 
-  _findNonGlowstoneHotbarSlot() {
-    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return -1;
+  _findBestSword() {
+    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return null;
     const start = this._getHotbarStart();
-
-    // Prefer sword slot if combat module tracks it
     if (this.combat && typeof this.combat.getHotbarSlots === 'function') {
       const slots = this.combat.getHotbarSlots();
       if (slots && typeof slots.swordSlot === 'number' && slots.swordSlot >= 0) {
         const item = this.bot.inventory.slots[start + slots.swordSlot];
-        if (!item || item.name !== 'glowstone') {
+        if (item && item.name.endsWith('_sword')) {
+          return { item, quickBarSlot: slots.swordSlot };
+        }
+      }
+    }
+    const kbSword = this._findItemInHotbar((item) => item.name.endsWith('_sword') && hasItemEnchant(item, 'knockback'));
+    if (kbSword) return kbSword;
+    return this._findItem(SWORD_PRIORITY, false);
+  }
+
+  _getAnchorCharges(block) {
+    if (!block) return 0;
+    if (typeof block.getProperties === 'function') {
+      try {
+        const props = block.getProperties();
+        if (props && props.charges !== undefined) {
+          const val = Number(props.charges);
+          if (Number.isFinite(val)) return val;
+        }
+      } catch (_) {}
+    }
+    if (block._properties && block._properties.charges !== undefined) {
+      const val = Number(block._properties.charges);
+      if (Number.isFinite(val)) return val;
+    }
+    const meta = Number(block.metadata);
+    return Number.isFinite(meta) && meta > 0 ? meta : 0;
+  }
+
+  /**
+   * Mandatory non-glowstone hotbar swap selector:
+   * Strictly prioritizes Totem -> Sword -> Obsidian -> any other non-glowstone/non-anchor slot.
+   */
+  _findNonGlowstoneHotbarSlot() {
+    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return -1;
+    const start = this._getHotbarStart();
+
+    // 1. Totem of Undying in hotbar
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name === 'totem_of_undying') return i;
+    }
+
+    // 2. Sword slot (combat-tracked or any hotbar sword)
+    if (this.combat && typeof this.combat.getHotbarSlots === 'function') {
+      const slots = this.combat.getHotbarSlots();
+      if (slots && typeof slots.swordSlot === 'number' && slots.swordSlot >= 0) {
+        const item = this.bot.inventory.slots[start + slots.swordSlot];
+        if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
           return slots.swordSlot;
         }
       }
     }
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name.endsWith('_sword')) return i;
+    }
 
-    // Otherwise prefer any non-glowstone non-anchor slot (sword, totem, empty, etc.)
-    let fallback = -1;
+    // 3. Obsidian in hotbar
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name === 'obsidian') return i;
+    }
+
+    // 4. Any other non-glowstone, non-anchor hotbar slot (including empty slots)
     for (let i = 0; i < 9; i++) {
       const item = this.bot.inventory.slots[start + i];
       if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
-        if (item && item.name.endsWith('_sword')) return i;
-        if (fallback === -1) fallback = i;
+        return i;
       }
     }
-    return fallback;
+    return -1;
   }
 
   /**
@@ -1141,7 +1220,7 @@ class BurstModule {
     const botPos = this.bot.entity.position;
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
     const minSafeHp = 6;
-    let bestEntity = null;
+    let bestPlan = null;
     let bestScore = 0;
 
     for (const entity of Object.values(this.bot.entities)) {
@@ -1150,36 +1229,44 @@ class BurstModule {
       if (entity.position.distanceTo(predictedFeet) > 5.5) continue;
 
       const targetDmg = this.estimateBlastDamage(entity.position, predictedFeet, target, CRYSTAL_POWER);
-      const selfDmg = this.estimateBlastDamage(entity.position, botPos, this.bot.entity, CRYSTAL_POWER);
+      const rawSelfDmg = this.estimateBlastDamage(entity.position, botPos, this.bot.entity, CRYSTAL_POWER);
+      const feetShield = findFeetBlastShieldSpot(this, entity.position, null);
+      const coverSpot = feetShield.spot;
+      const effectiveSelfDmg = coverSpot
+        ? this.estimateBlastDamage(entity.position, botPos, this.bot.entity, CRYSTAL_POWER, coverSpot.placePos)
+        : rawSelfDmg;
 
       if (targetDmg < 4.0) continue;
-      if (targetDmg <= selfDmg) continue;
-      if ((this.bot.health - selfDmg) <= minSafeHp) continue;
+      if (targetDmg <= effectiveSelfDmg) continue;
+      if ((this.bot.health - effectiveSelfDmg) <= minSafeHp) continue;
 
-      const score = targetDmg - selfDmg * 1.25;
+      const score = targetDmg - effectiveSelfDmg * 1.25;
       if (score > bestScore) {
         bestScore = score;
-        bestEntity = entity;
+        bestPlan = { entity, coverSpot };
       }
     }
-    return bestEntity;
+    return bestPlan;
   }
 
   _findBestCrystalPlacement(target, predictedFeet) {
     if (this.burstCfg.crystalEnabled === false) return null;
     const now = Date.now();
-    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 450)) return null;
+    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 100)) return null;
 
     const crystalItem = this._findItem('end_crystal');
     if (!crystalItem) return null;
     if (!this.bot || typeof this.bot.blockAt !== 'function') return null;
 
+    const botPos = this.bot.entity.position;
+    const maxCrystalRange = this.burstCfg.crystalMaxRange || 4.5;
+    if (botPos.distanceTo(target.position) > maxCrystalRange) return null;
+
     const obsidianItem = this._findItem('obsidian');
     const scanRadius = this.burstCfg.scanRadius || 4.5;
     const rInt = Math.ceil(scanRadius);
-    const botPos = this.bot.entity.position;
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
-    const minSafeHp = Math.max(6, (this.burstCfg.minBurstHealth || 14) * 0.45);
+    const minSafeHp = 6;
 
     const cx = Math.floor(predictedFeet.x);
     const cy = Math.floor(predictedFeet.y);
@@ -1197,11 +1284,12 @@ class BurstModule {
           if (eyePos.distanceTo(basePos.offset(0.5, 0.8, 0.5)) > 4.5) continue;
 
           const baseBlock = this.bot.blockAt(basePos);
-          const aboveBlock = this.bot.blockAt(basePos.offset(0, 1, 0));
+          const crystalSpace = basePos.offset(0, 1, 0);
+          const aboveBlock = this.bot.blockAt(crystalSpace);
           if (!baseBlock || !isAirLike(aboveBlock)) continue;
+          if (hasExistingCrystalAt(this.bot, crystalSpace)) continue;
 
           // Ensure crystal space does not collide with target or bot
-          const crystalSpace = basePos.offset(0, 1, 0);
           if (this._intersectsEntityHitbox(crystalSpace, botPos)) continue;
           if (this._intersectsEntityHitbox(crystalSpace, target.position, target.height || 1.8)) continue;
 
@@ -1221,25 +1309,44 @@ class BurstModule {
           }
 
           const targetDmg = this.estimateBlastDamage(blastPos, predictedFeet, target, CRYSTAL_POWER);
-          const selfDmg = this.estimateBlastDamage(blastPos, botPos, this.bot.entity, CRYSTAL_POWER);
-
-          // Strict safety & advantage requirements
           if (targetDmg < 4.0) continue;
-          if (targetDmg <= selfDmg) continue;
-          if ((this.bot.health - selfDmg) <= minSafeHp) continue;
 
-          const score = targetDmg - selfDmg * 1.35 - (needsObsidian ? 1.5 : 0);
+          const rawSelfDmg = this.estimateBlastDamage(
+            blastPos,
+            botPos,
+            this.bot.entity,
+            CRYSTAL_POWER,
+            needsObsidian ? basePos : null
+          );
+          const feetShield = findFeetBlastShieldSpot(this, blastPos, basePos);
+          const coverSpot = feetShield.spot;
+          if (feetShield.needed && !coverSpot && rawSelfDmg > 4.0) continue;
+
+          const effectiveSelfDmg = coverSpot
+            ? this.estimateBlastDamage(
+                blastPos,
+                botPos,
+                this.bot.entity,
+                CRYSTAL_POWER,
+                [coverSpot.placePos, needsObsidian ? basePos : null]
+              )
+            : rawSelfDmg;
+
+          if (targetDmg <= effectiveSelfDmg) continue;
+          if ((this.bot.health - effectiveSelfDmg) <= minSafeHp) continue;
+
+          const score = targetDmg - effectiveSelfDmg * 1.35 - (needsObsidian ? 1.0 : 0);
           if (!best || score > best.score) {
             best = {
               kind: 'crystal',
               score,
               targetDmg,
-              selfDmg,
+              selfDmg: effectiveSelfDmg,
               basePos,
               blastPos,
               needsObsidian,
               obsidianRef,
-              coverSpot: selfDmg > 4.0 ? this._findOptionalCoverSpot(blastPos) : null
+              coverSpot
             };
           }
         }
@@ -1252,18 +1359,21 @@ class BurstModule {
   _findBestAnchorPlacement(target, predictedFeet) {
     if (!this._canUseRespawnAnchor()) return null;
     const now = Date.now();
-    if ((now - this.lastAnchorTime) < (this.burstCfg.anchorCooldownMs || 900)) return null;
+    if ((now - this.lastAnchorTime) < (this.burstCfg.anchorCooldownMs || 250)) return null;
 
     const anchorItem = this._findItem('respawn_anchor');
     const glowstoneItem = this._findItem('glowstone');
     if (!anchorItem || !glowstoneItem) return null;
     if (!this.bot || typeof this.bot.blockAt !== 'function') return null;
 
+    const botPos = this.bot.entity.position;
+    const maxAnchorRange = this.burstCfg.anchorMaxRange || 3.6;
+    if (botPos.distanceTo(target.position) > maxAnchorRange) return null;
+
     const scanRadius = this.burstCfg.scanRadius || 4.5;
     const rInt = Math.ceil(scanRadius);
-    const botPos = this.bot.entity.position;
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
-    const minSafeHp = Math.max(6, (this.burstCfg.minBurstHealth || 14) * 0.45);
+    const minSafeHp = 6;
 
     const cx = Math.floor(predictedFeet.x);
     const cy = Math.floor(predictedFeet.y);
@@ -1285,9 +1395,11 @@ class BurstModule {
 
           let needsPlace = false;
           let anchorRef = null;
+          let alreadyCharged = false;
 
           if (existing.name === 'respawn_anchor') {
             needsPlace = false;
+            alreadyCharged = this._getAnchorCharges(existing) >= 1;
           } else if (isAirLike(existing)) {
             if (this._intersectsEntityHitbox(anchorPos, botPos)) continue;
             if (this._intersectsEntityHitbox(anchorPos, target.position, target.height || 1.8)) continue;
@@ -1299,24 +1411,33 @@ class BurstModule {
           }
 
           const targetDmg = this.estimateBlastDamage(blastPos, predictedFeet, target, ANCHOR_POWER);
-          const selfDmg = this.estimateBlastDamage(blastPos, botPos, this.bot.entity, ANCHOR_POWER);
-
           if (targetDmg < 4.0) continue;
-          if (targetDmg <= selfDmg) continue;
-          if ((this.bot.health - selfDmg) <= minSafeHp) continue;
 
-          const score = targetDmg - selfDmg * 1.35 - (needsPlace ? 1.0 : 0);
+          const rawSelfDmg = this.estimateBlastDamage(blastPos, botPos, this.bot.entity, ANCHOR_POWER);
+          const feetShield = findFeetBlastShieldSpot(this, blastPos, anchorPos);
+          const coverSpot = feetShield.spot;
+          if (feetShield.needed && !coverSpot && rawSelfDmg > 4.0) continue;
+
+          const effectiveSelfDmg = coverSpot
+            ? this.estimateBlastDamage(blastPos, botPos, this.bot.entity, ANCHOR_POWER, coverSpot.placePos)
+            : rawSelfDmg;
+
+          if (targetDmg <= effectiveSelfDmg) continue;
+          if ((this.bot.health - effectiveSelfDmg) <= minSafeHp) continue;
+
+          const score = targetDmg - effectiveSelfDmg * 1.35 - (needsPlace ? 0.5 : 0);
           if (!best || score > best.score) {
             best = {
               kind: 'anchor',
               score,
               targetDmg,
-              selfDmg,
+              selfDmg: effectiveSelfDmg,
               anchorPos,
               blastPos,
               needsPlace,
+              alreadyCharged,
               anchorRef,
-              coverSpot: selfDmg > 3.5 ? this._findOptionalCoverSpot(blastPos) : null
+              coverSpot
             };
           }
         }
@@ -1324,6 +1445,27 @@ class BurstModule {
     }
 
     return best;
+  }
+
+  _canStartHitCrystal(target) {
+    if (this.burstCfg.hitCrystalEnabled === false || this.burstCfg.crystalEnabled === false) return false;
+    if (!target || !target.isValid || !this.bot || !this.bot.entity) return false;
+
+    const now = Date.now();
+    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 100)) return false;
+    if ((now - this.lastHitCrystalTime) < (this.burstCfg.hitCrystalCooldownMs || 350)) return false;
+
+    if (!this._findItem('end_crystal')) return false;
+    if (!this._findBestSword()) return false;
+
+    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
+    const reachDist = this._getReachDistanceToEntity(target);
+    if (reachDist > maxHitRange) return false;
+
+    // Only initiate hit-launch when opponent is grounded/low so sprint-knockback launches them upward
+    if (target.onGround === false && target.velocity && target.velocity.y > 0.15) return false;
+
+    return Boolean(planHitCrystalTrajectory(this, target));
   }
 
   _findCrystalEntityNear(pos, maxDist = 2.2) {
@@ -1341,7 +1483,7 @@ class BurstModule {
     return closest;
   }
 
-  _tickCrystalState() {
+  _tickCrystalState(target) {
     const plan = this.activePlan;
     if (!plan) {
       this._resetOffensiveState(true);
@@ -1354,19 +1496,83 @@ class BurstModule {
       return false;
     }
 
+    // Step 0 (Hit-Crystal): Sprint-knockback melee hit -> trajectory Obsidian -> End Crystal -> Spawn-Tick Detonate
+    if (this.state === 'CRYSTAL_HIT_LAUNCH') {
+      if (!target || !target.isValid || this.stateTicks > 10) {
+        this._resetOffensiveState(true);
+        return false;
+      }
+
+      const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
+      const reachDist = this._getReachDistanceToEntity(target);
+      if (reachDist > maxHitRange + 0.35) {
+        this._resetOffensiveState(true);
+        return false;
+      }
+
+      const swordRecord = this._findBestSword();
+      if (!swordRecord) {
+        this._resetOffensiveState(true);
+        return false;
+      }
+
+      const torsoPos = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
+      const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 1.5, toleranceRad: 0.2 });
+      const equipRes = this._ensureItemHeld(swordRecord);
+
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', this.bot.food > 6);
+      }
+
+      if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned || reachDist > maxHitRange) {
+        return true;
+      }
+
+      if (typeof this.bot.attack === 'function') {
+        this.bot.attack(target);
+      }
+      this.lastHitCrystalTime = Date.now();
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('forward', false);
+      }
+
+      const trajPlan = planHitCrystalTrajectory(this, target) ||
+        this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 2));
+      if (!trajPlan) {
+        this._resetOffensiveState(true);
+        return false;
+      }
+
+      this.activePlan = trajPlan;
+      this.stepDelayTicks = 1;
+      if (trajPlan.coverSpot) {
+        this.state = 'CRYSTAL_COVER';
+      } else if (trajPlan.needsObsidian) {
+        this.state = 'CRYSTAL_PLACE_OBSIDIAN';
+      } else {
+        this.state = 'CRYSTAL_PLACE_CRYSTAL';
+      }
+      return true;
+    }
+
     this.bot.setControlState('sprint', false);
 
-    // Optional Cover Placement before crystal
+    // Optional Feet Blast-Shield Cover Placement before crystal
     if (this.state === 'CRYSTAL_COVER') {
       const cover = plan.coverSpot;
+      const nextState = plan.detonateOnly
+        ? 'CRYSTAL_DETONATE'
+        : (plan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL');
       if (!cover) {
-        this.state = plan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL';
+        this.state = nextState;
         return true;
       }
       const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 1.35, toleranceRad: 0.16 });
       const equipRes = this._ensureItemHeld(cover.blockRecord);
       if (!equipRes.found) {
-        this.state = plan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL';
+        this.state = nextState;
         return true;
       }
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -1381,7 +1587,7 @@ class BurstModule {
         }
       }
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = plan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL';
+      this.state = nextState;
       return true;
     }
 
@@ -1469,16 +1675,18 @@ class BurstModule {
       return true;
     }
 
-    // Step 3: Next-tick Crystal Detonation
+    // Step 3: Spawn-Tick Crystal Detonation
     if (this.state === 'CRYSTAL_DETONATE') {
-      const crystalEntity = this._findCrystalEntityNear(plan.blastPos, 2.5);
+      const crystalEntity = (plan.spawnedCrystal && plan.spawnedCrystal.isValid)
+        ? plan.spawnedCrystal
+        : this._findCrystalEntityNear(plan.blastPos, 2.5);
       const aimPos = crystalEntity ? crystalEntity.position.offset(0, 0.5, 0) : plan.blastPos.offset(0, 0.5, 0);
       const aimStatus = this.aimer.stepTowardsPoint(aimPos, {
         speedMultiplier: 1.65,
         toleranceRad: 0.28
       });
 
-      if (this.stepDelayTicks > 0 || !crystalEntity || !aimStatus.aligned) {
+      if (!crystalEntity || (this.stepDelayTicks > 0 && !plan.spawnedCrystal) || !aimStatus.aligned) {
         return true;
       }
 
@@ -1494,6 +1702,11 @@ class BurstModule {
   }
 
   _tickAnchorState() {
+    if (!this._canUseRespawnAnchor()) {
+      this._resetOffensiveState(true);
+      return false;
+    }
+
     const plan = this.activePlan;
     if (!plan) {
       this._resetOffensiveState(true);
@@ -1509,11 +1722,48 @@ class BurstModule {
     this.bot.setControlState('sprint', false);
     const anchorAim = plan.anchorPos.offset(0.5, 0.5, 0.5);
 
+    // Step 0: Feet Blast-Shield Cover Placement before Anchor combo
+    if (this.state === 'ANCHOR_COVER') {
+      const nextState = plan.needsPlace
+        ? 'ANCHOR_PLACE'
+        : (plan.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE');
+      const cover = plan.coverSpot;
+      if (!cover || plan.coverPlaced) {
+        this.state = nextState;
+        return true;
+      }
+
+      const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, {
+        speedMultiplier: 1.35,
+        toleranceRad: 0.18
+      });
+      const equipRes = this._ensureItemHeld(cover.blockRecord);
+      if (!equipRes.found) {
+        this.state = nextState;
+        return true;
+      }
+      if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
+        return true;
+      }
+
+      const refBlock = this.bot.blockAt(cover.refPos);
+      if (refBlock && refBlock.boundingBox === 'block' && isAirLike(this.bot.blockAt(cover.placePos))) {
+        this._markOwnPlacement(cover.placePos);
+        if (typeof this.bot.placeBlock === 'function') {
+          Promise.resolve(this.bot.placeBlock(refBlock, cover.face)).catch(() => {});
+        }
+      }
+      plan.coverPlaced = true;
+      this.stepDelayTicks = this.placeDelayTicks;
+      this.state = nextState;
+      return true;
+    }
+
     // Step 1: Place Respawn Anchor
     if (this.state === 'ANCHOR_PLACE') {
       const existing = this.bot.blockAt(plan.anchorPos);
       if (existing && existing.name === 'respawn_anchor') {
-        this.state = 'ANCHOR_CHARGE';
+        this.state = this._getAnchorCharges(existing) >= 1 ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE';
         return true;
       }
 
@@ -1548,13 +1798,18 @@ class BurstModule {
       return true;
     }
 
-    // Step 2: Charge Respawn Anchor with Glowstone (activateBlock)
+    // Step 2: Single-Charge Efficiency — Charge Respawn Anchor with exactly 1 Glowstone block
     if (this.state === 'ANCHOR_CHARGE') {
       const anchorBlock = this.bot.blockAt(plan.anchorPos);
       if (!anchorBlock || anchorBlock.name !== 'respawn_anchor') {
         if (this.stateTicks < 10) return true;
         this._resetOffensiveState(true);
         return false;
+      }
+
+      if (plan.charged || this._getAnchorCharges(anchorBlock) >= 1) {
+        this.state = 'ANCHOR_SWITCH_SLOT';
+        return true;
       }
 
       const glowstoneItem = this._findItem('glowstone');
@@ -1576,17 +1831,19 @@ class BurstModule {
         Promise.resolve(this.bot.activateBlock(anchorBlock)).catch(() => {});
       }
 
+      plan.charged = true;
       this.stepDelayTicks = this.placeDelayTicks;
       this.state = 'ANCHOR_SWITCH_SLOT';
       return true;
     }
 
-    // Step 3: Switch to a non-glowstone slot (sequential tick before cover & detonation)
+    // Step 3: Mandatory Hotbar Swap to non-glowstone slot (Totem, Sword, or Obsidian) before detonating
     if (this.state === 'ANCHOR_SWITCH_SLOT') {
       this.aimer.stepTowardsPoint(anchorAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
       if (this.stepDelayTicks > 0) return true;
 
-      if (this.bot.heldItem && this.bot.heldItem.name === 'glowstone') {
+      const heldName = this.bot.heldItem ? this.bot.heldItem.name : '';
+      if (heldName === 'glowstone' || heldName === 'respawn_anchor') {
         const safeSlot = this._findNonGlowstoneHotbarSlot();
         if (safeSlot < 0) {
           this._resetOffensiveState(true);
@@ -1595,62 +1852,14 @@ class BurstModule {
         if (typeof this.bot.setQuickBarSlot === 'function') {
           this.bot.setQuickBarSlot(safeSlot);
         }
+        this.stepDelayTicks = Math.max(1, this.placeDelayTicks);
       }
 
-      this.stepDelayTicks = this.placeDelayTicks;
-      this.state = 'ANCHOR_SHIELD_COVER';
-      return true;
-    }
-
-    // Step 4: Raise Shield / Place Cover before detonating on the following tick
-    if (this.state === 'ANCHOR_SHIELD_COVER') {
-      this.aimer.stepTowardsPoint(anchorAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
-      if (this.stepDelayTicks > 0) return true;
-
-      const offhand = this._getOffhandItem();
-      const hasOffhandShield = Boolean(offhand && offhand.name === 'shield');
-
-      if (hasOffhandShield) {
-        this.bot.setControlState('sneak', true);
-        if (!this.anchorShieldRaised && typeof this.bot.activateItem === 'function') {
-          this.bot.activateItem(true);
-          this.anchorShieldRaised = true;
-        }
-        this.stepDelayTicks = this.placeDelayTicks;
-        this.state = 'ANCHOR_DETONATE';
-        return true;
-      }
-
-      // If no offhand shield, try placing a cover block if planned, else crouch facing anchor
-      if (plan.coverSpot && !plan.coverPlaced) {
-        const cover = plan.coverSpot;
-        const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 1.35, toleranceRad: 0.18 });
-        const equipRes = this._ensureItemHeld(cover.blockRecord);
-        if (equipRes.found) {
-          if (equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
-            return true;
-          }
-          const refBlock = this.bot.blockAt(cover.refPos);
-          if (refBlock && refBlock.boundingBox === 'block' && isAirLike(this.bot.blockAt(cover.placePos))) {
-            this._markOwnPlacement(cover.placePos);
-            if (typeof this.bot.placeBlock === 'function') {
-              Promise.resolve(this.bot.placeBlock(refBlock, cover.face)).catch(() => {});
-            }
-          }
-          plan.coverPlaced = true;
-          this.stepDelayTicks = this.placeDelayTicks;
-          this.state = 'ANCHOR_DETONATE';
-          return true;
-        }
-      }
-
-      this.bot.setControlState('sneak', true);
-      this.stepDelayTicks = this.placeDelayTicks;
       this.state = 'ANCHOR_DETONATE';
       return true;
     }
 
-    // Step 5: Detonate Respawn Anchor on the following tick (activateBlock with non-glowstone slot)
+    // Step 4: Detonate Respawn Anchor on the following tick (activateBlock with non-glowstone slot)
     if (this.state === 'ANCHOR_DETONATE') {
       const anchorBlock = this.bot.blockAt(plan.anchorPos);
       if (!anchorBlock || anchorBlock.name !== 'respawn_anchor') {
@@ -1663,6 +1872,7 @@ class BurstModule {
         const safeSlot = this._findNonGlowstoneHotbarSlot();
         if (safeSlot >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
           this.bot.setQuickBarSlot(safeSlot);
+          this.stepDelayTicks = Math.max(1, this.placeDelayTicks);
           return true;
         }
         this._resetOffensiveState(true);
@@ -2027,7 +2237,7 @@ class BurstModule {
       return false;
     }
 
-    const minBurstHealth = this.burstCfg.minBurstHealth !== undefined ? this.burstCfg.minBurstHealth : 14;
+    const minBurstHealth = this.burstCfg.minBurstHealth !== undefined ? this.burstCfg.minBurstHealth : 9;
 
     // Continue an active offensive sequence
     if (this.state !== 'IDLE') {
@@ -2037,7 +2247,7 @@ class BurstModule {
       }
 
       if (this.state.startsWith('CRYSTAL_')) {
-        return this._tickCrystalState();
+        return this._tickCrystalState(target);
       }
       if (this.state.startsWith('ANCHOR_')) {
         return this._tickAnchorState();
@@ -2049,62 +2259,96 @@ class BurstModule {
 
     // IDLE: check preconditions to initiate a new offensive burst
     if (!target || !target.isValid) return false;
-
-    const predictedFeet = this._getPredictedTargetFeet(target, 3);
-
-    // 0. HIGH-TIER CPvP PRIORITY: Immediately pop any already-placed End Crystal that favors us!
-    if (this.burstCfg.crystalEnabled !== false && this.bot.health > Math.max(6, minBurstHealth - 2)) {
-      const popCrystal = this._findExistingPoppableCrystal(target, predictedFeet);
-      if (popCrystal) {
-        this.activePlan = {
-          kind: 'crystal',
-          basePos: popCrystal.position.floored().offset(0, -1, 0),
-          blastPos: popCrystal.position.clone()
-        };
-        this.state = 'CRYSTAL_DETONATE';
-        this.stateTicks = 0;
-        this.stepDelayTicks = 0;
-        return this._tickCrystalState();
-      }
-    }
-
     if (this.bot.health <= minBurstHealth) return false;
 
-    // Evaluate End Crystal and Respawn Anchor candidates
-    const bestCrystal = this._findBestCrystalPlacement(target, predictedFeet);
-    const bestAnchor = this._findBestAnchorPlacement(target, predictedFeet);
+    const predictedFeet = this._getPredictedTargetFeet(target, 3);
+    const targetDist = this.bot.entity.position.distanceTo(target.position);
 
-    let chosenExplosive = null;
-    if (bestCrystal && bestAnchor) {
-      chosenExplosive = bestCrystal.score >= bestAnchor.score ? bestCrystal : bestAnchor;
-    } else {
-      chosenExplosive = bestCrystal || bestAnchor;
+    // 0. Instant CPvP pop on any existing End Crystal that favors us (with feet blast-shield if needed)
+    if (this.burstCfg.crystalEnabled !== false) {
+      const popPlan = this._findExistingPoppableCrystal(target, predictedFeet);
+      if (popPlan) {
+        this.activePlan = {
+          kind: 'crystal',
+          detonateOnly: true,
+          spawnedCrystal: popPlan.entity,
+          basePos: popPlan.entity.position.floored().offset(0, -1, 0),
+          blastPos: popPlan.entity.position.clone(),
+          coverSpot: popPlan.coverSpot
+        };
+        this.state = popPlan.coverSpot ? 'CRYSTAL_COVER' : 'CRYSTAL_DETONATE';
+        this.stateTicks = 0;
+        this.stepDelayTicks = 0;
+        return this._tickCrystalState(target);
+      }
     }
 
-    if (chosenExplosive) {
-      this.activePlan = chosenExplosive;
-      this.stateTicks = 0;
-      this.stepDelayTicks = 0;
-
-      if (chosenExplosive.kind === 'crystal') {
-        if (chosenExplosive.coverSpot) {
-          this.state = 'CRYSTAL_COVER';
-        } else if (chosenExplosive.needsObsidian) {
-          this.state = 'CRYSTAL_PLACE_OBSIDIAN';
+    // Priority 3: Dimension-guarded Respawn Anchor combo at <= 3.6b (Blast Shield -> Anchor -> 1x Glowstone -> Swap -> Detonate)
+    if (
+      this._canUseRespawnAnchor() &&
+      this._findItem('respawn_anchor') &&
+      this._findItem('glowstone') &&
+      targetDist <= (this.burstCfg.anchorMaxRange || 3.6)
+    ) {
+      const bestAnchor = this._findBestAnchorPlacement(target, predictedFeet);
+      if (bestAnchor) {
+        this.activePlan = bestAnchor;
+        this.stateTicks = 0;
+        this.stepDelayTicks = 0;
+        if (bestAnchor.coverSpot) {
+          this.state = 'ANCHOR_COVER';
+        } else if (bestAnchor.needsPlace) {
+          this.state = 'ANCHOR_PLACE';
+        } else if (bestAnchor.alreadyCharged) {
+          this.state = 'ANCHOR_SWITCH_SLOT';
         } else {
-          this.state = 'CRYSTAL_PLACE_CRYSTAL';
+          this.state = 'ANCHOR_CHARGE';
         }
-        return this._tickCrystalState();
-      }
-
-      if (chosenExplosive.kind === 'anchor') {
-        this.state = chosenExplosive.needsPlace ? 'ANCHOR_PLACE' : 'ANCHOR_CHARGE';
         return this._tickAnchorState();
       }
     }
 
-    // Fall back to Wind Charge Mace Launch on open ground
-    if (this._canStartWindChargeLaunch(target)) {
+    // Priority 4: End Crystal combo at <= 4.5b (Surround Pressure -> Hit-Crystal -> Place-and-Pop)
+    if (
+      this.burstCfg.crystalEnabled !== false &&
+      this._findItem('end_crystal') &&
+      targetDist <= (this.burstCfg.crystalMaxRange || 4.5)
+    ) {
+      let crystalPlan = null;
+
+      if (this.burstCfg.surroundPressureEnabled !== false && isTargetInSurround(this.bot, target)) {
+        crystalPlan = planSurroundPressurePlacement(this, target, predictedFeet);
+      }
+
+      if (!crystalPlan && this._canStartHitCrystal(target)) {
+        this.activePlan = { kind: 'crystal', isHitCrystal: true };
+        this.state = 'CRYSTAL_HIT_LAUNCH';
+        this.stateTicks = 0;
+        this.stepDelayTicks = 0;
+        return this._tickCrystalState(target);
+      }
+
+      if (!crystalPlan) {
+        crystalPlan = this._findBestCrystalPlacement(target, predictedFeet);
+      }
+
+      if (crystalPlan) {
+        this.activePlan = crystalPlan;
+        this.stateTicks = 0;
+        this.stepDelayTicks = 0;
+        if (crystalPlan.coverSpot) {
+          this.state = 'CRYSTAL_COVER';
+        } else if (crystalPlan.needsObsidian) {
+          this.state = 'CRYSTAL_PLACE_OBSIDIAN';
+        } else {
+          this.state = 'CRYSTAL_PLACE_CRYSTAL';
+        }
+        return this._tickCrystalState(target);
+      }
+    }
+
+    // Optional Wind Charge Mace Launch fallback (only if explicitly enabled)
+    if (this.burstCfg.windChargeLaunchEnabled === true && this._canStartWindChargeLaunch(target)) {
       this.activePlan = { kind: 'wind_mace' };
       this.state = 'WIND_AIM_LAUNCH';
       this.stateTicks = 0;

@@ -19,10 +19,8 @@ const CART_STATES = Object.freeze({
 });
 
 /**
- * Elite Cart PvP module:
- * Pre-loads hotbar Crossbows (>5b), stuns shields with Axe, places blast-shield cover /
- * predictive rails (pos + vel * 5), stacks 2-3 TNT minecarts with hotbar cycling,
- * detonates instantly via Flame Crossbow/Bow, and swaps to Sword/Axe for follow-up crits.
+ * @deprecated TNT Minecart, rail, and crossbow-detonation behaviors are deprecated in favor of
+ * high-cadence End Crystal and Respawn Anchor PvP (`modules/burst.js` + `modules/cpvp_tactics.js`).
  */
 class CartModule {
   constructor(bot, config, aimer, prediction = null, combat = null) {
@@ -377,6 +375,12 @@ class CartModule {
   }
 
   tick(target) {
+    this.swappedThisTick = false;
+    this.cancel();
+    return false;
+  }
+
+  _legacyTick(target) {
     this.swappedThisTick = false;
     if (this.cartCfg.enabled === false || !this.bot || !this.bot.entity || !target || !target.isValid) {
       this.cancel();

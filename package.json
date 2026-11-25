@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node -e \"require('./modules/constants'); require('./modules/aim'); require('./modules/prediction'); require('./modules/combat'); require('./modules/survival'); require('./modules/ranged'); require('./modules/burst'); require('./modules/cart'); require('./modules/aerial'); console.log('All modules loaded cleanly.');\""
+    "test": "node -e \"require('./modules/constants'); require('./modules/aim'); require('./modules/prediction'); require('./modules/combat'); require('./modules/survival'); require('./modules/ranged'); require('./modules/cpvp_tactics'); require('./modules/mace_elytra'); require('./modules/burst'); require('./modules/cart'); require('./modules/aerial'); console.log('All modules loaded cleanly.');\""
   },
   "keywords": [],
   "author": "",

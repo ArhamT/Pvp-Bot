@@ -10,6 +10,7 @@ const {
   isSpearItem,
   getItemMetadataText
 } = require('./constants');
+const { executeAttributeSwapAttack } = require('./mace_elytra');
 
 const ATTACK_SPEED_OVERRIDES = {
   mace: 0.6,
@@ -1471,11 +1472,12 @@ class CombatModule {
       return;
     }
 
-    // --- Path C2: Ground Breach Swap Tick N (Swap to Breach Mace; attack on Tick N+1, swap back Tick N+2) ---
+    // --- Path C2: Ground Breach Attribute Swap (or multi-tick swap fallback) ---
     const breachReady = (cooldownRatio >= requiredCooldown && (!this.critInProgress || isFalling)) ||
       (isFalling && cooldownRatio >= 0.85);
     if (
       this.combatCfg.enableBreachSwap &&
+      !this.combatCfg.durabilityDrainMode &&
       this.breachSwapState === 'IDLE' &&
       this.breachMaceSlot >= 0 &&
       this.swordSlot >= 0 &&
@@ -1484,6 +1486,25 @@ class CombatModule {
       breachReady &&
       this.isTargetHeavilyArmored(target)
     ) {
+      if (this.combatCfg.sameTickAttributeSwap !== false) {
+        if (isFalling) {
+          this.bot.setControlState('sprint', false);
+        }
+        executeAttributeSwapAttack(
+          this.bot,
+          target,
+          { hotbarIndex: this.swordSlot },
+          { hotbarIndex: this.breachMaceSlot },
+          { durabilityDrainMode: false }
+        );
+        this.lastSwingTime = now;
+        this.cooldownResetTime = now;
+        this.critInProgress = false;
+        this.bot.setControlState('jump', false);
+        this.breachSwapState = 'SWAP_BACK_PENDING';
+        return;
+      }
+
       const tickRateMs = (this.config && this.config.physics && this.config.physics.tickRateMs) || 50;
       const delayMs = this.combatCfg.breachSwapDelayMs !== undefined ? this.combatCfg.breachSwapDelayMs : 50;
       const requiredDelayTicks = Math.max(1, Math.round(delayMs / tickRateMs));

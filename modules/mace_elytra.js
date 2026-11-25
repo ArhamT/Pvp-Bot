@@ -1,0 +1,529 @@
+'use strict';
+
+const {
+  HOTBAR_START,
+  SWORD_PRIORITY,
+  AXE_PRIORITY,
+  getItemMetadataText
+} = require('./constants');
+
+const ELYTRA_MAX_DURABILITY = 432;
+
+const TRACKED_ENCHANTS = [
+  'protection',
+  'blast_protection',
+  'density',
+  'breach',
+  'wind_burst',
+  'unbreaking',
+  'mending'
+];
+
+function unwrapNbt(val) {
+  let cur = val;
+  while (cur && typeof cur === 'object' && 'value' in cur && !Array.isArray(cur)) {
+    cur = cur.value;
+  }
+  return cur;
+}
+
+function normalizeEnchantName(raw) {
+  if (typeof raw !== 'string') return '';
+  const lower = raw.trim().toLowerCase();
+  return lower.startsWith('minecraft:') ? lower.slice('minecraft:'.length) : lower;
+}
+
+/**
+ * Parses Minecraft 1.21+ item `components` (Array, Map, or object), `enchants`, legacy `nbt`,
+ * and fallback metadata text into normalized enchantment levels.
+ */
+function parseItemEnchantments(item) {
+  const result = {
+    protection: 0,
+    blast_protection: 0,
+    density: 0,
+    breach: 0,
+    wind_burst: 0,
+    unbreaking: 0,
+    mending: 0
+  };
+  if (!item) return result;
+
+  const record = (nameRaw, lvlRaw) => {
+    const name = normalizeEnchantName(nameRaw);
+    if (!name || !Object.prototype.hasOwnProperty.call(result, name)) return;
+    const lvl = Math.max(0, Number(unwrapNbt(lvlRaw)) || 1);
+    if (lvl > result[name]) {
+      result[name] = lvl;
+    }
+  };
+
+  const inspectContainer = (container) => {
+    const unwrapped = unwrapNbt(container);
+    if (!unwrapped) return;
+
+    if (Array.isArray(unwrapped)) {
+      for (const entry of unwrapped) {
+        if (!entry || typeof entry !== 'object') continue;
+        const id = unwrapNbt(entry.id !== undefined ? entry.id : entry.name);
+        const lvl = entry.level !== undefined ? entry.level : entry.lvl;
+        record(id, lvl);
+      }
+      return;
+    }
+
+    if (unwrapped instanceof Map) {
+      for (const [key, val] of unwrapped.entries()) {
+        record(key, val);
+      }
+      return;
+    }
+
+    if (typeof unwrapped === 'object') {
+      if (unwrapped.levels) inspectContainer(unwrapped.levels);
+      if (unwrapped.enchantments) inspectContainer(unwrapped.enchantments);
+      for (const [key, val] of Object.entries(unwrapped)) {
+        if (key === 'levels' || key === 'enchantments') continue;
+        record(key, val);
+      }
+    }
+  };
+
+  if (Array.isArray(item.enchants)) {
+    inspectContainer(item.enchants);
+  }
+
+  if (Array.isArray(item.components)) {
+    for (const comp of item.components) {
+      if (!comp || typeof comp !== 'object') continue;
+      const type = normalizeEnchantName(comp.type || '');
+      if (type === 'enchantments' || type === 'stored_enchantments') {
+        inspectContainer(comp.data || comp.value || comp);
+      }
+    }
+  } else if (item.components && typeof item.components === 'object') {
+    inspectContainer(item.components.enchantments || item.components['minecraft:enchantments']);
+    inspectContainer(item.components.stored_enchantments || item.components['minecraft:stored_enchantments']);
+  }
+
+  if (item.componentMap instanceof Map) {
+    inspectContainer(item.componentMap.get('enchantments') || item.componentMap.get('minecraft:enchantments'));
+  }
+
+  if (item.nbt && typeof item.nbt === 'object') {
+    const nbtVal = unwrapNbt(item.nbt);
+    if (nbtVal && typeof nbtVal === 'object') {
+      if (nbtVal.Enchantments) inspectContainer(nbtVal.Enchantments);
+      if (nbtVal.ench) inspectContainer(nbtVal.ench);
+    }
+  }
+
+  // Fallback text extraction (strip specialized protection types before matching generic 'protection')
+  const rawText = getItemMetadataText(item);
+  if (rawText) {
+    const bpMatch = rawText.match(/blast_protection[^0-9]{0,20}(\d+)/);
+    if (bpMatch && Number(bpMatch[1]) > result.blast_protection) {
+      result.blast_protection = Number(bpMatch[1]);
+    } else if (rawText.includes('blast_protection') && result.blast_protection === 0) {
+      result.blast_protection = 1;
+    }
+
+    const stripped = rawText
+      .replace(/blast_protection/g, '')
+      .replace(/fire_protection/g, '')
+      .replace(/projectile_protection/g, '');
+
+    for (const key of TRACKED_ENCHANTS) {
+      if (key === 'blast_protection') continue;
+      const re = new RegExp(`${key}[^0-9]{0,20}(\\d+)`);
+      const m = stripped.match(re);
+      if (m && Number(m[1]) > result[key]) {
+        result[key] = Number(m[1]);
+      } else if (stripped.includes(key) && result[key] === 0) {
+        result[key] = 1;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Scans inventory for all Maces (Density / Breach / Wind Burst), Axes, and Swords,
+ * and checks whether the Axe is positioned to the right of all Maces on the hotbar.
+ */
+function scanWeaponEnchantments(bot) {
+  const empty = {
+    maces: [],
+    densityMace: null,
+    breachMace: null,
+    windBurstMace: null,
+    bestAxe: null,
+    bestSword: null,
+    axeRightOfMace: false
+  };
+  if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) return empty;
+
+  const hotbarStart = bot.inventory.hotbarStart || HOTBAR_START;
+  const slots = bot.inventory.slots;
+  const maces = [];
+  let bestAxe = null;
+  let bestSword = null;
+
+  for (let slot = 0; slot < slots.length; slot++) {
+    const item = slots[slot];
+    if (!item || !item.name) continue;
+    const inHotbar = slot >= hotbarStart && slot < hotbarStart + 9;
+    const hotbarIndex = inHotbar ? slot - hotbarStart : -1;
+
+    if (item.name === 'mace') {
+      const ench = parseItemEnchantments(item);
+      maces.push({
+        slot,
+        hotbarIndex,
+        item,
+        density: ench.density,
+        breach: ench.breach,
+        wind_burst: ench.wind_burst
+      });
+    } else if (AXE_PRIORITY.includes(item.name)) {
+      const tier = AXE_PRIORITY.indexOf(item.name);
+      if (!bestAxe || (inHotbar && bestAxe.hotbarIndex < 0) || (inHotbar === (bestAxe.hotbarIndex >= 0) && tier < bestAxe.tier)) {
+        bestAxe = { slot, hotbarIndex, item, tier };
+      }
+    } else if (SWORD_PRIORITY.includes(item.name)) {
+      const tier = SWORD_PRIORITY.indexOf(item.name);
+      if (!bestSword || (inHotbar && bestSword.hotbarIndex < 0) || (inHotbar === (bestSword.hotbarIndex >= 0) && tier < bestSword.tier)) {
+        bestSword = { slot, hotbarIndex, item, tier };
+      }
+    }
+  }
+
+  const pickBest = (cmp) => {
+    if (maces.length === 0) return null;
+    const sorted = maces.slice().sort(cmp);
+    return sorted[0];
+  };
+
+  const densityMace = pickBest((a, b) =>
+    (b.density - a.density) ||
+    (b.wind_burst - a.wind_burst) ||
+    ((b.hotbarIndex >= 0 ? 1 : 0) - (a.hotbarIndex >= 0 ? 1 : 0))
+  );
+  const breachMace = pickBest((a, b) =>
+    (b.breach - a.breach) ||
+    (b.wind_burst - a.wind_burst) ||
+    ((b.hotbarIndex >= 0 ? 1 : 0) - (a.hotbarIndex >= 0 ? 1 : 0))
+  );
+  const windBurstMace = pickBest((a, b) =>
+    (b.wind_burst - a.wind_burst) ||
+    (b.breach - a.breach) ||
+    ((b.hotbarIndex >= 0 ? 1 : 0) - (a.hotbarIndex >= 0 ? 1 : 0))
+  );
+
+  let maxMaceIdx = -1;
+  for (const m of maces) {
+    if (m.hotbarIndex > maxMaceIdx) maxMaceIdx = m.hotbarIndex;
+  }
+  const axeRightOfMace = Boolean(bestAxe && bestAxe.hotbarIndex >= 0 && maxMaceIdx >= 0 && bestAxe.hotbarIndex > maxMaceIdx);
+
+  return {
+    maces,
+    densityMace,
+    breachMace,
+    windBurstMace,
+    bestAxe,
+    bestSword,
+    axeRightOfMace
+  };
+}
+
+/**
+ * Validates worn and carried armor: flags Blast Protection pieces and checks full Protection IV.
+ */
+function validateArmorInventory(bot) {
+  const flaggedPieces = [];
+  let fullProtectionIV = true;
+  if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) {
+    return { fullProtectionIV: false, hasBlastProtection: false, flaggedPieces };
+  }
+
+  for (const item of bot.inventory.slots) {
+    if (!item || !item.name) continue;
+    if (
+      item.name.endsWith('_helmet') ||
+      item.name.endsWith('_chestplate') ||
+      item.name.endsWith('_leggings') ||
+      item.name.endsWith('_boots')
+    ) {
+      const ench = parseItemEnchantments(item);
+      if (ench.blast_protection > 0) {
+        flaggedPieces.push({ slot: item.slot, name: item.name, blast_protection: ench.blast_protection });
+      }
+    }
+  }
+
+  for (const slotIdx of [5, 6, 7, 8]) {
+    const piece = bot.inventory.slots[slotIdx];
+    if (!piece) {
+      fullProtectionIV = false;
+      continue;
+    }
+    const ench = parseItemEnchantments(piece);
+    if (ench.blast_protection > 0 || ench.protection < 4) {
+      fullProtectionIV = false;
+    }
+  }
+
+  return {
+    fullProtectionIV,
+    hasBlastProtection: flaggedPieces.length > 0,
+    flaggedPieces
+  };
+}
+
+/**
+ * Enforces the 7-Block Enchantment Rule:
+ * - fallDistance > 7  -> Density Mace
+ * - fallDistance <= 7 -> Breach Mace
+ */
+function selectMaceForFall(fallDistance, weaponMap, options = {}) {
+  if (!weaponMap || !Array.isArray(weaponMap.maces) || weaponMap.maces.length === 0) return null;
+  const preferWindBurst = options.preferWindBurst !== false;
+  const useDensity = fallDistance > 7.0;
+
+  const ranked = weaponMap.maces.slice().sort((a, b) => {
+    if (useDensity) {
+      if (b.density !== a.density) return b.density - a.density;
+    } else {
+      if (b.breach !== a.breach) return b.breach - a.breach;
+    }
+    if (preferWindBurst && b.wind_burst !== a.wind_burst) {
+      return b.wind_burst - a.wind_burst;
+    }
+    return ((b.hotbarIndex >= 0 ? 1 : 0) - (a.hotbarIndex >= 0 ? 1 : 0));
+  });
+
+  const chosen = ranked[0];
+  return {
+    item: chosen.item,
+    hotbarIndex: chosen.hotbarIndex,
+    isDensity: chosen.density > 0,
+    isBreach: chosen.breach > 0,
+    isWindBurst: chosen.wind_burst > 0
+  };
+}
+
+/**
+ * Extracts structured target combat state from entity properties & metadata (no visual cues).
+ */
+function buildTargetState(target) {
+  if (!target || !target.position) return null;
+  const meta = target.metadata || {};
+  const entityFlags = Number(meta[0] || 0);
+  const handFlags = Number(meta[8] || 0);
+  const eq = Array.isArray(target.equipment) ? target.equipment : [];
+  const mainHand = eq[0] || null;
+  const offHand = eq[1] || null;
+
+  const isGliding = Boolean(
+    target.elytraFlying ||
+    target.pose === 1 ||
+    (typeof target.height === 'number' && target.height <= 0.7) ||
+    (entityFlags & 0x80) !== 0
+  );
+  const hasShield = Boolean(
+    (mainHand && mainHand.name === 'shield') ||
+    (offHand && offHand.name === 'shield')
+  );
+  const isBlocking = Boolean(
+    hasShield &&
+    (target.usingItem || (handFlags & 0x01) !== 0)
+  );
+  const hasTotemOffhand = Boolean(offHand && offHand.name === 'totem_of_undying');
+
+  return {
+    position: target.position,
+    velocity: target.velocity || { x: 0, y: 0, z: 0 },
+    yaw: typeof target.yaw === 'number' ? target.yaw : 0,
+    pitch: typeof target.pitch === 'number' ? target.pitch : 0,
+    height: isGliding ? 0.6 : (target.height || 1.8),
+    isGliding,
+    isBlocking,
+    hasTotemOffhand
+  };
+}
+
+/**
+ * 3-branch Shield Countering logic:
+ * 1. BACKSTAB (preferred airborne when behind or able to flank the 180° shield arc)
+ * 2. STUN_SLAM (Axe -> Mace smash when airborne or either player is gliding)
+ * 3. SHIELD_DRAIN (continuous pressure when unable to backstab or stun-slam)
+ */
+function evaluateShieldCounter(bot, targetState, equipInfo = {}) {
+  if (!bot || !bot.entity || !bot.entity.position || !targetState || !targetState.isBlocking) {
+    return { strategy: 'NONE', dot: 1, behindTarget: false };
+  }
+
+  const dx = bot.entity.position.x - targetState.position.x;
+  const dz = bot.entity.position.z - targetState.position.z;
+  const len = Math.sqrt(dx * dx + dz * dz);
+  if (len < 0.01) {
+    return { strategy: 'BACKSTAB', dot: -1, behindTarget: true };
+  }
+
+  const toBotX = dx / len;
+  const toBotZ = dz / len;
+  const lookX = -Math.sin(targetState.yaw);
+  const lookZ = -Math.cos(targetState.yaw);
+  const dot = lookX * toBotX + lookZ * toBotZ;
+
+  if (dot < 0 || (equipInfo.isAirborne && dot < 0.25)) {
+    return { strategy: 'BACKSTAB', dot, behindTarget: dot < 0 };
+  }
+
+  if (equipInfo.hasAxe && equipInfo.hasMace && (equipInfo.isAirborne || targetState.isGliding || equipInfo.isGliding)) {
+    return { strategy: 'STUN_SLAM', dot, behindTarget: false };
+  }
+
+  return { strategy: 'SHIELD_DRAIN', dot, behindTarget: false };
+}
+
+/**
+ * Checks `bot.entity.effects` for Slow Falling (effect id 28 / 'slow_falling').
+ */
+function hasSlowFalling(bot) {
+  if (!bot || !bot.entity || !bot.entity.effects) return false;
+  const effects = bot.entity.effects;
+  if (effects instanceof Map) {
+    return effects.has(28) || effects.has('28') || effects.has('slow_falling');
+  }
+  if (Array.isArray(effects)) {
+    return effects.some((e) => e && (e.id === 28 || e.name === 'slow_falling'));
+  }
+  if (typeof effects === 'object') {
+    if (effects[28] || effects['28'] || effects.slow_falling) return true;
+    return Object.values(effects).some((e) => e && (e.id === 28 || e.name === 'slow_falling'));
+  }
+  return false;
+}
+
+/**
+ * Detects an incoming enemy Dive Bomb (`dy > 5` and steep downward `vy < -0.6` closing horizontally).
+ */
+function detectEnemyDiveBomb(bot, targetState) {
+  if (!bot || !bot.entity || !bot.entity.position || !targetState || !targetState.position) {
+    return { threat: false, dy: 0, vy: 0, horizDist: Infinity };
+  }
+  const botPos = bot.entity.position;
+  const tPos = targetState.position;
+  const vel = targetState.velocity || { x: 0, y: 0, z: 0 };
+  const dy = tPos.y - botPos.y;
+  const vy = typeof vel.y === 'number' ? vel.y : 0;
+  const dx = botPos.x - tPos.x;
+  const dz = botPos.z - tPos.z;
+  const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+  if (dy <= 5.0 || vy >= -0.6) {
+    return { threat: false, dy, vy, horizDist };
+  }
+
+  const closingSpeed = horizDist > 0.05
+    ? ((vel.x || 0) * (dx / horizDist) + (vel.z || 0) * (dz / horizDist))
+    : 1.0;
+  const threat = horizDist <= 5.0 || (horizDist <= 12.0 && closingSpeed > 0.05);
+
+  return { threat, dy, vy, horizDist };
+}
+
+function getElytraDurabilityInfo(item) {
+  if (!item || item.name !== 'elytra') {
+    return { valid: false, remaining: 0, max: ELYTRA_MAX_DURABILITY };
+  }
+  let used = 0;
+  if (typeof item.durabilityUsed === 'number') {
+    used = item.durabilityUsed;
+  } else if (item.components && typeof item.components.damage === 'number') {
+    used = item.components.damage;
+  } else if (item.nbt && item.nbt.value && item.nbt.value.Damage && typeof item.nbt.value.Damage.value === 'number') {
+    used = item.nbt.value.Damage.value;
+  }
+  const max = typeof item.maxDurability === 'number' ? item.maxDurability : ELYTRA_MAX_DURABILITY;
+  return {
+    valid: true,
+    remaining: Math.max(0, max - used),
+    max
+  };
+}
+
+function shouldConserveElytra(bot, threshold = 50) {
+  if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) {
+    return { low: false, remaining: ELYTRA_MAX_DURABILITY, item: null };
+  }
+  const torsoSlot = typeof bot.getEquipmentDestSlot === 'function' ? bot.getEquipmentDestSlot('torso') : 6;
+  const worn = bot.inventory.slots[torsoSlot];
+  const elytra = (worn && worn.name === 'elytra')
+    ? worn
+    : bot.inventory.slots.find((i) => i && i.name === 'elytra');
+  if (!elytra) {
+    return { low: false, remaining: 0, item: null };
+  }
+  const info = getElytraDurabilityInfo(elytra);
+  return {
+    low: info.remaining < threshold,
+    remaining: info.remaining,
+    item: elytra
+  };
+}
+
+/**
+ * Executes an attribute-swap attack in the same tick window:
+ * holds base Sword/Axe, switches quickbar slot to target Mace, and calls `bot.attack(target)`.
+ * When `durabilityDrainMode` is true, skips swapping and performs a standard attack.
+ */
+function executeAttributeSwapAttack(bot, target, baseSel, maceSel, options = {}) {
+  if (!bot || !target || typeof bot.attack !== 'function') return false;
+
+  if (options.durabilityDrainMode) {
+    bot.attack(target);
+    return true;
+  }
+
+  if (
+    baseSel &&
+    typeof baseSel.hotbarIndex === 'number' &&
+    baseSel.hotbarIndex >= 0 &&
+    typeof bot.setQuickBarSlot === 'function' &&
+    bot.quickBarSlot !== baseSel.hotbarIndex
+  ) {
+    bot.setQuickBarSlot(baseSel.hotbarIndex);
+  }
+
+  if (
+    maceSel &&
+    typeof maceSel.hotbarIndex === 'number' &&
+    maceSel.hotbarIndex >= 0 &&
+    typeof bot.setQuickBarSlot === 'function' &&
+    bot.quickBarSlot !== maceSel.hotbarIndex
+  ) {
+    bot.setQuickBarSlot(maceSel.hotbarIndex);
+  }
+
+  bot.attack(target);
+  return true;
+}
+
+module.exports = {
+  ELYTRA_MAX_DURABILITY,
+  parseItemEnchantments,
+  scanWeaponEnchantments,
+  validateArmorInventory,
+  selectMaceForFall,
+  buildTargetState,
+  evaluateShieldCounter,
+  hasSlowFalling,
+  detectEnemyDiveBomb,
+  getElytraDurabilityInfo,
+  shouldConserveElytra,
+  executeAttributeSwapAttack
+};

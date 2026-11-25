@@ -14,6 +14,16 @@ const {
   isSpearItem,
   hasItemEnchant
 } = require('./constants');
+const {
+  scanWeaponEnchantments,
+  selectMaceForFall,
+  buildTargetState,
+  evaluateShieldCounter,
+  hasSlowFalling,
+  detectEnemyDiveBomb,
+  shouldConserveElytra,
+  executeAttributeSwapAttack
+} = require('./mace_elytra');
 
 const DEFAULT_REACH = 3.0;
 
@@ -25,6 +35,9 @@ const AERIAL_MODES = Object.freeze({
   SPEAR_MACE: 'SPEAR_MACE',
   ELYTRA_DIVE: 'ELYTRA_DIVE',
   ELYTRA_SPEAR: 'ELYTRA_SPEAR',
+  ELYTRA_BOOST: 'ELYTRA_BOOST',
+  DIVE_DODGE: 'DIVE_DODGE',
+  SLOW_FALL_EVADE: 'SLOW_FALL_EVADE',
   CLUTCH: 'CLUTCH'
 });
 
@@ -104,9 +117,23 @@ class AerialModule {
     this.clutchItemName = null;
     this.clutchActivated = false;
 
-    // Bind death/respawn cleanup & enemy Ender Pearl projectile tracking safely
+    // 1.21+ Mace & Elytra-Rocket state tracking
+    this.targetState = null;
+    this.weaponEnchantments = scanWeaponEnchantments(bot);
+    this.pearlInterceptVec = null;
+    this.elytraConserveTicks = 0;
+    this.bHopTicks = 0;
+    this.lastDiveDodgeTime = 0;
+
+    // Bind death/respawn cleanup, inventory enchant rescan, & enemy Ender Pearl projectile tracking safely
     this._onDeath = this._handleDeathOrRespawn.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
+    this._onUpdateSlot = () => {
+      this.weaponEnchantments = scanWeaponEnchantments(this.bot);
+    };
+    if (this.bot && this.bot.inventory && typeof this.bot.inventory.on === 'function') {
+      this.bot.inventory.on('updateSlot', this._onUpdateSlot);
+    }
     if (this.bot && typeof this.bot.on === 'function') {
       this.bot.on('death', this._onDeath);
       this.bot.on('respawn', this._onDeath);
@@ -132,6 +159,9 @@ class AerialModule {
    * Cleans up event listeners and transient aerial state cleanly.
    */
   dispose() {
+    if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
+      this.bot.inventory.removeListener('updateSlot', this._onUpdateSlot);
+    }
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('death', this._onDeath);
       this.bot.removeListener('respawn', this._onDeath);
@@ -142,6 +172,7 @@ class AerialModule {
     this.lastY = null;
     this.lastBotPos = null;
     this.trackedEnemyPearl = null;
+    this.targetState = null;
   }
 
   _handleDeathOrRespawn() {
@@ -417,8 +448,9 @@ class AerialModule {
     }
 
     if (this.lastY !== null) {
+      const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
       const dy = this.lastY - pos.y;
-      if (dy > 0) {
+      if (dy > 0 && velY <= 0) {
         this.fallDistance += dy;
       } else if (dy < -0.05) {
         // Ascending (e.g. jump, wind charge launch, firework boost) resets accumulated descent
@@ -427,6 +459,10 @@ class AerialModule {
     }
 
     this.lastY = pos.y;
+  }
+
+  _resetFallAfterSmash() {
+    this.fallDistance = 0;
   }
 
   _getHeightAboveGround(maxScan = 16) {
@@ -603,67 +639,15 @@ class AerialModule {
   }
 
   /**
-   * Finds the optimal Mace for aerial smashes:
-   * - When `preferWindBurst` is true (chaining bounces & pearl catching), prioritizes Wind Burst Mace.
-   * - Otherwise prioritizes Breach / Density / Wind Burst / any Mace.
+   * Selects the optimal Mace using the 7-Block Enchantment Rule:
+   * - `fallDistance > 7` -> Density Mace (per-block scaling damage)
+   * - `fallDistance <= 7` -> Breach Mace (armor bypass)
    */
-  _findMace(preferWindBurst = false) {
-    const hotbarStart = this._getHotbarStart();
-    const slots = this._getCombatHotbarSlots();
-
-    if (preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false) {
-      if (slots && typeof slots.windBurstMaceSlot === 'number' && slots.windBurstMaceSlot >= 0) {
-        const wbItem = this._getSlotItem(hotbarStart + slots.windBurstMaceSlot);
-        if (wbItem && wbItem.name === 'mace') {
-          return { item: wbItem, hotbarIndex: slots.windBurstMaceSlot, isWindBurst: true, isBreach: this._hasBreachEnchant(wbItem) };
-        }
-      }
-      const items = this._getInventoryItems();
-      const wbDirect = items.find((i) => i.name === 'mace' && this._hasWindBurstEnchant(i));
-      if (wbDirect) return { ...this._makeSelection(wbDirect), isWindBurst: true, isBreach: this._hasBreachEnchant(wbDirect) };
-    }
-
-    // Priority 1: CombatModule-detected Breach Mace hotbar slot
-    if (slots && typeof slots.breachMaceSlot === 'number' && slots.breachMaceSlot >= 0) {
-      const slotItem = this._getSlotItem(hotbarStart + slots.breachMaceSlot);
-      if (slotItem && slotItem.name === 'mace') {
-        return { item: slotItem, hotbarIndex: slots.breachMaceSlot, isBreach: true, isWindBurst: this._hasWindBurstEnchant(slotItem) };
-      }
-    }
-
-    // Priority 2: Density Mace hotbar slot (highest fall-damage multiplier)
-    if (slots && typeof slots.densityMaceSlot === 'number' && slots.densityMaceSlot >= 0) {
-      const slotItem = this._getSlotItem(hotbarStart + slots.densityMaceSlot);
-      if (slotItem && slotItem.name === 'mace') {
-        return { item: slotItem, hotbarIndex: slots.densityMaceSlot, isBreach: false, isWindBurst: this._hasWindBurstEnchant(slotItem) };
-      }
-    }
-
-    // Priority 3: Direct scan for a Breach-enchanted Mace (hotbar first)
-    const items = this._getInventoryItems();
-    const breachHotbar = items.find(
-      (i) => i.name === 'mace' &&
-        typeof i.slot === 'number' &&
-        i.slot >= hotbarStart &&
-        i.slot < hotbarStart + 9 &&
-        this._hasBreachEnchant(i)
-    );
-    if (breachHotbar) return { ...this._makeSelection(breachHotbar), isBreach: true, isWindBurst: this._hasWindBurstEnchant(breachHotbar) };
-
-    const breachInv = items.find((i) => i.name === 'mace' && this._hasBreachEnchant(i));
-    if (breachInv) return { ...this._makeSelection(breachInv), isBreach: true, isWindBurst: this._hasWindBurstEnchant(breachInv) };
-
-    // Priority 4: CombatModule-detected standard Mace hotbar slot
-    if (slots && typeof slots.maceSlot === 'number' && slots.maceSlot >= 0) {
-      const slotItem = this._getSlotItem(hotbarStart + slots.maceSlot);
-      if (slotItem && slotItem.name === 'mace') {
-        return { item: slotItem, hotbarIndex: slots.maceSlot, isBreach: false, isWindBurst: this._hasWindBurstEnchant(slotItem) };
-      }
-    }
-
-    // Priority 5: Any Mace in hotbar or inventory
-    const anyMace = this._findItemByName('mace');
-    return anyMace ? { ...anyMace, isBreach: false, isWindBurst: this._hasWindBurstEnchant(anyMace.item) } : null;
+  _findMace(preferWindBurst = true) {
+    this.weaponEnchantments = scanWeaponEnchantments(this.bot);
+    return selectMaceForFall(this.fallDistance, this.weaponEnchantments, {
+      preferWindBurst: preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false
+    });
   }
 
   _findAxe() {
@@ -818,7 +802,8 @@ class AerialModule {
       ? this.aimer.getEyePosition()
       : this.bot.entity.position.offset(0, 1.62, 0);
     const halfWidth = 0.3;
-    const height = target.height || 1.8;
+    const tState = buildTargetState(target);
+    const height = (tState && tState.height) || target.height || 1.8;
 
     const cx = clamp(eye.x, target.position.x - halfWidth, target.position.x + halfWidth);
     const cy = clamp(eye.y, target.position.y, target.position.y + height);
@@ -827,19 +812,12 @@ class AerialModule {
   }
 
   _isTargetRaisingShield(target) {
+    const tState = buildTargetState(target);
+    if (tState && tState.isBlocking) return true;
     if (this.combat && typeof this.combat.isTargetRaisingShield === 'function') {
       return this.combat.isTargetRaisingShield(target);
     }
-    if (!target || !target.isValid) return false;
-    const equipment = target.equipment || [];
-    const hasShield = equipment.some((item) => item && item.name === 'shield');
-    if (!hasShield) return false;
-
-    const handFlags = target.metadata && target.metadata[8];
-    if (typeof handFlags === 'number') {
-      return (handFlags & 0x01) !== 0;
-    }
-    return Boolean(target.usingHeldItem || target.isUsingItem);
+    return false;
   }
 
   _getPredictedPosition(target, leadTicks = 3) {
@@ -861,12 +839,15 @@ class AerialModule {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
     }
     const predPos = this._getPredictedPosition(target, leadTicks);
+    const tState = buildTargetState(target);
+    const tHeight = (tState && tState.height) || target.height || 1.8;
     const heightOffset = options.heightOffset !== undefined
       ? options.heightOffset
-      : (target.height ? target.height * 0.65 : 1.15);
+      : tHeight * 0.65;
     return this.aimer.stepTowardsPoint(predPos.offset(0, heightOffset, 0), {
       speedMultiplier: options.speedMultiplier || 1.35,
-      toleranceRad: options.toleranceRad !== undefined ? options.toleranceRad : 0.25
+      toleranceRad: options.toleranceRad !== undefined ? options.toleranceRad : 0.25,
+      force: options.force !== undefined ? options.force : true
     });
   }
 
@@ -900,11 +881,12 @@ class AerialModule {
       return false;
     }
 
-    // 1. Always track accurate fall distance & teleport jumps every tick
+    // 1. Always track accurate fall distance, targetState & teleport jumps every tick
     this._updateFallDistance();
     const curPos = this.bot.entity.position;
     this.teleportedThisTick = Boolean(this.lastBotPos && curPos.distanceTo(this.lastBotPos) > 2.5);
     this.lastBotPos = curPos.clone();
+    this.targetState = (target && target.isValid) ? buildTargetState(target) : null;
 
     if (this.trackedEnemyPearl && Date.now() > this.trackedEnemyPearl.expiresAt) {
       this.trackedEnemyPearl = null;
@@ -916,9 +898,49 @@ class AerialModule {
       return true;
     }
 
+    // 1b. HARD ABORT (Threat Matrix): Slow Falling (effect id 28) disables all Mace dives & stays evasive
+    if (hasSlowFalling(this.bot)) {
+      if (
+        this.mode !== AERIAL_MODES.IDLE &&
+        this.mode !== AERIAL_MODES.SLOW_FALL_EVADE &&
+        this.mode !== AERIAL_MODES.CLUTCH
+      ) {
+        this.cancel();
+      }
+      if (this.mode !== AERIAL_MODES.CLUTCH) {
+        return this._tickSlowFallEvade(target);
+      }
+    } else if (this.mode === AERIAL_MODES.SLOW_FALL_EVADE) {
+      this._resetState();
+    }
+
+    // 1c. HARD THREAT CHECK: Dodge incoming Enemy Dive Bombs (dy > 5 && vy < -0.6) via Pearl / Wind Charge
+    if (
+      this.aerialCfg.diveBombDodgeEnabled !== false &&
+      this.mode !== AERIAL_MODES.CLUTCH &&
+      this.mode !== AERIAL_MODES.DIVE_DODGE &&
+      this.targetState
+    ) {
+      const diveThreat = detectEnemyDiveBomb(this.bot, this.targetState);
+      if (diveThreat.threat && (Date.now() - this.lastDiveDodgeTime) >= 1200) {
+        if (this._findItemByName('ender_pearl') || this._findItemByName('wind_charge')) {
+          this.mode = AERIAL_MODES.DIVE_DODGE;
+          this.stage = 'DODGE_EXEC';
+          this.stageTicks = 0;
+          return this._tickDiveDodge(target);
+        }
+      }
+    }
+
     // 2. Continue active aerial state machine if already engaged
     if (this.mode === AERIAL_MODES.CLUTCH) {
       return this._tickClutch();
+    }
+    if (this.mode === AERIAL_MODES.DIVE_DODGE) {
+      return this._tickDiveDodge(target);
+    }
+    if (this.mode === AERIAL_MODES.ELYTRA_BOOST) {
+      return this._tickElytraBoost(target);
     }
     if (this.mode === AERIAL_MODES.PEARL_CATCH) {
       return this._tickPearlCatch(target);
@@ -950,7 +972,7 @@ class AerialModule {
     }
 
     // 4. Evaluate offensive aerial triggers in tactical priority order:
-    //    (a) Stun Slam (airborne descending onto shielded enemy)
+    //    (a) Shield Countering (BACKSTAB / STUN_SLAM / SHIELD_DRAIN) when airborne descending onto shielded enemy
     if (this._canStartStunSlam(target)) {
       this.mode = AERIAL_MODES.STUN_SLAM;
       this.stage = 'AXE_BREAK';
@@ -1124,7 +1146,7 @@ class AerialModule {
     const { onGround, inWater } = this._getEnvironmentFlags();
     const reach = this.combatCfg.reach || DEFAULT_REACH;
 
-    // Stage 1: Aim & throw Ender Pearl onto target/landing zone
+    // Stage 1: Aim along target vector (force = true) & throw Ender Pearl
     if (this.stage === 'PEARL_AIM_THROW') {
       if (this.stageTicks > 18 || !this.pearlCatchLandingTarget) {
         this.mode = AERIAL_MODES.MACE_LAUNCH;
@@ -1148,9 +1170,11 @@ class AerialModule {
         : null;
 
       const sol = this._solvePearlBallistics(targetPos, targetVel);
+      this.pearlInterceptVec = { yaw: sol.yaw, pitch: sol.pitch };
       const aimStatus = this.aimer.stepTowardsAngles(sol.yaw, sol.pitch, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.14
+        toleranceRad: 0.14,
+        force: true
       });
 
       if (eq.ready && !eq.swapped && aimStatus.aligned) {
@@ -1159,14 +1183,42 @@ class AerialModule {
         }
         this.lastPearlCatchTime = Date.now();
         this.trackedEnemyPearl = null;
-        this.stage = 'PEARL_WAIT_TP';
+        if (this.aerialCfg.pearlWindInterceptEnabled !== false && this._findItemByName('wind_charge')) {
+          this.stage = 'PEARL_WIND_INTERCEPT';
+        } else {
+          this.stage = 'PEARL_WAIT_TP';
+        }
         this.stageTicks = 0;
         return true;
       }
       return true;
     }
 
-    // Stage 2: Pre-equip Wind Burst / Breach Mace while pearl flies -> instant smash on teleport/arrival!
+    // Stage 1b: Next-tick Wind Charge interception so the Pearl intercepts the Wind Charge for high-speed catch
+    if (this.stage === 'PEARL_WIND_INTERCEPT') {
+      const windSel = this._findItemByName('wind_charge');
+      if (!windSel || !this.pearlInterceptVec) {
+        this.stage = 'PEARL_WAIT_TP';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      if (typeof windSel.hotbarIndex === 'number' && windSel.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
+        this.bot.setQuickBarSlot(windSel.hotbarIndex);
+      } else {
+        this._equipHand(windSel);
+      }
+
+      this.aimer.stepTowardsAngles(this.pearlInterceptVec.yaw, this.pearlInterceptVec.pitch, { force: true });
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
+      }
+      this.stage = 'PEARL_WAIT_TP';
+      this.stageTicks = 0;
+      return true;
+    }
+
+    // Stage 2: Pre-equip Mace (7-Block Rule) while pearl flies -> instant smash on teleport/arrival!
     if (this.stage === 'PEARL_WAIT_TP') {
       if (!target || !target.isValid) {
         if (this._shouldTriggerClutch(null, true)) {
@@ -1180,14 +1232,14 @@ class AerialModule {
       const reachDist = this._getReachDistance(target);
       const { aimStatus } = this._steerAirborneToward(target, 1);
 
-      // If target raised a shield right where we land -> Stun Slam!
-      if (
-        this.aerialCfg.stunSlamEnabled !== false &&
-        this._isTargetRaisingShield(target) &&
-        reachDist <= 3.6 &&
-        this._findAxe() &&
-        this._findMace(true)
-      ) {
+      // Shield countering branch (BACKSTAB / STUN_SLAM / SHIELD_DRAIN)
+      const counter = evaluateShieldCounter(this.bot, this.targetState, {
+        hasAxe: Boolean(this._findAxe()),
+        hasMace: Boolean(this._findMace(true)),
+        isAirborne: !onGround,
+        isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
+      });
+      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.6) {
         this.mode = AERIAL_MODES.STUN_SLAM;
         this.stage = 'AXE_BREAK';
         this.stageTicks = 0;
@@ -1198,15 +1250,14 @@ class AerialModule {
       const maceSel = this._findMace(true);
       if (maceSel) {
         const eq = this._equipHand(maceSel);
-        // Immediate Mace Smash as soon as pearl teleports us into reach (or we dive into reach)
         const arrivedInReach = reachDist <= reach + 0.25 && (this.teleportedThisTick || aimStatus.aligned || aimStatus.yawErrorDeg < 35);
         if (eq.ready && !eq.swapped && arrivedInReach) {
           if (typeof this.bot.setControlState === 'function') {
             this.bot.setControlState('sprint', false);
           }
           this.bot.attack(target);
+          this._resetFallAfterSmash();
           this.windBurstChainCount++;
-          // Enter WIND_BURST_BOUNCE so a Wind Burst hit immediately chains into the next aerial launch!
           this.mode = AERIAL_MODES.MACE_LAUNCH;
           this.stage = 'WIND_BURST_BOUNCE';
           this.stageTicks = 0;
@@ -1313,7 +1364,7 @@ class AerialModule {
     const launchPitchDeg = horizDist < 3.5 ? -86 : (horizDist < 7.0 ? -80 : -75);
     const launchPitchRad = launchPitchDeg * DEG_TO_RAD;
 
-    // Stage 1: Jump off ground FIRST while equipping wind_charge and starting downward pitch
+    // Stage 1: Same-tick Grounded Wind Charge Launch (jump + pitch -Math.PI/2 + activateItem)
     if (this.stage === 'JUMP_INIT') {
       this.maceJumpTicks++;
       const windSel = this._findItemByName('wind_charge');
@@ -1322,10 +1373,19 @@ class AerialModule {
         return false;
       }
 
-      this._equipHand(windSel);
-      this.aimer.stepTowardsAngles(yawToTarget, launchPitchRad, {
+      if (typeof windSel.hotbarIndex === 'number' && windSel.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
+        if (this.bot.quickBarSlot !== windSel.hotbarIndex) {
+          this.bot.setQuickBarSlot(windSel.hotbarIndex);
+        }
+      } else {
+        const eq = this._equipHand(windSel);
+        if (!eq.ready) return true;
+      }
+
+      this.aimer.stepTowardsAngles(yawToTarget, -Math.PI / 2, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2
+        toleranceRad: 0.2,
+        force: true
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -1334,11 +1394,13 @@ class AerialModule {
         this.bot.setControlState('jump', onGround);
       }
 
-      // Transition to fire wind_charge strictly AFTER jumping off ground (1-2 ticks) for max 8+ block height!
-      if (!onGround || this.maceJumpTicks >= 2) {
-        this.stage = 'WIND_CHARGE_LAUNCH';
-        this.stageTicks = 0;
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
       }
+      this.lastMaceLaunchTime = Date.now();
+      this.stage = 'AIRBORNE_DESCENT';
+      this.stageTicks = 0;
+      this.spearLaunchTicks = 0;
       return true;
     }
 
@@ -1440,13 +1502,17 @@ class AerialModule {
         : 1.8;
 
       if (velY < -0.05) {
-        // Branch A: Target raised shield while we descend -> Stun Slam!
+        // Branch A: 3-Branch Shield Countering (BACKSTAB / STUN_SLAM / SHIELD_DRAIN)
+        const counter = evaluateShieldCounter(this.bot, this.targetState, {
+          hasAxe: Boolean(this._findAxe()),
+          hasMace: Boolean(this._findMace(true)),
+          isAirborne: !onGround,
+          isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
+        });
         if (
           this.aerialCfg.stunSlamEnabled !== false &&
           this.fallDistance >= minFall &&
-          this._isTargetRaisingShield(target) &&
-          this._findAxe() &&
-          this._findMace(true)
+          counter.strategy === 'STUN_SLAM'
         ) {
           this.mode = AERIAL_MODES.STUN_SLAM;
           this.stage = 'AXE_BREAK';
@@ -1455,7 +1521,7 @@ class AerialModule {
           return this._tickStunSlam(target);
         }
 
-        // Branch B: Pre-equip Wind Burst (preferred for chaining) / Breach / Density Mace & SMASH on impact!
+        // Branch B: 7-Block Mace Rule (Density > 7b, Breach <= 7b) & SMASH on impact (incl. BACKSTAB bypass)
         const preferWb = this.aerialCfg.windBurstChainEnabled !== false;
         const maceSel = this._findMace(preferWb);
         if (maceSel) {
@@ -1467,11 +1533,11 @@ class AerialModule {
             reachDist <= reach + 0.15 &&
             (aimStatus.aligned || aimStatus.yawErrorDeg < 30)
           ) {
-            // Drop sprint on smash tick so fall-damage smash registers cleanly
             if (typeof this.bot.setControlState === 'function') {
               this.bot.setControlState('sprint', false);
             }
             this.bot.attack(target);
+            this._resetFallAfterSmash();
             this.windBurstChainCount++;
             this.stage = 'WIND_BURST_BOUNCE';
             this.stageTicks = 0;
@@ -1554,11 +1620,23 @@ class AerialModule {
 
     const aimStatus = this._aimAtTarget(target, 1, {
       speedMultiplier: 1.5,
-      toleranceRad: 0.28
+      toleranceRad: 0.28,
+      force: true
     });
     this._setAirborneMove(aimStatus.yawErrorDeg < 45, false);
 
-    // --- Stage 1: Equip hotbar Axe & break target's shield ---
+    // 3-Branch Shield Countering: BACKSTAB (preferred airborne) bypasses shield without Axe swap
+    const shieldCounter = evaluateShieldCounter(this.bot, this.targetState, {
+      hasAxe: Boolean(this._findAxe()),
+      hasMace: Boolean(this._findMace(true)),
+      isAirborne: !onGround,
+      isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
+    });
+    if (shieldCounter.strategy === 'BACKSTAB') {
+      this.stage = 'MACE_SMASH';
+    }
+
+    // --- Stage 1: Equip hotbar Axe & break target's shield (STUN_SLAM / SHIELD_DRAIN) ---
     if (this.stage === 'AXE_BREAK') {
       const axeSel = this._findAxe();
       if (!axeSel) {
@@ -1566,24 +1644,46 @@ class AerialModule {
         return true;
       }
 
-      // Predict next-tick reach so Axe is swapped 1 tick before entering 3.0b reach (or <= 3.2b)
       const projectedReach = reachDist - Math.abs(velY);
       const readyToEquipAxe = reachDist <= 3.2 || projectedReach <= reach;
 
       if (readyToEquipAxe) {
         const eq = this._equipHand(axeSel);
-        // Break shield when within 3.0b reach and smoothly aligned
         if (eq.ready && reachDist <= reach && aimStatus.aligned) {
+          if (
+            this.aerialCfg.sameTickAttributeSwap !== false &&
+            shieldCounter.strategy === 'STUN_SLAM'
+          ) {
+            const maceSel = this._findMace(true);
+            this.bot.attack(target);
+            this._markShieldDisabled();
+            if (maceSel) {
+              executeAttributeSwapAttack(this.bot, target, axeSel, maceSel, {
+                durabilityDrainMode: Boolean(this.combatCfg.durabilityDrainMode)
+              });
+              this._resetFallAfterSmash();
+              if (this.aerialCfg.windBurstChainEnabled !== false && maceSel.isWindBurst) {
+                this.windBurstChainCount++;
+                this.mode = AERIAL_MODES.MACE_LAUNCH;
+                this.stage = 'WIND_BURST_BOUNCE';
+                this.stageTicks = 0;
+                this.windBurstBounceTicks = 0;
+              } else {
+                this.stage = 'SWORD_RESTORE';
+              }
+              return true;
+            }
+          }
           this.bot.attack(target);
           this._markShieldDisabled();
-          this.stage = 'MACE_SMASH';
+          this.stage = shieldCounter.strategy === 'SHIELD_DRAIN' ? 'AXE_BREAK' : 'MACE_SMASH';
           return true;
         }
       }
       return true;
     }
 
-    // --- Stage 2 (Very next tick): Swap to Wind Burst / Breach Mace & land smash before ground ---
+    // --- Stage 2: Swap to 7-Block Mace & land smash before ground ---
     if (this.stage === 'MACE_SMASH') {
       const maceSel = this._findMace(this.aerialCfg.windBurstChainEnabled !== false);
       if (!maceSel) {
@@ -1597,6 +1697,7 @@ class AerialModule {
           this.bot.setControlState('sprint', false);
         }
         this.bot.attack(target);
+        this._resetFallAfterSmash();
         if (this.aerialCfg.windBurstChainEnabled !== false && maceSel.isWindBurst) {
           this.windBurstChainCount++;
           this.mode = AERIAL_MODES.MACE_LAUNCH;
@@ -1969,7 +2070,7 @@ class AerialModule {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 3: BOOST_CLIMB — Fire firework_rocket immediately once gliding & pitched >= 22°, climb to 65-75°
+    // Stage 3: BOOST_CLIMB — Fire firework_rocket, or Elytra Wind-Boost / B-Hop to conserve rockets
     // -----------------------------------------------------------------------
     if (this.stage === 'BOOST_CLIMB') {
       if (onGround && this.fireworkFired && this.climbTicksAfterBoost > 3) {
@@ -1989,16 +2090,37 @@ class AerialModule {
       const horizDist = Math.sqrt(dx * dx + dz * dz);
       const yawToTarget = Math.atan2(-dx, -dz);
 
-      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, this.boostPitchRad, {
-        speedMultiplier: 1.75,
-        toleranceRad: 0.16
-      });
-
       // Retry start_elytra_flying once if server hasn't acknowledged glide state yet while airborne
       if (!onGround && this.bot.entity.elytraFlying === false && !this.elytraGlideRetrySent && this.stageTicks === 3) {
         this._sendStartElytraFlying();
         this.elytraGlideRetrySent = true;
       }
+
+      // Elytra Wind-Charge Boost (snap down -> fire wind_charge -> snap up on next tick)
+      if (
+        !onGround &&
+        this.aerialCfg.elytraWindBoostEnabled !== false &&
+        this.stageTicks === 2 &&
+        this._findItemByName('wind_charge')
+      ) {
+        const windSel = this._findItemByName('wind_charge');
+        if (windSel && typeof windSel.hotbarIndex === 'number' && windSel.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
+          this.bot.setQuickBarSlot(windSel.hotbarIndex);
+        }
+        this.aimer.stepTowardsAngles(yawToTarget, -Math.PI / 2, { force: true });
+        if (typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+        }
+        this.fireworkFired = true;
+        this.climbTicksAfterBoost = 0;
+        return true;
+      }
+
+      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, this.boostPitchRad, {
+        speedMultiplier: 1.75,
+        toleranceRad: 0.16,
+        force: true
+      });
 
       if (!this.fireworkFired) {
         const rocketSel = this._findItemByName('firework_rocket');
@@ -2010,7 +2132,6 @@ class AerialModule {
 
         const eq = this._equipHand(rocketSel);
         const currentPitchDeg = this.bot.entity.pitch / DEG_TO_RAD;
-        // Fire as soon as rocket is settled and pitched upward (>= 22°) BEFORE hitting the ground!
         if (eq.ready && !eq.swapped && (currentPitchDeg >= 22 || aimStatus.pitchErrorDeg <= 10 || this.stageTicks >= 3)) {
           if (typeof this.bot.activateItem === 'function') {
             this.bot.activateItem(false);
@@ -2020,6 +2141,12 @@ class AerialModule {
           this.climbTicksAfterBoost = 0;
         }
         return true;
+      }
+
+      // B-Hopping height preservation (pitch oscillation without spending extra rockets/wind charges)
+      if (this.aerialCfg.bHopEnabled !== false && this.climbTicksAfterBoost > 0 && this.climbTicksAfterBoost % 5 === 0) {
+        const oscPitch = (this.climbTicksAfterBoost % 10 === 0) ? -25 * DEG_TO_RAD : this.boostPitchRad;
+        this.aimer.stepTowardsAngles(yawToTarget, oscPitch, { force: true });
       }
 
       this.climbTicksAfterBoost++;
@@ -2037,7 +2164,7 @@ class AerialModule {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 4: DIVE — Steer above predicted XZ (4 ticks), pitch -75 to -85 deg
+    // Stage 4: DIVE — Steer above predicted XZ, conserve low-durability Elytra, pitch -75 to -85 deg
     // -----------------------------------------------------------------------
     if (this.stage === 'DIVE') {
       if (onGround || inWater) {
@@ -2055,6 +2182,22 @@ class AerialModule {
         ? this.aerialCfg.elytraStrikeHeight
         : 3.5;
 
+      // Elytra durability conservation: alternate Chestplate / Elytra mid-flight when remaining < threshold
+      const conserveInfo = shouldConserveElytra(this.bot, this.aerialCfg.elytraConserveThreshold || 50);
+      if (conserveInfo.low && this._hasChestplateAvailable()) {
+        this.elytraConserveTicks++;
+        const mod = this.elytraConserveTicks % 5;
+        if (mod === 1 && this._isWearingElytra()) {
+          this._restoreChestplate(true);
+        } else if (mod === 4 && !this._isWearingElytra()) {
+          const elySel = this._findItemByName('elytra');
+          if (elySel) {
+            this._equipTorso(elySel.item, true);
+            this._sendStartElytraFlying();
+          }
+        }
+      }
+
       // Transition to Stage 5 (STRIKE) once <= 3.5 blocks above target
       if (heightAboveTarget <= strikeHeight && (horizDist <= 6.0 || reachDist <= 5.0)) {
         this.stage = 'STRIKE_CHESTPLATE';
@@ -2062,7 +2205,6 @@ class AerialModule {
         return this._tickElytraStrikeChestplate(target);
       }
 
-      // If far horizontally from target while low and about to hit ground, clutch!
       if (heightAboveTarget <= strikeHeight && horizDist > 6.0 && this._shouldTriggerClutch(target, true)) {
         this._enterClutch();
         return this._tickClutch();
@@ -2076,7 +2218,6 @@ class AerialModule {
         ? this.aerialCfg.elytraDivePitchMaxDeg
         : -75) * DEG_TO_RAD;
 
-      // Glide toward predicted XZ when far out; lock steep -75..-85 deg dive once closing above target
       let targetPitchRad;
       if (horizDist > Math.max(12.0, heightAboveTarget * 1.15)) {
         const directPitch = Math.atan2((predPos.y + 4.0) - pos.y, Math.max(0.1, horizDist));
@@ -2088,7 +2229,8 @@ class AerialModule {
 
       this.aimer.stepTowardsAngles(yawToPred, targetPitchRad, {
         speedMultiplier: 1.65,
-        toleranceRad: 0.16
+        toleranceRad: 0.16,
+        force: true
       });
 
       return true;
@@ -2102,10 +2244,10 @@ class AerialModule {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5b: STRIKE_EQUIP_MACE — Equip Breach Mace (or best Mace) on next tick
+    // Stage 5b: STRIKE_EQUIP_MACE — Equip 7-Block Mace on next tick
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_EQUIP_MACE') {
-      this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28 });
+      this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28, force: true });
       const maceSel = this._findMace();
       if (maceSel) {
         this._equipHand(maceSel);
@@ -2115,7 +2257,7 @@ class AerialModule {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5c: STRIKE_SMASH — Execute Mace smash on next tick; Stage 6 CLUTCH on miss
+    // Stage 5c: STRIKE_SMASH — Flight Crit Mace Smash (<= 3.0b) + Immediate Loop on grounded target
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_SMASH') {
       if (onGround || inWater) {
@@ -2125,7 +2267,8 @@ class AerialModule {
 
       const aimStatus = this._aimAtTarget(target, 1, {
         speedMultiplier: 1.6,
-        toleranceRad: 0.28
+        toleranceRad: 0.28,
+        force: true
       });
 
       const maceSel = this._findMace();
@@ -2136,7 +2279,22 @@ class AerialModule {
       }
 
       if (holdingMace && reachDist <= reach && aimStatus.aligned) {
+        if (typeof this.bot.setControlState === 'function') {
+          this.bot.setControlState('sprint', false);
+        }
         this.bot.attack(target);
+        this._resetFallAfterSmash();
+        // Loop back into Launch/Glide immediately to lock down non-elytra targets
+        if (
+          this.aerialCfg.loopDiveOnGrounded !== false &&
+          this.targetState &&
+          !this.targetState.isGliding &&
+          this._hasElytraAvailable() &&
+          this._findItemByName('firework_rocket')
+        ) {
+          this._enterElytraDive();
+          return true;
+        }
         this.stage = 'SWORD_RESTORE';
         return true;
       }
@@ -2166,7 +2324,7 @@ class AerialModule {
     const yawToTarget = Math.atan2(-dx, -dz);
     const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
 
-    this.aimer.stepTowardsAngles(yawToTarget, 38 * DEG_TO_RAD, { speedMultiplier: 1.55 });
+    this.aimer.stepTowardsAngles(yawToTarget, 38 * DEG_TO_RAD, { speedMultiplier: 1.55, force: true });
 
     // Pre-equip rocket if not already held so BOOST_CLIMB ignites without delay
     const rocketSel = this._findItemByName('firework_rocket');
@@ -2215,7 +2373,7 @@ class AerialModule {
   }
 
   _tickElytraStrikeChestplate(target) {
-    this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28 });
+    this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28, force: true });
     this.isGliding = false;
     this._restoreChestplate();
     this.stage = 'STRIKE_EQUIP_MACE';
@@ -2781,6 +2939,107 @@ class AerialModule {
       return true;
     }
 
+    return true;
+  }
+
+  /**
+   * Slow Falling (effect id 28) Threat Matrix handler:
+   * Disables Mace dive attempts and stays evasive in the air to dodge arrows until effect clears.
+   */
+  _tickSlowFallEvade(target) {
+    const { onGround, inWater } = this._getEnvironmentFlags();
+    if (onGround || inWater) {
+      // Grounded with slow falling: keep Mace dives disabled but yield to ground survival/combat
+      this._resetState();
+      return false;
+    }
+
+    this.mode = AERIAL_MODES.SLOW_FALL_EVADE;
+    this.stage = 'EVADE_AIR';
+    this.stageTicks++;
+
+    const awayYaw = (target && target.position)
+      ? Math.atan2(-(this.bot.entity.position.x - target.position.x), -(this.bot.entity.position.z - target.position.z))
+      : this.bot.entity.yaw;
+    const weaveYaw = awayYaw + ((this.stageTicks % 12 < 6) ? 0.55 : -0.55);
+    this.aimer.stepTowardsAngles(weaveYaw, 10 * DEG_TO_RAD, { force: true });
+
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('forward', true);
+      this.bot.setControlState('sprint', true);
+      this.bot.setControlState('left', this.stageTicks % 10 < 5);
+      this.bot.setControlState('right', this.stageTicks % 10 >= 5);
+    }
+    return true;
+  }
+
+  /**
+   * Enemy Dive Bomb dodge: breaks melee reach immediately using Ender Pearl or Wind Charge.
+   */
+  _tickDiveDodge(target) {
+    this.stageTicks++;
+    const pearlSel = this._findItemByName('ender_pearl');
+    const windSel = this._findItemByName('wind_charge');
+    const escapeSel = pearlSel || windSel;
+    if (!escapeSel || this.stageTicks > 6) {
+      this._resetState();
+      return false;
+    }
+
+    const eq = this._equipHand(escapeSel);
+    const awayYaw = (target && target.position)
+      ? Math.atan2(-(this.bot.entity.position.x - target.position.x), -(this.bot.entity.position.z - target.position.z))
+      : this.bot.entity.yaw;
+    const pitch = pearlSel ? 36 * DEG_TO_RAD : -Math.PI / 2;
+    this.aimer.stepTowardsAngles(awayYaw, pitch, { force: true });
+
+    if (eq.ready && !eq.swapped) {
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
+      }
+      this.lastDiveDodgeTime = Date.now();
+      this._resetState();
+      return true;
+    }
+    return true;
+  }
+
+  /**
+   * Elytra Wind-Charge Boost & B-Hopping height preservation loop.
+   */
+  _tickElytraBoost(target) {
+    this.stageTicks++;
+    const { onGround, inWater } = this._getEnvironmentFlags();
+    if (onGround || inWater || this.stageTicks > 20) {
+      this._resetState();
+      return false;
+    }
+
+    const yaw = (target && target.position)
+      ? Math.atan2(-(target.position.x - this.bot.entity.position.x), -(target.position.z - this.bot.entity.position.z))
+      : this.bot.entity.yaw;
+
+    if (this.stage === 'BOOST_SNAP_DOWN') {
+      const windSel = this._findItemByName('wind_charge');
+      if (windSel) {
+        const eq = this._equipHand(windSel);
+        this.aimer.stepTowardsAngles(yaw, -Math.PI / 2, { force: true });
+        if (eq.ready && !eq.swapped) {
+          if (typeof this.bot.activateItem === 'function') {
+            this.bot.activateItem(false);
+          }
+          this.stage = 'BOOST_SNAP_UP';
+        }
+        return true;
+      }
+      this.stage = 'BOOST_SNAP_UP';
+    }
+
+    this.aimer.stepTowardsAngles(yaw, 65 * DEG_TO_RAD, { force: true });
+    this.bHopTicks++;
+    if (this.bHopTicks >= 4) {
+      this._resetState();
+    }
     return true;
   }
 }

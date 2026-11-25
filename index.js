@@ -15,7 +15,6 @@ const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
 const { RangedModule } = require('./modules/ranged');
 const { BurstModule } = require('./modules/burst');
-const { CartModule } = require('./modules/cart');
 const { AerialModule } = require('./modules/aerial');
 
 const STATES = Object.freeze({
@@ -105,7 +104,6 @@ class PvPBotController {
     this.survival = null;
     this.ranged = null;
     this.burst = null;
-    this.cart = null;
     this.aerial = null;
 
     this.state = STATES.IDLE;
@@ -248,7 +246,6 @@ class PvPBotController {
         this.combat = new CombatModule(bot, this.config, this.aimer, this.ranged, this.prediction);
         this.survival = new SurvivalModule(bot, this.config, this.aimer);
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat);
-        this.cart = new CartModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
 
         this.survival.configureAutoEat();
@@ -391,7 +388,6 @@ class PvPBotController {
       if (this.survival) this.survival.dispose();
       if (this.ranged) this.ranged.dispose();
       if (this.burst) this.burst.dispose();
-      if (this.cart) this.cart.dispose();
       if (this.aerial) this.aerial.dispose();
       if (this.prediction) this.prediction.clear();
       this.bot = null;
@@ -897,7 +893,7 @@ class PvPBotController {
         `[DEBUG] State=${this.state} Target=${this.activeTargetName || 'none'} (found=${Boolean(target)}, dist=${dist}) ` +
         `Auto=${this.autoFight} PendingDuel=${this.pendingDuelTarget || 'none'} Controls=[${ctrlState}] ` +
         `Aerial=${aerialInfo} Pots=[${potSummary}] ` +
-        `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, cart=${this.cart ? this.cart.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +
+        `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +
         `Pkt/s=${this.getOutgoingPacketRate()}`
       );
       return;
@@ -1201,7 +1197,6 @@ class PvPBotController {
     if (this.ranged) this.ranged.cancel();
     if (this.survival) this.survival.stopConsumption();
     if (this.burst) this.burst.cancel();
-    if (this.cart) this.cart.cancel();
     if (this.aerial) this.aerial.cancel();
     if (nextState === STATES.IDLE && this.prediction) {
       this.prediction.clear();
@@ -1381,10 +1376,21 @@ class PvPBotController {
       return;
     }
 
-    // 1. HIGHEST PRIORITY: Offhand Totem of Undying (slot 45) / Shield safety
-    const totemSwapActive = this.survival.ensureOffhandSafety();
-
     const target = this._resolveActiveTarget();
+
+    // 1. HIGHEST PRIORITY: Offhand Totem of Undying (slot 45) / Shield safety
+    const totemSwapActive = this.survival.ensureOffhandSafety(target);
+    if (totemSwapActive) {
+      if (this.burst && this.burst.state !== 'IDLE' && this.burst.state !== 'WIND_CLUTCH') {
+        this.burst.cancel();
+      }
+      if (this.combat && this.state === STATES.ENGAGING) {
+        this.combat.stopMovement();
+      }
+      if (this.state === STATES.ENGAGING) {
+        return;
+      }
+    }
 
     // Maintain rolling 5-tick trajectory prediction whenever tracking a valid target
     if (this.prediction && target && target.isValid) {
@@ -1402,19 +1408,17 @@ class PvPBotController {
       return;
     }
 
-    // 2. Global emergency retreat override (bot.health <= 11 during active engagement)
+    // 2. Global emergency retreat override (bot.health <= 9 during active engagement)
     if (
       target &&
       target.isValid &&
       this.state === STATES.ENGAGING &&
       this.survival.needsRetreat()
     ) {
+      if (this.burst && this.burst.state !== 'IDLE' && this.burst.state !== 'WIND_CLUTCH') {
+        this.burst.cancel();
+      }
       this.transitionState(STATES.RETREATING, `critical HP (${this.bot.health.toFixed(1)} <= ${this.config.survival.retreatHealthThreshold})`);
-    }
-
-    // Yield offensive actions during an active emergency Totem swap
-    if (totemSwapActive && this.state === STATES.ENGAGING) {
-      return;
     }
 
     switch (this.state) {
@@ -1619,7 +1623,7 @@ class PvPBotController {
         const pitchDiff = Math.abs(this.roamGlancePitch - (this.bot.entity.pitch || 0));
         if (yawDiff > 0.04 || pitchDiff > 0.04) {
           this.roamLastLookAt = now;
-          this.aimer.stepTowardsAngles(this.roamGlanceYaw, this.roamGlancePitch, { speedMultiplier: 0.35 });
+          this.aimer.stepTowardsAngles(this.roamGlanceYaw, this.roamGlancePitch, { speedMultiplier: 0.35, force: false });
         }
       }
 
@@ -1669,7 +1673,8 @@ class PvPBotController {
       this.roamLastLookAt = now;
       const aimStatus = this.aimer.stepTowardsAngles(yawToDest, 0, {
         speedMultiplier: 0.5,
-        toleranceRad: 0.25
+        toleranceRad: 0.25,
+        force: false
       });
       yawErrorDeg = aimStatus.yawErrorDeg;
     }
@@ -1757,7 +1762,7 @@ class PvPBotController {
       return;
     }
 
-    // Survival priority transitions (only retreat at critical <=6 HP without totem/pots)
+    // Survival priority transitions (Priority 2: <= 9 HP triggers Obsidian cover + Gapple / Pearl reset)
     if (this.survival.needsRetreat()) {
       this.transitionState(STATES.RETREATING, `critical health (${this.bot.health.toFixed(1)})`);
       return;
@@ -1767,14 +1772,13 @@ class PvPBotController {
       return;
     }
 
-    // 0. Inline quick-potting (Instant Health II at <=13 HP) & combat buffs (Strength/Swiftness/FireRes)
-    //    Runs right inside ENGAGING so the bot heals aggressively without running away!
+    // 0. Inline quick-potting (Instant Health II) & combat buffs (Strength/Swiftness/FireRes)
     if (this.survival.tickInlineCombatHeal(target)) {
       this.combat.stopMovement();
       return;
     }
 
-    // 1. Smart shield blocking (bow draw <= 12b or sword/axe rush while weapon on cooldown)
+    // 1. Smart shield blocking (only when offhand holds a shield instead of totem)
     const weaponCooldownProgress = this.combat.getCooldownProgress();
     if (this.survival.tickShield(target, weaponCooldownProgress)) {
       this.combat.stopMovement();
@@ -1782,25 +1786,20 @@ class PvPBotController {
       return;
     }
 
-    // 2. Aerial combat techniques (Stun Slam, Wind-Charge Mace Launch, Spear-to-Mace chain, Elytra Mace Dive)
-    if (this.aerial && this.aerial.tick(target)) {
+    // 2. Primary Offense: Aerial Mace / Elytra-Rocket PvP (yields immediately when no Mace/Elytra gear or no aerial trigger)
+    if (this.config.aerial && this.config.aerial.enabled !== false && this.aerial && this.aerial.tick(target)) {
       this.combat.stopMovement();
       return;
     }
 
-    // 2b. High-velocity Cart PvP combos (shield block -> rail -> 2-3x TNT cart stack -> Flame Crossbow/Bow detonation)
-    if (this.cart && this.cart.tick(target)) {
-      this.combat.stopMovement();
-      return;
-    }
-
-    // 3. Burst damage combos (CPvP instant pop, End Crystal, Respawn Anchor, Wind Charge launch)
+    // 3. End Crystal & Respawn Anchor PvP
+    //    (Priority 3: Anchor <= 3.6b outside Nether; Priority 4: End Crystal <= 4.5b Hit-Crystal / Surround / Place-and-Pop)
     if (this.burst && this.burst.tick(target)) {
       this.combat.stopMovement();
       return;
     }
 
-    // 4. Ranged & utility opportunities (aggressive/agro-cancel pearl, cobweb/lava utility, predictive bow/crossbow)
+    // 3. Gap-closing Ender Pearls & cobweb escape (crossbow/bow disabled in CPvP mode)
     if (!this.ranged.isBusy()) {
       this.ranged.tryEnderPearl(target, 'chase') || this.ranged.tryCloseUtility(target);
     }
@@ -1810,7 +1809,7 @@ class PvPBotController {
       return;
     }
 
-    // 5. High-tier melee & standalone Spear combat (prediction, jump-reset, hit-select, breach swap, strafe, crit, W-tap)
+    // 4. Priority 5 Fallback: sprint-strafe spacing and Sword/Axe shield-break pressure
     this.combat.tick(target);
   }
 
@@ -1840,12 +1839,13 @@ class PvPBotController {
       return;
     }
 
-    // Defensive escape Ender Pearl if < 6 HP and trapped in a combo or cobweb (never interrupt active gapple bite)
+    // Defensive escape Ender Pearl at <= 9 HP when rushed or out of gapples (never interrupt active gapple bite or cover block)
     if (
       !this.ranged.isBusy() &&
       !this.survival.isConsuming &&
       !this.survival.pendingSplashPotion &&
-      !this.survival.pendingLosBlock
+      !this.survival.pendingLosBlock &&
+      (!this.survival.findGoldenApple() || dist < 5.5)
     ) {
       this.ranged.tryDefensivePearl(target);
     }
