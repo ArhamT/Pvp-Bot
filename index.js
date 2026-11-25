@@ -15,6 +15,7 @@ const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
 const { RangedModule } = require('./modules/ranged');
 const { BurstModule } = require('./modules/burst');
+const { CartModule } = require('./modules/cart');
 const { AerialModule } = require('./modules/aerial');
 
 const STATES = Object.freeze({
@@ -104,6 +105,7 @@ class PvPBotController {
     this.survival = null;
     this.ranged = null;
     this.burst = null;
+    this.cart = null;
     this.aerial = null;
 
     this.state = STATES.IDLE;
@@ -246,6 +248,7 @@ class PvPBotController {
         this.combat = new CombatModule(bot, this.config, this.aimer, this.ranged, this.prediction);
         this.survival = new SurvivalModule(bot, this.config, this.aimer);
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat);
+        this.cart = new CartModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
 
         this.survival.configureAutoEat();
@@ -388,6 +391,7 @@ class PvPBotController {
       if (this.survival) this.survival.dispose();
       if (this.ranged) this.ranged.dispose();
       if (this.burst) this.burst.dispose();
+      if (this.cart) this.cart.dispose();
       if (this.aerial) this.aerial.dispose();
       if (this.prediction) this.prediction.clear();
       this.bot = null;
@@ -893,7 +897,7 @@ class PvPBotController {
         `[DEBUG] State=${this.state} Target=${this.activeTargetName || 'none'} (found=${Boolean(target)}, dist=${dist}) ` +
         `Auto=${this.autoFight} PendingDuel=${this.pendingDuelTarget || 'none'} Controls=[${ctrlState}] ` +
         `Aerial=${aerialInfo} Pots=[${potSummary}] ` +
-        `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +
+        `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, cart=${this.cart ? this.cart.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +
         `Pkt/s=${this.getOutgoingPacketRate()}`
       );
       return;
@@ -1197,6 +1201,7 @@ class PvPBotController {
     if (this.ranged) this.ranged.cancel();
     if (this.survival) this.survival.stopConsumption();
     if (this.burst) this.burst.cancel();
+    if (this.cart) this.cart.cancel();
     if (this.aerial) this.aerial.cancel();
     if (nextState === STATES.IDLE && this.prediction) {
       this.prediction.clear();
@@ -1779,6 +1784,12 @@ class PvPBotController {
 
     // 2. Aerial combat techniques (Stun Slam, Wind-Charge Mace Launch, Spear-to-Mace chain, Elytra Mace Dive)
     if (this.aerial && this.aerial.tick(target)) {
+      this.combat.stopMovement();
+      return;
+    }
+
+    // 2b. High-velocity Cart PvP combos (shield block -> rail -> 2-3x TNT cart stack -> Flame Crossbow/Bow detonation)
+    if (this.cart && this.cart.tick(target)) {
       this.combat.stopMovement();
       return;
     }

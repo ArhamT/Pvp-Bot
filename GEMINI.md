@@ -8,9 +8,9 @@ CommonJS Mineflayer PvP bot (`node >= 18`, Windows PowerShell: use `npm.cmd test
 
 ### Layout & Entry Points
 - `start.bat` — Windows interactive launcher (prompts host/user/version/password into `PVPBOT_*` env vars; do **not** enable `EnableDelayedExpansion` around password prompts).
-- `package.json` — Dependencies & `npm.cmd test` smoke check (loads all 8 modules).
-- `config.json` — All runtime tunables (`server`, `bot`, `physics`, `prediction`, `combat`, `burst`, `aerial`, `survival`, `ranged`, `looting`).
-- `index.js` (~1,939 lines) — Main entry point & 20-TPS `physicsTick` FSM (`IDLE`, `ENGAGING`, `RETREATING`, `HEALING`, `LOOTING`), auth, proxy auto-join/rejoin, duel auto-accept, ads, spawn roam, console commands.
+- `package.json` — Dependencies & `npm.cmd test` smoke check (loads all 9 modules).
+- `config.json` — All runtime tunables (`server`, `bot`, `physics`, `prediction`, `combat`, `burst`, `cart`, `aerial`, `survival`, `ranged`, `looting`).
+- `index.js` (~1,945 lines) — Main entry point & 20-TPS `physicsTick` FSM (`IDLE`, `ENGAGING`, `RETREATING`, `HEALING`, `LOOTING`), auth, proxy auto-join/rejoin, duel auto-accept, ads, spawn roam, console commands.
 - `modules/constants.js` (133 lines) — Shared slots/physics/priorities, `ROAM_HAZARD_BLOCKS`, `isSpearItem`, `clearMovementControls`, WeakMap-cached `getItemMetadataText` & `hasItemEnchant`.
 - `modules/aim.js` (181 lines) — `SmoothAimer` clamped exponential look smoothing & `normalizeAngle`.
 - `modules/prediction.js` (265 lines) — 5-tick rolling trajectory predictor (MC air/ground drag & gravity).
@@ -18,6 +18,7 @@ CommonJS Mineflayer PvP bot (`node >= 18`, Windows PowerShell: use `npm.cmd test
 - `modules/survival.js` (~2,283 lines) — Delayed AutoTotem, smart shield, splash/drinkable potions (MC 1.20.4–1.21.4+), XP mending, gapples, armor/hotbar sort.
 - `modules/ranged.js` (~1,493 lines) — Predictive bow/crossbow, necessary-only Ender Pearls, hazard raycasting, cobweb water clutch.
 - `modules/burst.js` (~2,124 lines) — End Crystal, Respawn Anchor, blast-damage estimator, anti-explosive defense, Wind Charge.
+- `modules/cart.js` (~385 lines) — Tournament Cart PvP: crossbow pre-loading, Axe shield stun, obsidian/cobble blast-shield, predictive rail + 2–3x TNT cart stacking, hotbar cart cycling, Flame Crossbow/Bow instant detonation, follow-up weapon swap.
 - `modules/aerial.js` (~2,792 lines) — Fall tracking, Stun Slam, Mace Launch, Wind Burst Pearl Catch, Spear-Mace, Elytra Mace Dive, Elytra Rocket Spear, fall clutch.
 
 ### Key Section Ranges (Files > 300 Lines)

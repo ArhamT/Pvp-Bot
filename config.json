@@ -111,6 +111,20 @@
     "crystalCooldownMs": 150,
     "anchorCooldownMs": 550
   },
+  "cart": {
+    "enabled": true,
+    "minHealth": 10,
+    "engageRange": 4.5,
+    "preloadMinRange": 5.0,
+    "preloadMaxRange": 16.0,
+    "stackCount": 3,
+    "leadTicks": 5,
+    "shieldSelfDistance": 4.5,
+    "crossbowChargeTicks": 26,
+    "bowDetonateTicks": 12,
+    "comboCooldownMs": 900,
+    "refillClickDelayMs": 120
+  },
   "aerial": {
     "enableElytraMace": true,
     "enableElytraSpear": true,
