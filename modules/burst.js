@@ -2,10 +2,14 @@
 
 const { Vec3 } = require('vec3');
 const { clamp, normalizeAngle } = require('./aim');
+const {
+  HOTBAR_START,
+  OFFHAND_SLOT,
+  getItemMetadataText,
+  hasItemEnchant
+} = require('./constants');
 
-const HOTBAR_START = 36;
 const HOTBAR_END = 44;
-const OFFHAND_SLOT = 45;
 
 const CRYSTAL_POWER = 6.0;
 const ANCHOR_POWER = 5.0;
@@ -426,9 +430,9 @@ class BurstModule {
       }
     }
 
-    // 3. Legacy NBT fallback via serialized inspection (avoiding double-counting blast_protection)
+    // 3. Legacy NBT fallback via cached metadata inspection (avoiding double-counting blast_protection)
     if (blastProt === 0 && genericProt === 0 && (item.nbt || item.components)) {
-      const raw = JSON.stringify({ nbt: item.nbt || null, components: item.components || null }).toLowerCase();
+      const raw = getItemMetadataText(item);
       const blastMatch = raw.match(/blast_protection[^0-9]{0,24}(\d+)/);
       if (blastMatch) {
         blastProt = Math.min(5, parseInt(blastMatch[1], 10));
@@ -624,11 +628,7 @@ class BurstModule {
     }
 
     // Prefer a mace with breach enchantment if present in hotbar
-    const breachHotbar = this._findItemInHotbar((item) => {
-      if (item.name !== 'mace') return false;
-      const raw = JSON.stringify({ enchants: item.enchants || null, nbt: item.nbt || null, components: item.components || null }).toLowerCase();
-      return raw.includes('breach');
-    });
+    const breachHotbar = this._findItemInHotbar((item) => item.name === 'mace' && hasItemEnchant(item, 'breach'));
     if (breachHotbar) return breachHotbar;
 
     return this._findItem('mace', hotbarOnly);

@@ -2,37 +2,20 @@
 
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('./aim');
+const {
+  TORSO_SLOT,
+  HOTBAR_START: DEFAULT_HOTBAR_START,
+  PEARL_SPEED,
+  PEARL_GRAVITY,
+  PEARL_DRAG,
+  SWORD_PRIORITY,
+  AXE_PRIORITY,
+  CHESTPLATE_PRIORITY,
+  isSpearItem,
+  hasItemEnchant
+} = require('./constants');
 
-const TORSO_SLOT = 6;
-const DEFAULT_HOTBAR_START = 36;
 const DEFAULT_REACH = 3.0;
-
-const SWORD_PRIORITY = [
-  'netherite_sword',
-  'diamond_sword',
-  'iron_sword',
-  'stone_sword',
-  'golden_sword',
-  'wooden_sword'
-];
-
-const AXE_PRIORITY = [
-  'netherite_axe',
-  'diamond_axe',
-  'iron_axe',
-  'stone_axe',
-  'golden_axe',
-  'wooden_axe'
-];
-
-const CHESTPLATE_PRIORITY = [
-  'netherite_chestplate',
-  'diamond_chestplate',
-  'iron_chestplate',
-  'chainmail_chestplate',
-  'golden_chestplate',
-  'leather_chestplate'
-];
 
 const AERIAL_MODES = Object.freeze({
   IDLE: 'IDLE',
@@ -44,10 +27,6 @@ const AERIAL_MODES = Object.freeze({
   ELYTRA_SPEAR: 'ELYTRA_SPEAR',
   CLUTCH: 'CLUTCH'
 });
-
-const PEARL_SPEED = 1.5;
-const PEARL_GRAVITY = 0.03;
-const PEARL_DRAG = 0.99;
 
 /**
  * Advanced aerial PvP module implementing:
@@ -92,7 +71,6 @@ class AerialModule {
     this.lastMaceLaunchTime = 0;
     this.spearThrustDone = false;
     this.spearLaunchTicks = 0;
-    this.spearDeactivatePending = false;
     this.windBurstBounceTicks = 0;
     this.windBurstChainCount = 0;
     this.maceJumpTicks = 0;
@@ -101,7 +79,6 @@ class AerialModule {
     this.lastPearlCatchTime = 0;
     this.pearlCatchLandingTarget = null;
     this.pearlCatchTicks = 0;
-    this.pearlDeactivatePending = false;
     this.trackedEnemyPearl = null; // { entity, landingPos, expiresAt }
 
     // Elytra Mace Dive & Elytra Spear state
@@ -112,9 +89,7 @@ class AerialModule {
     this.takeoffJumped = false;
     this.isGliding = false;
     this.boostPitchRad = 70 * DEG_TO_RAD;
-    this.divePitchRad = -80 * DEG_TO_RAD;
     this.fireworkFired = false;
-    this.fireworkDeactivatePending = false;
     this.climbTicksAfterBoost = 0;
     this.lastElytraTakeoffTime = 0;
     this.lastRocketTime = 0;
@@ -128,7 +103,6 @@ class AerialModule {
     // Fall-damage clutch state
     this.clutchItemName = null;
     this.clutchActivated = false;
-    this.clutchDeactivatePending = false;
 
     // Bind death/respawn cleanup & enemy Ender Pearl projectile tracking safely
     this._onDeath = this._handleDeathOrRespawn.bind(this);
@@ -346,7 +320,7 @@ class AerialModule {
         this.bot.setControlState('sprint', false);
       }
       if (
-        (this.elytraSpearCharging || this.fireworkDeactivatePending || this.spearDeactivatePending || this.clutchDeactivatePending) &&
+        this.elytraSpearCharging &&
         typeof this.bot.deactivateItem === 'function'
       ) {
         try {
@@ -378,12 +352,10 @@ class AerialModule {
     this.stunSlamAxeSwapped = false;
     this.spearThrustDone = false;
     this.spearLaunchTicks = 0;
-    this.spearDeactivatePending = false;
     this.elytraEquipTicks = 0;
     this.takeoffJumped = false;
     this.isGliding = false;
     this.fireworkFired = false;
-    this.fireworkDeactivatePending = false;
     this.climbTicksAfterBoost = 0;
     this.elytraAirborneTicks = 0;
     this.elytraFlightTicks = 0;
@@ -392,7 +364,6 @@ class AerialModule {
     this.elytraSpearAttackNextTick = false;
     this.clutchItemName = null;
     this.clutchActivated = false;
-    this.clutchDeactivatePending = false;
   }
 
   /**
@@ -570,17 +541,7 @@ class AerialModule {
   }
 
   _hasBreachEnchant(item) {
-    if (!item || item.name !== 'mace') return false;
-    try {
-      const serialized = JSON.stringify({
-        nbt: item.nbt || null,
-        components: item.components || null,
-        enchants: item.enchants || null
-      }).toLowerCase();
-      return serialized.includes('breach');
-    } catch (_) {
-      return false;
-    }
+    return Boolean(item && item.name === 'mace' && hasItemEnchant(item, 'breach'));
   }
 
   _makeSelection(item) {
@@ -638,18 +599,7 @@ class AerialModule {
     if (this.combat && typeof this.combat._getEnchantmentLevel === 'function') {
       return this.combat._getEnchantmentLevel(item, 'wind_burst') >= 1;
     }
-    try {
-      const parts = [];
-      if (item.enchants) parts.push(JSON.stringify(item.enchants));
-      if (item.nbt) parts.push(JSON.stringify(item.nbt));
-      if (item.components) parts.push(JSON.stringify(item.components));
-      if (item.componentMap instanceof Map) {
-        for (const [k, v] of item.componentMap.entries()) parts.push(String(k), JSON.stringify(v));
-      }
-      return parts.join(' ').toLowerCase().includes('wind_burst');
-    } catch (_) {
-      return false;
-    }
+    return hasItemEnchant(item, 'wind_burst');
   }
 
   /**
@@ -731,22 +681,16 @@ class AerialModule {
   _findSpear() {
     const items = this._getInventoryItems();
     const hotbarStart = this._getHotbarStart();
-    const isSpearOrTrident = (i) => {
-      if (!i) return false;
-      const name = String(i.name || '').toLowerCase();
-      const custom = String(i.customName || i.displayName || '').toLowerCase();
-      return name.includes('spear') || name.includes('trident') || custom.includes('spear');
-    };
 
     const hotbarSpear = items.find(
-      (i) => isSpearOrTrident(i) &&
+      (i) => isSpearItem(i) &&
         typeof i.slot === 'number' &&
         i.slot >= hotbarStart &&
         i.slot < hotbarStart + 9
     );
     if (hotbarSpear) return this._makeSelection(hotbarSpear);
 
-    const invSpear = items.find(isSpearOrTrident);
+    const invSpear = items.find(isSpearItem);
     return invSpear ? this._makeSelection(invSpear) : null;
   }
 
@@ -964,20 +908,6 @@ class AerialModule {
 
     if (this.trackedEnemyPearl && Date.now() > this.trackedEnemyPearl.expiresAt) {
       this.trackedEnemyPearl = null;
-    }
-
-    // Release any pending continuous-use item activation (not needed for instant throwables like pearls/wind charges)
-    if (this.fireworkDeactivatePending) {
-      this.fireworkDeactivatePending = false;
-    }
-    if (this.spearDeactivatePending) {
-      this.spearDeactivatePending = false;
-    }
-    if (this.pearlDeactivatePending) {
-      this.pearlDeactivatePending = false;
-    }
-    if (this.clutchDeactivatePending) {
-      this.clutchDeactivatePending = false;
     }
 
     // Complete deferred safe chestplate restore if we cancelled mid-air earlier
@@ -1227,7 +1157,6 @@ class AerialModule {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
-        this.pearlDeactivatePending = true;
         this.lastPearlCatchTime = Date.now();
         this.trackedEnemyPearl = null;
         this.stage = 'PEARL_WAIT_TP';
@@ -1440,7 +1369,6 @@ class AerialModule {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
-        this.spearDeactivatePending = true;
         this.lastMaceLaunchTime = Date.now();
         this.stage = 'AIRBORNE_DESCENT';
         this.stageTicks = 0;
@@ -1820,7 +1748,6 @@ class AerialModule {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
-        this.spearDeactivatePending = true;
         this.lastSpearMaceTime = Date.now();
         this.stage = 'AIRBORNE_DESCENT';
         this.stageTicks = 0;
@@ -1944,12 +1871,6 @@ class AerialModule {
     const boostMax = this.aerialCfg.elytraBoostPitchMaxDeg !== undefined
       ? this.aerialCfg.elytraBoostPitchMaxDeg
       : 75;
-    const diveMin = this.aerialCfg.elytraDivePitchMinDeg !== undefined
-      ? this.aerialCfg.elytraDivePitchMinDeg
-      : -85;
-    const diveMax = this.aerialCfg.elytraDivePitchMaxDeg !== undefined
-      ? this.aerialCfg.elytraDivePitchMaxDeg
-      : -75;
 
     this.mode = AERIAL_MODES.ELYTRA_DIVE;
     this.stage = 'EQUIP_ELYTRA';
@@ -1960,7 +1881,6 @@ class AerialModule {
     this.fireworkFired = false;
     this.climbTicksAfterBoost = 0;
     this.boostPitchRad = ((boostMin + boostMax) * 0.5) * DEG_TO_RAD;
-    this.divePitchRad = ((diveMin + diveMax) * 0.5) * DEG_TO_RAD;
   }
 
   _tickElytraDive(target) {
@@ -2857,7 +2777,6 @@ class AerialModule {
         this.bot.activateItem(false);
       }
       this.clutchActivated = true;
-      this.clutchDeactivatePending = true;
       this.stage = 'CLUTCH_RECOVER';
       return true;
     }

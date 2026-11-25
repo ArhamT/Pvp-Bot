@@ -7,8 +7,8 @@ const mineflayer = require('mineflayer');
 const { Vec3 } = require('vec3');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
-const armorManager = require('mineflayer-armor-manager');
 
+const { ROAM_HAZARD_BLOCKS, clearMovementControls } = require('./modules/constants');
 const { SmoothAimer, normalizeAngle } = require('./modules/aim');
 const { PredictionModule } = require('./modules/prediction');
 const { CombatModule } = require('./modules/combat');
@@ -194,7 +194,6 @@ class PvPBotController {
     // Load Mineflayer plugins (mineflayer-pvp's static getAttackSpeed is used directly in combat.js)
     this.bot.loadPlugin(pathfinder);
     this.bot.loadPlugin(autoEatLoader);
-    this.bot.loadPlugin(armorManager);
 
     this._bindEvents();
   }
@@ -282,10 +281,7 @@ class PvPBotController {
         this.duelsLoginJoinDone = true;
         this._clearDuelsLoginJoinTimer('server/world switch');
         this.log(`Switched world/server — spawned at ${bot.entity.position.floored()}.`);
-        this.activeTargetName = null;
-        this.activeTargetEntityId = null;
-        this.targetLastSeenPos = null;
-        this.targetLostAt = 0;
+        this._clearTargetState();
         this.spawnAnchorPos = bot.entity.position.clone();
         this._resetSpawnRoam();
 
@@ -354,12 +350,7 @@ class PvPBotController {
 
     bot.on('death', () => {
       this.log('Bot died. Resetting state to IDLE.');
-      this.activeTargetName = null;
-      this.activeTargetEntityId = null;
-      this.pendingDuelTarget = null;
-      this.pendingDuelReady = false;
-      this.autoStartDuelUntil = 0;
-      this.inDuelArena = false;
+      this._clearTargetState(true);
       this.duelEndedAt = Date.now();
       this.transitionState(STATES.IDLE, 'death');
     });
@@ -589,14 +580,7 @@ class PvPBotController {
     if (!isDirectDuelsKick && !isGenericKickOrLobby) return false;
 
     // Reset combat cleanly before waiting for proxy settlement
-    this.activeTargetName = null;
-    this.activeTargetEntityId = null;
-    this.targetLastSeenPos = null;
-    this.targetLostAt = 0;
-    this.pendingDuelTarget = null;
-    this.pendingDuelReady = false;
-    this.autoStartDuelUntil = 0;
-    this.inDuelArena = false;
+    this._clearTargetState(true);
     this.duelEndedAt = Date.now();
     this._clearDuelAcceptTimer();
     this.transitionState(STATES.IDLE, 'kicked from duels');
@@ -716,14 +700,7 @@ class PvPBotController {
       lower.includes('you won!') ||
       lower.includes('you lost!')
     ) {
-      this.activeTargetName = null;
-      this.activeTargetEntityId = null;
-      this.targetLastSeenPos = null;
-      this.targetLostAt = 0;
-      this.pendingDuelTarget = null;
-      this.pendingDuelReady = false;
-      this.autoStartDuelUntil = 0;
-      this.inDuelArena = false;
+      this._clearTargetState(true);
       this.duelEndedAt = Date.now();
       if (this.state !== STATES.IDLE) {
         this.transitionState(STATES.IDLE, 'duel ended');
@@ -948,10 +925,7 @@ class PvPBotController {
     }
 
     if (command === 'stop') {
-      this.activeTargetName = null;
-      this.activeTargetEntityId = null;
-      this.pendingDuelTarget = null;
-      this.pendingDuelReady = false;
+      this._clearTargetState(true);
       this.autoFight = false;
       this.transitionState(STATES.IDLE, '!stop command');
       reply('Stopped combat, disabled !auto, and returned to IDLE.');
@@ -1036,6 +1010,19 @@ class PvPBotController {
       ? line.replace(/^(\/\S+)\s+.*$/i, '$1 ********')
       : line;
     this.log(`[SENT] ${masked}`);
+  }
+
+  _clearTargetState(clearDuel = false) {
+    this.activeTargetName = null;
+    this.activeTargetEntityId = null;
+    this.targetLastSeenPos = null;
+    this.targetLostAt = 0;
+    if (clearDuel) {
+      this.pendingDuelTarget = null;
+      this.pendingDuelReady = false;
+      this.autoStartDuelUntil = 0;
+      this.inDuelArena = false;
+    }
   }
 
   /**
@@ -1480,14 +1467,7 @@ class PvPBotController {
   }
 
   _stopSpawnRoam() {
-    if (this.bot && typeof this.bot.setControlState === 'function') {
-      this.bot.setControlState('forward', false);
-      this.bot.setControlState('back', false);
-      this.bot.setControlState('left', false);
-      this.bot.setControlState('right', false);
-      this.bot.setControlState('sprint', false);
-      this.bot.setControlState('jump', false);
-    }
+    clearMovementControls(this.bot);
     this.roamTargetPos = null;
   }
 
@@ -1519,14 +1499,8 @@ class PvPBotController {
     const stepZ = pos.z - Math.cos(yaw) * 1.1;
     const baseY = Math.floor(pos.y);
 
-    const hazardNames = new Set([
-      'water', 'flowing_water', 'lava', 'flowing_lava',
-      'fire', 'soul_fire', 'campfire', 'soul_campfire',
-      'cobweb', 'cactus', 'magma_block', 'sweet_berry_bush', 'wither_rose'
-    ]);
-
     const feetBlock = this.bot.blockAt(new Vec3(pos.x, baseY, pos.z));
-    if (feetBlock && hazardNames.has(feetBlock.name)) {
+    if (feetBlock && ROAM_HAZARD_BLOCKS.has(feetBlock.name)) {
       return { safe: false, shouldStepUp: false };
     }
 
@@ -1537,9 +1511,9 @@ class PvPBotController {
     const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
 
     if (
-      (aheadFeet && hazardNames.has(aheadFeet.name)) ||
-      (aheadHead && hazardNames.has(aheadHead.name)) ||
-      (aheadFloor0 && hazardNames.has(aheadFloor0.name))
+      (aheadFeet && ROAM_HAZARD_BLOCKS.has(aheadFeet.name)) ||
+      (aheadHead && ROAM_HAZARD_BLOCKS.has(aheadHead.name)) ||
+      (aheadFloor0 && ROAM_HAZARD_BLOCKS.has(aheadFloor0.name))
     ) {
       return { safe: false, shouldStepUp: false };
     }
@@ -1726,10 +1700,7 @@ class PvPBotController {
       // If loot appeared right where the target stood, they were defeated
       const nearLoot = this.config.looting.enabled ? this._findNearestLoot() : null;
       if (nearLoot && this.targetLastSeenPos && nearLoot.position.distanceTo(this.targetLastSeenPos) <= 5.0) {
-        this.activeTargetName = null;
-        this.activeTargetEntityId = null;
-        this.targetLastSeenPos = null;
-        this.targetLostAt = 0;
+        this._clearTargetState();
         this.transitionState(STATES.LOOTING, 'target defeated, collecting drops');
         return;
       }
@@ -1761,10 +1732,7 @@ class PvPBotController {
         }
       }
 
-      this.activeTargetName = null;
-      this.activeTargetEntityId = null;
-      this.targetLastSeenPos = null;
-      this.targetLostAt = 0;
+      this._clearTargetState();
       if (nearLoot) {
         this.transitionState(STATES.LOOTING, 'collecting nearby drops');
       } else {
@@ -1779,9 +1747,7 @@ class PvPBotController {
 
     const dist = this.bot.entity.position.distanceTo(target.position);
     if (dist > (this.config.combat.disengageRange || 96.0)) {
-      this.activeTargetName = null;
-      this.activeTargetEntityId = null;
-      this.targetLastSeenPos = null;
+      this._clearTargetState();
       this.transitionState(STATES.IDLE, 'target out of disengage range');
       return;
     }
@@ -1842,7 +1808,7 @@ class PvPBotController {
       if (this.survival.needsHealing()) {
         this.transitionState(STATES.HEALING, 'safe to heal after retreat');
       } else {
-        this.activeTargetName = null;
+        this._clearTargetState();
         this.transitionState(STATES.IDLE, 'threat gone during retreat');
       }
       return;
@@ -1896,7 +1862,7 @@ class PvPBotController {
       if (target && target.isValid) {
         this.transitionState(STATES.ENGAGING, 'healing complete');
       } else {
-        this.activeTargetName = null;
+        this._clearTargetState();
         this.transitionState(STATES.IDLE, 'healing complete, no target');
       }
       return;

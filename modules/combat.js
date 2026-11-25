@@ -4,24 +4,12 @@ const { Vec3 } = require('vec3');
 const { getAttackSpeed } = require('mineflayer-pvp');
 const { goals } = require('mineflayer-pathfinder');
 const { normalizeAngle } = require('./aim');
-
-const SWORD_PRIORITY = [
-  'netherite_sword',
-  'diamond_sword',
-  'iron_sword',
-  'stone_sword',
-  'golden_sword',
-  'wooden_sword'
-];
-
-const AXE_PRIORITY = [
-  'netherite_axe',
-  'diamond_axe',
-  'iron_axe',
-  'stone_axe',
-  'golden_axe',
-  'wooden_axe'
-];
+const {
+  SWORD_PRIORITY,
+  AXE_PRIORITY,
+  isSpearItem,
+  getItemMetadataText
+} = require('./constants');
 
 const ATTACK_SPEED_OVERRIDES = {
   mace: 0.6,
@@ -186,16 +174,13 @@ class CombatModule {
   }
 
   _isSpearItem(item) {
-    if (!item) return false;
-    const name = String(item.name || '').toLowerCase();
-    const custom = String(item.customName || item.displayName || '').toLowerCase();
-    return name.includes('spear') || name === 'trident' || custom.includes('spear');
+    return isSpearItem(item);
   }
 
   _itemHasAnyEnchants(item) {
     if (!item) return false;
     if (Array.isArray(item.enchants) && item.enchants.length > 0) return true;
-    if (item.nbt && JSON.stringify(item.nbt).toLowerCase().includes('enchant')) return true;
+    if (item.nbt && getItemMetadataText(item).includes('enchant')) return true;
     if (item.componentMap instanceof Map) {
       if (item.componentMap.has('enchantments') || item.componentMap.has('minecraft:enchantments')) return true;
     }

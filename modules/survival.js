@@ -2,27 +2,15 @@
 
 const { Vec3 } = require('vec3');
 const { normalizeAngle } = require('./aim');
-
-const OFFHAND_SLOT = 45;
-const HOTBAR_START = 36;
-
-const SWORD_PRIORITY = [
-  'netherite_sword',
-  'diamond_sword',
-  'iron_sword',
-  'stone_sword',
-  'golden_sword',
-  'wooden_sword'
-];
-
-const AXE_PRIORITY = [
-  'netherite_axe',
-  'diamond_axe',
-  'iron_axe',
-  'stone_axe',
-  'golden_axe',
-  'wooden_axe'
-];
+const {
+  OFFHAND_SLOT,
+  HOTBAR_START,
+  SWORD_PRIORITY,
+  AXE_PRIORITY,
+  isSpearItem,
+  clearMovementControls,
+  getItemMetadataText
+} = require('./constants');
 
 const GAPPLE_PRIORITY = [
   'enchanted_golden_apple',
@@ -358,13 +346,7 @@ class SurvivalModule {
   }
 
   _pauseMovementForTotemSwap() {
-    if (!this.bot || typeof this.bot.setControlState !== 'function') return;
-    this.bot.setControlState('sprint', false);
-    this.bot.setControlState('forward', false);
-    this.bot.setControlState('back', false);
-    this.bot.setControlState('left', false);
-    this.bot.setControlState('right', false);
-    this.bot.setControlState('jump', false);
+    clearMovementControls(this.bot);
   }
 
   _isHotbarSlot(slot) {
@@ -1589,7 +1571,7 @@ class SurvivalModule {
     // Also treat a charged crossbow aimed at us as an immediate ranged threat
     const chargedCrossbow = [mainHand, offHand].some((item) => {
       if (!item || item.name !== 'crossbow') return false;
-      const raw = JSON.stringify({ nbt: item.nbt || null, components: item.components || null }).toLowerCase();
+      const raw = getItemMetadataText(item);
       return raw.includes('charged') && (raw.includes('arrow') || raw.includes('firework'));
     });
 
@@ -2089,12 +2071,7 @@ class SurvivalModule {
 
   _moveAwayWalk(target) {
     if (!target || !target.isValid || !this.bot.entity) {
-      this.bot.setControlState('forward', false);
-      this.bot.setControlState('back', false);
-      this.bot.setControlState('left', false);
-      this.bot.setControlState('right', false);
-      this.bot.setControlState('sprint', false);
-      this.bot.setControlState('jump', false);
+      clearMovementControls(this.bot);
       return;
     }
 
@@ -2126,7 +2103,7 @@ class SurvivalModule {
     if (score === 0) return -1;
 
     // Inspect enchantments across legacy NBT and 1.20.5+ item components
-    const raw = JSON.stringify({ nbt: item.nbt || null, components: item.components || null }).toLowerCase();
+    const raw = getItemMetadataText(item);
     const protMatch = raw.match(/protection[^0-9]{0,20}(\d+)/);
     if (protMatch) {
       score += Math.min(5, parseInt(protMatch[1], 10)) * 6;
@@ -2162,12 +2139,7 @@ class SurvivalModule {
       // Preserve worn Elytra in Elytra Spear kits (Elytra + Firework Rocket + Spear/Trident, no Mace)
       if (spec.dest === 'torso' && worn && worn.name === 'elytra') {
         const hasRocket = allItems.some((i) => i && i.name === 'firework_rocket');
-        const hasSpear = allItems.some((i) => {
-          if (!i) return false;
-          const n = String(i.name || '').toLowerCase();
-          const c = String(i.customName || i.displayName || '').toLowerCase();
-          return n.includes('spear') || n.includes('trident') || c.includes('spear');
-        });
+        const hasSpear = allItems.some(isSpearItem);
         const hasMace = allItems.some((i) => i && i.name === 'mace');
         if (hasRocket && hasSpear && !hasMace) {
           continue;

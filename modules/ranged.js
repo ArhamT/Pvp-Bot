@@ -2,29 +2,17 @@
 
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('./aim');
-
-const HAZARD_BLOCKS = new Set([
-  'lava',
-  'flowing_lava',
-  'fire',
-  'soul_fire',
-  'campfire',
-  'soul_campfire',
-  'magma_block',
-  'cobweb',
-  'sweet_berry_bush',
-  'wither_rose',
-  'cactus'
-]);
+const {
+  HAZARD_BLOCKS,
+  PEARL_SPEED,
+  PEARL_GRAVITY,
+  PEARL_DRAG
+} = require('./constants');
 
 const ARROW_SPEED = 3.0;
 const CROSSBOW_SPEED = 3.15;
 const ARROW_GRAVITY = 0.05;
 const ARROW_DRAG = 0.99;
-
-const PEARL_SPEED = 1.5;
-const PEARL_GRAVITY = 0.03;
-const PEARL_DRAG = 0.99;
 
 /**
  * Ranged pressure, tactical Ender Pearl, and Arena/Hazard awareness module:
@@ -280,14 +268,6 @@ class RangedModule {
   }
 
   /**
-   * Backward-compatible wrapper returning { yaw, pitch }.
-   */
-  computeBallisticAngles(targetPos, targetVel, speed = ARROW_SPEED, gravity = ARROW_GRAVITY) {
-    const sol = this.solveProjectileTrajectory(targetPos, targetVel, speed, gravity, ARROW_DRAG);
-    return { yaw: sol.yaw, pitch: sol.pitch };
-  }
-
-  /**
    * Simple block-step raycast to check if line of sight to a point is unobstructed.
    */
   hasClearLineOfSight(toPos) {
@@ -375,20 +355,6 @@ class RangedModule {
   }
 
   /**
-   * Extracts target HP if exposed via entity.health or living-entity metadata[9].
-   */
-  _getTargetHealth(target) {
-    if (!target) return null;
-    if (typeof target.health === 'number' && !Number.isNaN(target.health)) {
-      return target.health;
-    }
-    if (target.metadata && typeof target.metadata[9] === 'number' && target.metadata[9] > 0) {
-      return target.metadata[9];
-    }
-    return null;
-  }
-
-  /**
    * Returns the number of incoming hits taken by the bot within the given millisecond window.
    */
   getRecentHitCount(windowMs = 1400) {
@@ -414,21 +380,6 @@ class RangedModule {
       (feet && feet.name && feet.name.includes('lava')) ||
       (head && head.name && head.name.includes('lava'))
     );
-  }
-
-  /**
-   * Returns true if the bot is trapped in a cobweb/lava OR caught in a rapid melee combo.
-   */
-  isTrappedInComboOrCobweb(target) {
-    if (this.isInCobweb() || this.isInLava()) return true;
-
-    const recentHits = this.getRecentHitCount(1600);
-    const enemyNear = target && target.isValid && this.bot.entity
-      ? this.bot.entity.position.distanceTo(target.position) < 5.5
-      : false;
-
-    const knockedAirborne = this.bot.entity && !this.bot.entity.onGround && recentHits >= 1 && enemyNear;
-    return (recentHits >= 2 && enemyNear) || knockedAirborne;
   }
 
   /**

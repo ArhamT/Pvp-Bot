@@ -8,59 +8,60 @@ CommonJS Mineflayer PvP bot (`node >= 18`, Windows PowerShell: use `npm.cmd test
 
 ### Layout & Entry Points
 - `start.bat` — Windows interactive launcher (prompts host/user/version/password into `PVPBOT_*` env vars; do **not** enable `EnableDelayedExpansion` around password prompts).
-- `package.json` — Dependencies & `npm.cmd test` smoke check (loads all 7 modules).
+- `package.json` — Dependencies & `npm.cmd test` smoke check (loads all 8 modules).
 - `config.json` — All runtime tunables (`server`, `bot`, `physics`, `prediction`, `combat`, `burst`, `aerial`, `survival`, `ranged`, `looting`).
-- `index.js` (~1,973 lines) — Main entry point & 20-TPS `physicsTick` FSM (`IDLE`, `ENGAGING`, `RETREATING`, `HEALING`, `LOOTING`), auth, proxy auto-join/rejoin, duel auto-accept, ads, spawn roam, console commands.
+- `index.js` (~1,939 lines) — Main entry point & 20-TPS `physicsTick` FSM (`IDLE`, `ENGAGING`, `RETREATING`, `HEALING`, `LOOTING`), auth, proxy auto-join/rejoin, duel auto-accept, ads, spawn roam, console commands.
+- `modules/constants.js` (133 lines) — Shared slots/physics/priorities, `ROAM_HAZARD_BLOCKS`, `isSpearItem`, `clearMovementControls`, WeakMap-cached `getItemMetadataText` & `hasItemEnchant`.
 - `modules/aim.js` (181 lines) — `SmoothAimer` clamped exponential look smoothing & `normalizeAngle`.
 - `modules/prediction.js` (265 lines) — 5-tick rolling trajectory predictor (MC air/ground drag & gravity).
-- `modules/combat.js` (~1,546 lines) — Melee spacing, strafing, W/S-tap, jump-reset, hit-select, breach swap, standalone spear.
-- `modules/survival.js` (~2,311 lines) — Delayed AutoTotem, smart shield, splash/drinkable potions (MC 1.20.4–1.21.4+), XP mending, gapples, armor/hotbar sort.
-- `modules/ranged.js` (~1,542 lines) — Predictive bow/crossbow, necessary-only Ender Pearls, hazard raycasting, cobweb water clutch.
+- `modules/combat.js` (~1,531 lines) — Melee spacing, strafing, W/S-tap, jump-reset, hit-select, breach swap, standalone spear.
+- `modules/survival.js` (~2,283 lines) — Delayed AutoTotem, smart shield, splash/drinkable potions (MC 1.20.4–1.21.4+), XP mending, gapples, armor/hotbar sort.
+- `modules/ranged.js` (~1,493 lines) — Predictive bow/crossbow, necessary-only Ender Pearls, hazard raycasting, cobweb water clutch.
 - `modules/burst.js` (~2,124 lines) — End Crystal, Respawn Anchor, blast-damage estimator, anti-explosive defense, Wind Charge.
-- `modules/aerial.js` (~2,873 lines) — Fall tracking, Stun Slam, Mace Launch, Wind Burst Pearl Catch, Spear-Mace, Elytra Mace Dive, Elytra Rocket Spear, fall clutch.
+- `modules/aerial.js` (~2,792 lines) — Fall tracking, Stun Slam, Mace Launch, Wind Burst Pearl Catch, Spear-Mace, Elytra Mace Dive, Elytra Rocket Spear, fall clutch.
 
 ### Key Section Ranges (Files > 300 Lines)
 - **`index.js`**
   - `L1–L165`: Imports, regexes (`DUEL_REQUEST_REGEX`, `DUEL_START_CUE_REGEX`), `loadRuntimeConfig`, `PvPBotController` constructor.
-  - `L170–L395`: `start()`, packet monitor, `_bindEvents()` (`spawn`, `entityHurt`, `health`, `messagestr`, `death`, `respawn`, `end`).
-  - `L400–L775`: Auth (`/login`, `/register`), proxy `/server duels` auto-join & kick rejoin, duel auto-accept, duel start/end chat triggers.
-  - `L775–L1200`: Chat/console commands (`executeBotCommand`, `handleConsoleInput`), target resolution, `_tryAutoRetaliate`.
-  - `L1200–L1445`: `transitionState`, tick loop, `_clearTimers`, duel ads (`_scheduleAdvertise`, `_sendAdvertise`), reconnect, `_tick()`.
-  - `L1450–L1705`: `_tickIdle()` & casual spawn roaming (`_tickSpawnRoam`, `_isRoamStepSafe`, `_pickRoamTarget`).
-  - `L1708–L1973`: `_tickEngaging`, `_tickRetreating`, `_tickHealing`, `_tickLooting`, `shutdown`.
+  - `L170–L390`: `start()`, packet monitor, `_bindEvents()` (`spawn`, `entityHurt`, `health`, `messagestr`, `death`, `respawn`, `end`).
+  - `L395–L765`: Auth (`/login`, `/register`), proxy `/server duels` auto-join & kick rejoin, duel auto-accept, duel start/end chat triggers.
+  - `L770–L1200`: Chat/console commands (`executeBotCommand`, `handleConsoleInput`), `_clearTargetState`, target resolution, `_tryAutoRetaliate`.
+  - `L1200–L1440`: `transitionState`, tick loop, `_clearTimers`, duel ads (`_scheduleAdvertise`, `_sendAdvertise`), reconnect, `_tick()`.
+  - `L1445–L1685`: `_tickIdle()` & casual spawn roaming (`_tickSpawnRoam`, `_isRoamStepSafe`, `_pickRoamTarget`).
+  - `L1690–L1939`: `_tickEngaging`, `_tickRetreating`, `_tickHealing`, `_tickLooting`, `shutdown`.
 - **`modules/combat.js`**
-  - `L45–L170`: Constructor & event listeners.
-  - `L173–L480`: Hotbar/enchant scanner (`scanHotbarSlots`, `getHotbarSlots`, `isTargetHeavilyArmored`).
-  - `L482–L635`: Strafe timers, Hit-Select (`_handleEntitySwingArm`), W-tap/Jump-Reset (`_handleEntityHurt`).
-  - `L638–L1005`: Weapon selection, cooldowns, reach geometry, hazard/wall checks, `stopMovement`.
-  - `L1008–L1546`: `tick()`, `_updateWeaponForTarget`, spacing/strafe, `_updateAttackAndCrits`.
+  - `L35–L165`: Constructor & event listeners.
+  - `L165–L470`: Hotbar/enchant scanner (`scanHotbarSlots`, `getHotbarSlots`, `isTargetHeavilyArmored`).
+  - `L470–L625`: Strafe timers, Hit-Select (`_handleEntitySwingArm`), W-tap/Jump-Reset (`_handleEntityHurt`).
+  - `L625–L995`: Weapon selection, cooldowns, reach geometry, hazard/wall checks, `stopMovement`.
+  - `L995–L1531`: `tick()`, `_updateWeaponForTarget`, spacing/strafe, `_updateAttackAndCrits`.
 - **`modules/survival.js`**
-  - `L1–L200`: Constants (`VANILLA_POTION_ID_TO_KEY` 0–45, effect ID tables, armor/food priorities).
-  - `L202–L660`: Constructor, delayed AutoTotem (`ensureTotemPriority`, `ensureOffhandSafety`), retreat/heal thresholds.
-  - `L660–L1145`: Potion metadata & `_classifyPotion`, drinkable heal lookup, armor durability & `tickArmorXpMend`.
-  - `L1149–L1515`: Effect listeners (`entityEffect`), `findNeededBuffPotion`, `tickInlineCombatHeal`, `_equipSingleForConsume`, `_startDrinkingPotion`.
-  - `L1520–L1945`: Food lookup, `tickShield`, `_tickSplashPotionDownward`, `_startEatingFood`, LOS block placement.
-  - `L1950–L2311`: `tickRetreating`, `tickHealing`, `equipBestArmor`, `sortHotbar`, `autoEquipAndSort`.
+  - `L1–L190`: Constants (`VANILLA_POTION_ID_TO_KEY` 0–45, effect ID tables, armor/food priorities).
+  - `L190–L640`: Constructor, delayed AutoTotem (`ensureTotemPriority`, `ensureOffhandSafety`), retreat/heal thresholds.
+  - `L640–L1130`: Potion metadata & `_classifyPotion`, drinkable heal lookup, armor durability & `tickArmorXpMend`.
+  - `L1130–L1495`: Effect listeners (`entityEffect`), `findNeededBuffPotion`, `tickInlineCombatHeal`, `_equipSingleForConsume`, `_startDrinkingPotion`.
+  - `L1500–L1920`: Food lookup, `tickShield`, `_tickSplashPotionDownward`, `_startEatingFood`, LOS block placement.
+  - `L1925–L2283`: `tickRetreating`, `tickHealing`, `equipBestArmor`, `sortHotbar`, `autoEquipAndSort`.
 - **`modules/ranged.js`**
-  - `L36–L165`: Constructor, combo-hit tracker, `isBusy`/`cancel`.
-  - `L166–L329`: Predictive bow/crossbow ballistics.
-  - `L330–L957`: Necessary-only Ender Pearl system (`tryChasePearl`, `tryAgroCancelPearl`, `tryDefensivePearl`, landing/arc safety).
-  - `L958–L1170`: Arena/hazard awareness & 1-tick Water Bucket `tickCobwebEscape`.
-  - `L1171–L1542`: Close utility (`tryCloseUtility`), `tick()`, 1-tick settled `_tickPendingAction`, `_tickBowOrCrossbow`.
+  - `L25–L155`: Constructor, combo-hit tracker, `isBusy`/`cancel`.
+  - `L155–L310`: Predictive bow/crossbow ballistics.
+  - `L310–L915`: Necessary-only Ender Pearl system (`tryChasePearl`, `tryAgroCancelPearl`, `tryDefensivePearl`, landing/arc safety).
+  - `L915–L1125`: Arena/hazard awareness & 1-tick Water Bucket `tickCobwebEscape`.
+  - `L1125–L1493`: Close utility (`tryCloseUtility`), `tick()`, 1-tick settled `_tickPendingAction`, `_tickBowOrCrossbow`.
 - **`modules/burst.js`**
-  - `L106–L338`: Constructor & own-placement / entitySpawn tracking.
-  - `L339–L790`: Raycast-occluded blast damage estimator & sequential hotbar helpers.
-  - `L791–L1087`: Anti-Crystal / Anti-Anchor defense (`tickDefense`).
-  - `L1088–L1692`: End Crystal (`_tickCrystalState`) & Respawn Anchor (`_tickAnchorState`).
-  - `L1693–L2124`: Wind Charge launch/clutch (`_tickWindChargeState`, `_tickWindClutch`) & `tick()`.
+  - `L105–L340`: Constructor & own-placement / entitySpawn tracking.
+  - `L340–L790`: Raycast-occluded blast damage estimator & sequential hotbar helpers.
+  - `L790–L1085`: Anti-Crystal / Anti-Anchor defense (`tickDefense`).
+  - `L1085–L1690`: End Crystal (`_tickCrystalState`) & Respawn Anchor (`_tickAnchorState`).
+  - `L1690–L2124`: Wind Charge launch/clutch (`_tickWindChargeState`, `_tickWindClutch`) & `tick()`.
 - **`modules/aerial.js`**
-  - `L62–L404`: Constructor, pearl-landing predictor, `cancel`/`_resetState`.
-  - `L405–L942`: Fall distance, version-safe `_sendStartElytraFlying`, inventory/armor/aim helpers.
-  - `L943–L1566`: Main `tick()`, Wind Burst Pearl Catch (`_tickPearlCatch`), Mace Launch (`_tickMaceLaunch`).
-  - `L1567–L1908`: Stun Slam (`_tickStunSlam`) & Spear-to-Mace chain (`_tickSpearMace`).
-  - `L1909–L2304`: Elytra Mace Dive (`_tickElytraDive`, `_tickElytraTakeoff`).
-  - `L2305–L2769`: Elytra Rocket Spear mode (`_canStartElytraSpear`, `_tickElytraSpear`).
-  - `L2770–L2873`: Fall-damage clutch (`_tickClutch`).
+  - `L45–L390`: Constructor, pearl-landing predictor, `cancel`/`_resetState`.
+  - `L390–L905`: Fall distance, version-safe `_sendStartElytraFlying`, inventory/armor/aim helpers.
+  - `L905–L1500`: Main `tick()`, Wind Burst Pearl Catch (`_tickPearlCatch`), Mace Launch (`_tickMaceLaunch`).
+  - `L1500–L1840`: Stun Slam (`_tickStunSlam`) & Spear-to-Mace chain (`_tickSpearMace`).
+  - `L1840–L2230`: Elytra Mace Dive (`_tickElytraDive`, `_tickElytraTakeoff`).
+  - `L2230–L2690`: Elytra Rocket Spear mode (`_canStartElytraSpear`, `_tickElytraSpear`).
+  - `L2690–L2792`: Fall-damage clutch (`_tickClutch`).
 
 ---
 
