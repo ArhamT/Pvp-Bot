@@ -41,6 +41,7 @@ const AERIAL_MODES = Object.freeze({
   PEARL_CATCH: 'PEARL_CATCH',
   SPEAR_MACE: 'SPEAR_MACE',
   ELYTRA_DIVE: 'ELYTRA_DIVE',
+  ELYTRA_SPEAR: 'ELYTRA_SPEAR',
   CLUTCH: 'CLUTCH'
 });
 
@@ -103,7 +104,7 @@ class AerialModule {
     this.pearlDeactivatePending = false;
     this.trackedEnemyPearl = null; // { entity, landingPos, expiresAt }
 
-    // Elytra Mace Dive state
+    // Elytra Mace Dive & Elytra Spear state
     this.savedChestplateName = null;
     this.elytraSwappedIn = false;
     this.pendingChestplateRestore = false;
@@ -115,6 +116,14 @@ class AerialModule {
     this.fireworkFired = false;
     this.fireworkDeactivatePending = false;
     this.climbTicksAfterBoost = 0;
+    this.lastElytraTakeoffTime = 0;
+    this.lastRocketTime = 0;
+    this.elytraAirborneTicks = 0;
+    this.elytraFlightTicks = 0;
+    this.elytraGlideRetrySent = false;
+    this.elytraSpearCharging = false;
+    this.elytraSpearAttackNextTick = false;
+    this.elytraPullUpYaw = 0;
 
     // Fall-damage clutch state
     this.clutchItemName = null;
@@ -337,7 +346,7 @@ class AerialModule {
         this.bot.setControlState('sprint', false);
       }
       if (
-        (this.fireworkDeactivatePending || this.spearDeactivatePending || this.clutchDeactivatePending) &&
+        (this.elytraSpearCharging || this.fireworkDeactivatePending || this.spearDeactivatePending || this.clutchDeactivatePending) &&
         typeof this.bot.deactivateItem === 'function'
       ) {
         try {
@@ -346,8 +355,9 @@ class AerialModule {
       }
     }
 
-    const wearingElytra = this._isWearingElytra();
-    if (this.elytraSwappedIn || wearingElytra) {
+    // Only restore a Chestplate if we explicitly swapped one off (e.g. Elytra Mace Dive),
+    // never strip an Elytra worn natively in an Elytra Spear kit!
+    if (this.elytraSwappedIn && this.savedChestplateName) {
       const safeToRestore = this._isSafeToRestoreChestplate();
       if (safeToRestore) {
         if (!this._restoreChestplate(true)) {
@@ -375,6 +385,11 @@ class AerialModule {
     this.fireworkFired = false;
     this.fireworkDeactivatePending = false;
     this.climbTicksAfterBoost = 0;
+    this.elytraAirborneTicks = 0;
+    this.elytraFlightTicks = 0;
+    this.elytraGlideRetrySent = false;
+    this.elytraSpearCharging = false;
+    this.elytraSpearAttackNextTick = false;
     this.clutchItemName = null;
     this.clutchActivated = false;
     this.clutchDeactivatePending = false;
@@ -466,6 +481,38 @@ class AerialModule {
   // =========================================================================
   // INVENTORY, HOTBAR & ARMOR HELPERS (SEQUENTIAL / ANTICHEAT-SAFE)
   // =========================================================================
+
+  _hasClearSkyAbove(minClearBlocks = 4) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return true;
+    if (typeof this.bot.blockAt !== 'function') return true;
+    const pos = this.bot.entity.position;
+    const bx = Math.floor(pos.x);
+    const bz = Math.floor(pos.z);
+    const startY = Math.floor(pos.y) + 2;
+    for (let dy = 0; dy < minClearBlocks; dy++) {
+      const b = this.bot.blockAt(new Vec3(bx, startY + dy, bz));
+      if (b && b.boundingBox === 'block') return false;
+    }
+    return true;
+  }
+
+  /**
+   * Version-safe Elytra glide activation across MC 1.20.4 (actionId: 8)
+   * and MC 1.21.2+ (string mapper 'start_elytra_flying').
+   */
+  _sendStartElytraFlying() {
+    if (!this.bot || !this.bot._client || typeof this.bot._client.write !== 'function') {
+      return false;
+    }
+    const useString = typeof this.bot.supportFeature === 'function' &&
+      this.bot.supportFeature('entityActionUsesStringMapper');
+    this.bot._client.write('entity_action', {
+      entityId: this.bot.entity.id,
+      actionId: useString ? 'start_elytra_flying' : 8,
+      jumpBoost: 0
+    });
+    return true;
+  }
 
   _getHotbarStart() {
     return (this.bot && this.bot.inventory && this.bot.inventory.hotbarStart) || DEFAULT_HOTBAR_START;
@@ -958,6 +1005,9 @@ class AerialModule {
     if (this.mode === AERIAL_MODES.ELYTRA_DIVE) {
       return this._tickElytraDive(target);
     }
+    if (this.mode === AERIAL_MODES.ELYTRA_SPEAR) {
+      return this._tickElytraSpear(target);
+    }
 
     // 3. Standalone lethal fall-damage clutch safety check when idle
     if (this._shouldTriggerClutch(target)) {
@@ -995,10 +1045,16 @@ class AerialModule {
       return this._tickMaceLaunch(target);
     }
 
-    //    (b) Elytra Mace Dive (> 18b away or after vertical launch)
+    //    (b) Elytra Mace Dive (> 18b away or after vertical launch, when carrying Mace + Chestplate)
     if (this._canStartElytraDive(target)) {
       this._enterElytraDive();
       return this._tickElytraDive(target);
+    }
+
+    //    (b2) Elytra Rocket Spear Mode (Elytra + Firework Rocket + Spear/Trident — no Mace or Chestplate required!)
+    if (this._canStartElytraSpear(target)) {
+      this._enterElytraSpear();
+      return this._tickElytraSpear(target);
     }
 
     //    (c) Spear-to-Mace Chain (3.1-4.6b mid-range with Spear/Trident + Wind Charge + Mace)
@@ -1930,18 +1986,18 @@ class AerialModule {
     const reachDist = this._getReachDistance(target);
 
     // -----------------------------------------------------------------------
-    // Stage 1: EQUIP_ELYTRA — Swap Chestplate (slot 6) with elytra, wait 1-2 ticks
+    // Stage 1: EQUIP_ELYTRA — Swap Chestplate (slot 6) with elytra, pre-equip rocket & pitch up
     // -----------------------------------------------------------------------
     if (this.stage === 'EQUIP_ELYTRA') {
       const equipDelay = this.aerialCfg.elytraEquipDelayTicks !== undefined
         ? this.aerialCfg.elytraEquipDelayTicks
         : 2;
 
-      // Aim horizontally toward target during preparation
+      // Aim upward toward target during preparation so rocket fires immediately after jump!
       const dx = target.position.x - pos.x;
       const dz = target.position.z - pos.z;
       const yawToTarget = Math.atan2(-dx, -dz);
-      this.aimer.stepTowardsAngles(yawToTarget, 15 * DEG_TO_RAD, { speedMultiplier: 1.3 });
+      this.aimer.stepTowardsAngles(yawToTarget, 38 * DEG_TO_RAD, { speedMultiplier: 1.5 });
 
       if (!this.elytraSwappedIn) {
         const torso = this._getTorsoItem();
@@ -1966,10 +2022,18 @@ class AerialModule {
         }
       }
 
+      // Pre-equip firework_rocket while grounded so zero swap delay happens mid-jump!
+      const rocketSel = this._findItemByName('firework_rocket');
+      if (rocketSel && !this.swappedThisTick) {
+        this._equipHand(rocketSel);
+      }
+
       this.elytraEquipTicks++;
       if (this.elytraEquipTicks >= equipDelay) {
         this.stage = 'TAKEOFF';
         this.stageTicks = 0;
+        this.elytraAirborneTicks = 0;
+        this.elytraGlideRetrySent = false;
         // Execute takeoff check on this tick (exactly `equipDelay` ticks after swap)
         return this._tickElytraTakeoff(target, onGround);
       }
@@ -1978,17 +2042,22 @@ class AerialModule {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 2: TAKEOFF — Jump if grounded, then send start_fall_flying (actionId: 8)
+    // Stage 2: TAKEOFF — Jump if grounded, wait 2 ticks airborne, then send start_elytra_flying
     // -----------------------------------------------------------------------
     if (this.stage === 'TAKEOFF') {
       return this._tickElytraTakeoff(target, onGround);
     }
 
     // -----------------------------------------------------------------------
-    // Stage 3: BOOST_CLIMB — Pitch smoothly to 65-75 deg, equip & fire firework_rocket
+    // Stage 3: BOOST_CLIMB — Fire firework_rocket immediately once gliding & pitched >= 22°, climb to 65-75°
     // -----------------------------------------------------------------------
     if (this.stage === 'BOOST_CLIMB') {
       if (onGround && this.fireworkFired && this.climbTicksAfterBoost > 3) {
+        this._restoreChestplate();
+        this._resetState();
+        return true;
+      }
+      if (onGround && !this.fireworkFired && this.stageTicks > 4) {
         this._restoreChestplate();
         this._resetState();
         return true;
@@ -2001,9 +2070,15 @@ class AerialModule {
       const yawToTarget = Math.atan2(-dx, -dz);
 
       const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, this.boostPitchRad, {
-        speedMultiplier: 1.65,
-        toleranceRad: 0.14
+        speedMultiplier: 1.75,
+        toleranceRad: 0.16
       });
+
+      // Retry start_elytra_flying once if server hasn't acknowledged glide state yet while airborne
+      if (!onGround && this.bot.entity.elytraFlying === false && !this.elytraGlideRetrySent && this.stageTicks === 3) {
+        this._sendStartElytraFlying();
+        this.elytraGlideRetrySent = true;
+      }
 
       if (!this.fireworkFired) {
         const rocketSel = this._findItemByName('firework_rocket');
@@ -2015,19 +2090,13 @@ class AerialModule {
 
         const eq = this._equipHand(rocketSel);
         const currentPitchDeg = this.bot.entity.pitch / DEG_TO_RAD;
-        const boostMinDeg = this.aerialCfg.elytraBoostPitchMinDeg !== undefined
-          ? this.aerialCfg.elytraBoostPitchMinDeg
-          : 65;
-        const boostMaxDeg = this.aerialCfg.elytraBoostPitchMaxDeg !== undefined
-          ? this.aerialCfg.elytraBoostPitchMaxDeg
-          : 75;
-        const inBoostBand = currentPitchDeg >= boostMinDeg && currentPitchDeg <= boostMaxDeg;
-        if (eq.ready && !eq.swapped && (inBoostBand || aimStatus.pitchErrorDeg <= 5)) {
+        // Fire as soon as rocket is settled and pitched upward (>= 22°) BEFORE hitting the ground!
+        if (eq.ready && !eq.swapped && (currentPitchDeg >= 22 || aimStatus.pitchErrorDeg <= 10 || this.stageTicks >= 3)) {
           if (typeof this.bot.activateItem === 'function') {
             this.bot.activateItem(false);
           }
           this.fireworkFired = true;
-          this.fireworkDeactivatePending = true;
+          this.lastRocketTime = Date.now();
           this.climbTicksAfterBoost = 0;
         }
         return true;
@@ -2175,11 +2244,32 @@ class AerialModule {
     const dx = target.position.x - pos.x;
     const dz = target.position.z - pos.z;
     const yawToTarget = Math.atan2(-dx, -dz);
+    const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
 
-    this.aimer.stepTowardsAngles(yawToTarget, 25 * DEG_TO_RAD, { speedMultiplier: 1.4 });
+    this.aimer.stepTowardsAngles(yawToTarget, 38 * DEG_TO_RAD, { speedMultiplier: 1.55 });
+
+    // Pre-equip rocket if not already held so BOOST_CLIMB ignites without delay
+    const rocketSel = this._findItemByName('firework_rocket');
+    if (rocketSel && !this.swappedThisTick) {
+      this._equipHand(rocketSel);
+    }
+
+    if (this.bot.entity.elytraFlying) {
+      this.isGliding = true;
+      this.stage = 'BOOST_CLIMB';
+      this.stageTicks = 0;
+      return true;
+    }
 
     if (onGround) {
+      this.elytraAirborneTicks = 0;
+      if (this.stageTicks > 15) {
+        this._restoreChestplate();
+        this._resetState();
+        return false;
+      }
       if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('forward', true);
         this.bot.setControlState('jump', true);
       }
       this.takeoffJumped = true;
@@ -2190,15 +2280,14 @@ class AerialModule {
       this.bot.setControlState('jump', false);
     }
 
-    // Send start_fall_flying packet (actionId: 8) with safe client guard
-    if (this.bot._client && typeof this.bot._client.write === 'function') {
-      this.bot._client.write('entity_action', {
-        entityId: this.bot.entity.id,
-        actionId: 8,
-        jumpBoost: 0
-      });
+    // Wait 2 airborne ticks (or velY <= 0.25) so Paper/GrimAC confirms airborne state before start_elytra_flying
+    this.elytraAirborneTicks++;
+    if (this.takeoffJumped && this.elytraAirborneTicks < 2 && velY > 0.25) {
+      return true;
     }
 
+    this._sendStartElytraFlying();
+    this.lastElytraTakeoffTime = Date.now();
     this.isGliding = true;
     this.stage = 'BOOST_CLIMB';
     this.stageTicks = 0;
@@ -2211,6 +2300,471 @@ class AerialModule {
     this._restoreChestplate();
     this.stage = 'STRIKE_EQUIP_MACE';
     return true;
+  }
+
+  // =========================================================================
+  // 4b. ELYTRA ROCKET SPEAR MODE (Full Flight, Rocket Boost & Spear Jousting)
+  // =========================================================================
+
+  _canStartElytraSpear(target) {
+    if (this.aerialCfg.enableElytraSpear === false) return false;
+    if (!target || !target.isValid || !target.position) return false;
+
+    const { onGround, inWater, inLava, inCobweb } = this._getEnvironmentFlags();
+    if (inWater || inLava || inCobweb) return false;
+
+    // Must have Elytra (worn or inventory) AND a Spear/Trident — NO Mace or Chestplate required!
+    if (!this._hasElytraAvailable()) return false;
+    if (!this._findSpear()) return false;
+
+    const alreadyFlying = Boolean(this.bot.entity.elytraFlying);
+    if (alreadyFlying) return true;
+
+    const hasRockets = Boolean(this._findItemByName('firework_rocket'));
+    const heightAboveGround = this._getHeightAboveGround();
+    if (!hasRockets && (onGround || heightAboveGround < 3.0)) {
+      return false;
+    }
+
+    const now = Date.now();
+    const takeoffCooldown = this.aerialCfg.elytraTakeoffCooldownMs !== undefined
+      ? this.aerialCfg.elytraTakeoffCooldownMs
+      : 1200;
+    if (onGround && (now - this.lastElytraTakeoffTime) < takeoffCooldown) {
+      return false;
+    }
+
+    if (onGround && !this._hasClearSkyAbove(4)) {
+      return false;
+    }
+
+    const dist = this.bot.entity.position.distanceTo(target.position);
+    const hasMace = Boolean(this._findMace());
+    // In dedicated Elytra Spear kits (no Mace), take off aggressively even at close range (>= 2.5b)!
+    const minDist = hasMace
+      ? (this.aerialCfg.elytraSpearMinDistance !== undefined ? this.aerialCfg.elytraSpearMinDistance : 6.0)
+      : (this.aerialCfg.elytraSpearMinDistance !== undefined ? Math.min(3.5, this.aerialCfg.elytraSpearMinDistance) : 2.5);
+
+    return dist >= minDist || !onGround;
+  }
+
+  _enterElytraSpear() {
+    this.mode = AERIAL_MODES.ELYTRA_SPEAR;
+    this.stage = this.bot.entity.elytraFlying ? 'FLY_APPROACH' : 'EQUIP_PREP';
+    this.stageTicks = 0;
+    this.elytraEquipTicks = 0;
+    this.takeoffJumped = false;
+    this.isGliding = Boolean(this.bot.entity.elytraFlying);
+    this.fireworkFired = false;
+    this.elytraAirborneTicks = 0;
+    this.elytraFlightTicks = 0;
+    this.elytraGlideRetrySent = false;
+    this.elytraSpearCharging = false;
+    this.elytraSpearAttackNextTick = false;
+  }
+
+  _releaseSpearChargeIfActive() {
+    if (this.elytraSpearCharging) {
+      this.elytraSpearCharging = false;
+      if (this.bot && typeof this.bot.deactivateItem === 'function') {
+        try {
+          this.bot.deactivateItem();
+        } catch (_) {}
+      }
+    }
+  }
+
+  _tickElytraSpear(target) {
+    this.stageTicks++;
+
+    if (!target || !target.isValid || !target.position) {
+      this._releaseSpearChargeIfActive();
+      this._resetState();
+      return false;
+    }
+
+    const pos = this.bot.entity.position;
+    const vel = this.bot.entity.velocity || new Vec3(0, 0, 0);
+    const velY = vel.y;
+    const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+    const { onGround, inWater, inLava, inCobweb } = this._getEnvironmentFlags();
+
+    if (inWater || inLava || inCobweb) {
+      this._releaseSpearChargeIfActive();
+      this._resetState();
+      return false;
+    }
+
+    const now = Date.now();
+    const rocketCooldownMs = this.aerialCfg.elytraRocketCooldownMs !== undefined
+      ? this.aerialCfg.elytraRocketCooldownMs
+      : 1600;
+    const spearReach = this.combatCfg.spearReach || 4.2;
+    const reachDist = this._getReachDistance(target);
+
+    // -----------------------------------------------------------------------
+    // Stage 1: EQUIP_PREP — Equip Elytra to torso, pre-equip firework_rocket, pitch up to +32°
+    // -----------------------------------------------------------------------
+    if (this.stage === 'EQUIP_PREP') {
+      const equipDelay = this.aerialCfg.elytraEquipDelayTicks !== undefined
+        ? this.aerialCfg.elytraEquipDelayTicks
+        : 2;
+
+      const dx = target.position.x - pos.x;
+      const dz = target.position.z - pos.z;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      // If very close on ground, angle slightly away while pitching up so we gain clean takeoff space
+      const desiredYaw = horizDist < 4.5
+        ? Math.atan2(dx, dz)
+        : Math.atan2(-dx, -dz);
+
+      const aimStatus = this.aimer.stepTowardsAngles(desiredYaw, 32 * DEG_TO_RAD, {
+        speedMultiplier: 1.65,
+        toleranceRad: 0.2
+      });
+
+      if (!this._isWearingElytra()) {
+        const elytraSel = this._findItemByName('elytra');
+        if (!elytraSel) {
+          this._resetState();
+          return false;
+        }
+        if (this._equipTorso(elytraSel.item)) {
+          this.elytraEquipTicks = 0;
+        }
+        return true;
+      }
+
+      // Pre-equip rocket while still grounded so ignition happens on tick 1 after glide starts
+      const rocketSel = this._findItemByName('firework_rocket');
+      let rocketReady = true;
+      if (rocketSel && !this.swappedThisTick) {
+        const eq = this._equipHand(rocketSel);
+        rocketReady = eq.ready && !eq.swapped;
+      }
+
+      this.elytraEquipTicks++;
+      const currentPitchDeg = this.bot.entity.pitch / DEG_TO_RAD;
+      if (
+        this.elytraEquipTicks >= equipDelay &&
+        rocketReady &&
+        (currentPitchDeg >= 15 || aimStatus.pitchErrorDeg <= 15 || this.stageTicks >= 6)
+      ) {
+        this.stage = this.bot.entity.elytraFlying ? 'FLY_APPROACH' : 'TAKEOFF';
+        this.stageTicks = 0;
+        this.elytraAirborneTicks = 0;
+        this.elytraGlideRetrySent = false;
+        return true;
+      }
+
+      if (this.stageTicks > 18) {
+        this._resetState();
+        return false;
+      }
+      return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 2: TAKEOFF — Jump off ground, wait 2 airborne ticks, send version-safe start_elytra_flying
+    // -----------------------------------------------------------------------
+    if (this.stage === 'TAKEOFF') {
+      const dx = target.position.x - pos.x;
+      const dz = target.position.z - pos.z;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      const desiredYaw = horizDist < 4.5 ? Math.atan2(dx, dz) : Math.atan2(-dx, -dz);
+
+      this.aimer.stepTowardsAngles(desiredYaw, 32 * DEG_TO_RAD, { speedMultiplier: 1.65 });
+
+      const rocketSel = this._findItemByName('firework_rocket');
+      if (rocketSel && !this.swappedThisTick) {
+        this._equipHand(rocketSel);
+      }
+
+      if (this.bot.entity.elytraFlying) {
+        this.isGliding = true;
+        this.stage = rocketSel ? 'BOOST_IGNITE' : 'FLY_APPROACH';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      if (onGround) {
+        this.elytraAirborneTicks = 0;
+        if (this.stageTicks > 15) {
+          this.lastElytraTakeoffTime = now;
+          this._resetState();
+          return false;
+        }
+        if (typeof this.bot.setControlState === 'function') {
+          this.bot.setControlState('forward', true);
+          this.bot.setControlState('sprint', false);
+          this.bot.setControlState('jump', true);
+        }
+        this.takeoffJumped = true;
+        return true;
+      }
+
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('jump', false);
+        this.bot.setControlState('forward', true);
+      }
+
+      this.elytraAirborneTicks++;
+      if (this.takeoffJumped && this.elytraAirborneTicks < 2 && velY > 0.25) {
+        return true;
+      }
+
+      this._sendStartElytraFlying();
+      this.lastElytraTakeoffTime = now;
+      this.isGliding = true;
+      this.elytraFlightTicks = 0;
+      this.stage = 'BOOST_IGNITE';
+      this.stageTicks = 0;
+      return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 3: BOOST_IGNITE — Fire initial takeoff firework_rocket immediately while airborne
+    // -----------------------------------------------------------------------
+    if (this.stage === 'BOOST_IGNITE') {
+      if (onGround && this.stageTicks > 2) {
+        this.lastElytraTakeoffTime = now;
+        this._resetState();
+        return false;
+      }
+
+      const dx = target.position.x - pos.x;
+      const dz = target.position.z - pos.z;
+      const yawToTarget = Math.atan2(-dx, -dz);
+      this.aimer.stepTowardsAngles(yawToTarget, 28 * DEG_TO_RAD, { speedMultiplier: 1.7 });
+
+      // Retry start_elytra_flying once if server hasn't marked elytraFlying yet
+      if (!onGround && this.bot.entity.elytraFlying === false && !this.elytraGlideRetrySent && this.stageTicks === 3) {
+        this._sendStartElytraFlying();
+        this.elytraGlideRetrySent = true;
+      }
+
+      const rocketSel = this._findItemByName('firework_rocket');
+      if (!rocketSel) {
+        this.stage = 'FLY_APPROACH';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      const eq = this._equipHand(rocketSel);
+      if (eq.ready && !eq.swapped) {
+        if (typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+        }
+        this.fireworkFired = true;
+        this.lastRocketTime = now;
+        this.stage = 'FLY_APPROACH';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      if (this.stageTicks > 10) {
+        this.stage = 'FLY_APPROACH';
+        this.stageTicks = 0;
+      }
+      return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4: FLY_APPROACH — Steer smoothly onto predicted target, boost with rockets, & Spear joust!
+    // -----------------------------------------------------------------------
+    if (this.stage === 'FLY_APPROACH') {
+      this.elytraFlightTicks++;
+
+      if (!this._isWearingElytra()) {
+        this._releaseSpearChargeIfActive();
+        this._resetState();
+        return false;
+      }
+
+      // Landed after a flight pass -> reset cleanly so survival/ground combat or fresh takeoff can run
+      if (onGround && this.elytraFlightTicks > 5) {
+        this._releaseSpearChargeIfActive();
+        this._resetState();
+        return true;
+      }
+
+      const rawDist = pos.distanceTo(target.position);
+      const leadTicks = clamp(Math.round(rawDist / 6), 2, 5);
+      const predPos = this._getPredictedPosition(target, leadTicks);
+      const eyePos = this.aimer ? this.aimer.getEyePosition() : pos.offset(0, 1.2, 0);
+      const aimPoint = predPos.offset(0, (target.height || 1.8) * 0.6, 0);
+
+      const dx = aimPoint.x - eyePos.x;
+      const dy = aimPoint.y - eyePos.y;
+      const dz = aimPoint.z - eyePos.z;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      const yawToPred = Math.atan2(-dx, -dz);
+      let desiredPitch = Math.atan2(dy, Math.max(0.1, horizDist));
+
+      // Terrain clearance protection: never nosedive into the floor when closing from > 7.5b away
+      const heightAboveGround = this._getHeightAboveGround();
+      if (heightAboveGround < 2.2 && dist3D > 7.5 && desiredPitch < 8 * DEG_TO_RAD) {
+        desiredPitch = 14 * DEG_TO_RAD;
+      }
+      desiredPitch = clamp(desiredPitch, -55 * DEG_TO_RAD, 55 * DEG_TO_RAD);
+
+      const aimStatus = this.aimer.stepTowardsAngles(yawToPred, desiredPitch, {
+        speedMultiplier: 1.85,
+        toleranceRad: 0.24
+      });
+
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('back', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+      }
+
+      // 4a. Execute deferred Spear jab on the tick immediately after releasing Spear couch/charge
+      const spearSel = this._findSpear();
+      if (this.elytraSpearAttackNextTick) {
+        this.elytraSpearAttackNextTick = false;
+        if (spearSel && this._isHoldingSelection(spearSel) && reachDist <= spearReach + 0.6 && aimStatus.yawErrorDeg < 45) {
+          this.bot.attack(target);
+        }
+        this.elytraPullUpYaw = this.bot.entity.yaw;
+        this.stage = 'PULL_UP';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      // 4b. Mid-flight Rocket Boost when distant, slow, or below target (paced by elytraRocketCooldownMs!)
+      const rocketSel = this._findItemByName('firework_rocket');
+      const wantsBoost = Boolean(
+        rocketSel &&
+        dist3D > 7.5 &&
+        (now - this.lastRocketTime) >= rocketCooldownMs &&
+        (speed < 0.78 || pos.y < target.position.y + 1.0 || dist3D > 15.0)
+      );
+
+      if (wantsBoost) {
+        this._releaseSpearChargeIfActive();
+        const eq = this._equipHand(rocketSel);
+        if (eq.ready && !eq.swapped) {
+          if (typeof this.bot.activateItem === 'function') {
+            this.bot.activateItem(false);
+          }
+          this.lastRocketTime = now;
+        }
+        return true;
+      }
+
+      // 4c. Spear equip, kinetic couch/charge (for *_spear items), & high-speed fly-by strike!
+      if (spearSel) {
+        const eq = this._equipHand(spearSel);
+        const holdingSpear = eq.ready && !eq.swapped;
+        const spearName = String(spearSel.item.name || '').toLowerCase();
+        const isNativeSpear = spearName.includes('spear') && !spearName.includes('trident');
+
+        if (holdingSpear) {
+          // Optional kinetic Spear couch/charge when closing at high velocity (1.21 Spear mechanic)
+          if (
+            isNativeSpear &&
+            this.aerialCfg.elytraSpearChargeEnabled !== false &&
+            !this.elytraSpearCharging &&
+            dist3D <= 8.5 &&
+            dist3D > spearReach + 0.2 &&
+            speed >= 0.55 &&
+            aimStatus.yawErrorDeg < 26
+          ) {
+            if (typeof this.bot.activateItem === 'function') {
+              this.bot.activateItem(false);
+              this.elytraSpearCharging = true;
+            }
+            return true;
+          }
+
+          // Strike window: inside spear reach & aligned
+          if (reachDist <= spearReach && aimStatus.yawErrorDeg < 38) {
+            if (this.elytraSpearCharging) {
+              // Release charge this tick and land melee jab next tick (prevents UseItem+Attack flag!)
+              this._releaseSpearChargeIfActive();
+              this.elytraSpearAttackNextTick = true;
+              return true;
+            }
+            this.bot.attack(target);
+            this.elytraPullUpYaw = this.bot.entity.yaw;
+            this.stage = 'PULL_UP';
+            this.stageTicks = 0;
+            return true;
+          }
+        }
+      }
+
+      // If we flew right past the target and are now moving away at close range, pull up cleanly!
+      if (dist3D < 3.0) {
+        const radial = (vel.x * dx + vel.z * dz) / Math.max(0.1, horizDist);
+        if (radial < -0.1) {
+          this._releaseSpearChargeIfActive();
+          this.elytraPullUpYaw = this.bot.entity.yaw;
+          this.stage = 'PULL_UP';
+          this.stageTicks = 0;
+          return true;
+        }
+      }
+
+      return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 5: PULL_UP — Climb smoothly to +32°, boost if slow/low, then loop back to FLY_APPROACH
+    // -----------------------------------------------------------------------
+    if (this.stage === 'PULL_UP') {
+      this._releaseSpearChargeIfActive();
+
+      if (onGround && this.stageTicks > 2) {
+        this._resetState();
+        return true;
+      }
+
+      const heightAboveGround = this._getHeightAboveGround();
+      const dx = target.position.x - pos.x;
+      const dz = target.position.z - pos.z;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+      this.aimer.stepTowardsAngles(this.elytraPullUpYaw, 32 * DEG_TO_RAD, {
+        speedMultiplier: 1.65,
+        toleranceRad: 0.22
+      });
+
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+      }
+
+      // Boost during pull-up if losing speed or near terrain so we stay aloft smoothly
+      const rocketSel = this._findItemByName('firework_rocket');
+      if (
+        rocketSel &&
+        (now - this.lastRocketTime) >= rocketCooldownMs &&
+        (speed < 0.65 || heightAboveGround < 4.5)
+      ) {
+        const eq = this._equipHand(rocketSel);
+        if (eq.ready && !eq.swapped) {
+          if (typeof this.bot.activateItem === 'function') {
+            this.bot.activateItem(false);
+          }
+          this.lastRocketTime = now;
+        }
+      }
+
+      // Loop back onto the opponent for the next high-speed Spear fly-by!
+      if (this.stageTicks >= 12 || (this.stageTicks >= 7 && horizDist >= 11.0 && heightAboveGround >= 4.5)) {
+        this.stage = 'FLY_APPROACH';
+        this.stageTicks = 0;
+      }
+      return true;
+    }
+
+    return false;
   }
 
   // =========================================================================

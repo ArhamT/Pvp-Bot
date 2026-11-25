@@ -106,6 +106,56 @@ const DEFAULT_BUFF_DURATION_MS = {
   unknown_drink: 85000
 };
 
+// Exact 0-based `minecraft:potion` registry order for MC 1.20.5–1.21.4+ (matches Mojang/ViaVersion Potions1_20_5)
+const VANILLA_POTION_ID_TO_KEY = [
+  'water',                // 0
+  'mundane',              // 1
+  'thick',                // 2
+  'awkward',              // 3
+  'night_vision',         // 4
+  'long_night_vision',    // 5
+  'invisibility',         // 6
+  'long_invisibility',    // 7
+  'leaping',              // 8
+  'long_leaping',         // 9
+  'strong_leaping',       // 10
+  'fire_resistance',      // 11
+  'long_fire_resistance', // 12
+  'swiftness',            // 13
+  'long_swiftness',       // 14
+  'strong_swiftness',     // 15
+  'slowness',             // 16
+  'long_slowness',        // 17
+  'strong_slowness',      // 18
+  'turtle_master',        // 19
+  'long_turtle_master',   // 20
+  'strong_turtle_master', // 21
+  'water_breathing',      // 22
+  'long_water_breathing', // 23
+  'healing',              // 24
+  'strong_healing',       // 25
+  'harming',              // 26
+  'strong_harming',       // 27
+  'poison',               // 28
+  'long_poison',          // 29
+  'strong_poison',        // 30
+  'regeneration',         // 31
+  'long_regeneration',    // 32
+  'strong_regeneration',  // 33
+  'strength',             // 34
+  'long_strength',        // 35
+  'strong_strength',      // 36
+  'weakness',             // 37
+  'long_weakness',        // 38
+  'luck',                 // 39
+  'slow_falling',         // 40
+  'long_slow_falling',    // 41
+  'wind_charged',         // 42
+  'weaving',              // 43
+  'oozing',               // 44
+  'infested'              // 45
+];
+
 // Standard MC Java status effect IDs (0-based in >= 1.20.5, 1-based in <= 1.20.4)
 const ZERO_BASED_EFFECT_TO_KIND = {
   0: 'swiftness',
@@ -113,6 +163,24 @@ const ZERO_BASED_EFFECT_TO_KIND = {
   9: 'regen',
   10: 'turtle_master',
   11: 'fire_res'
+};
+
+const ZERO_BASED_EFFECT_TO_CLASS = {
+  0: 'swiftness',
+  1: 'harmful',       // slowness
+  4: 'strength',
+  5: 'heal2',         // instant_health
+  6: 'harmful',       // instant_damage
+  9: 'regen',
+  10: 'turtle_master',
+  11: 'fire_res',
+  17: 'harmful',      // weakness
+  18: 'harmful',      // poison
+  19: 'harmful',      // wither
+  35: 'harmful',      // wind_charged
+  36: 'harmful',      // weaving
+  37: 'harmful',      // oozing
+  38: 'harmful'       // infested
 };
 
 const ONE_BASED_EFFECT_TO_KIND = {
@@ -164,6 +232,9 @@ class SurvivalModule {
     this.pendingSplashPotion = null;
     this.pendingSplashIsBuff = false;
     this.pendingSplashKind = null;
+    this.pendingSplashCreatedAt = 0;
+    this.pendingSplashSettleTicks = 0;
+    this.pendingSplashEquipStarted = false;
     this.pendingPotRefillTime = 0;
     this.justAteGappleAt = 0;
     this.activeBuffUntil = new Map();
@@ -502,7 +573,10 @@ class SurvivalModule {
       if (typeof val === 'object') {
         if (typeof val.potionId === 'number' && potionId === null) potionId = val.potionId;
         if (typeof val.potion === 'number' && potionId === null) potionId = val.potion;
-        if (typeof val.id === 'number' && (val.amplifier !== undefined || val.duration !== undefined)) {
+        if (
+          typeof val.id === 'number' &&
+          (val.amplifier !== undefined || val.duration !== undefined || val.details !== undefined)
+        ) {
           effectIds.push(val.id);
         }
         for (const [k, v] of Object.entries(val)) {
@@ -521,9 +595,36 @@ class SurvivalModule {
     return { text: parts.join(' '), potionId, effectIds };
   }
 
+  _classifyPotionKey(key) {
+    if (!key) return null;
+    const k = String(key).toLowerCase();
+    if (k === 'water' || k === 'mundane' || k === 'thick' || k === 'awkward' || k === 'empty') {
+      return 'other';
+    }
+    if (
+      k.includes('harming') || k.includes('instant_damage') || k.includes('poison') ||
+      k.includes('weakness') || k.includes('slowness') || k.includes('wither') ||
+      k.includes('oozing') || k.includes('weaving') || k.includes('infested') || k.includes('wind_charged')
+    ) {
+      return 'harmful';
+    }
+    if (k.includes('strong_healing') || k.includes('instant_health_ii') || k.includes('healing ii')) {
+      return 'heal2';
+    }
+    if (k.includes('healing') || k.includes('instant_health') || k.includes('instant health')) {
+      return 'heal1';
+    }
+    if (k.includes('regeneration') || k.includes('regen')) return 'regen';
+    if (k.includes('strength')) return 'strength';
+    if (k.includes('swiftness') || k.includes('speed')) return 'swiftness';
+    if (k.includes('fire_resistance') || k.includes('fire resistance')) return 'fire_res';
+    if (k.includes('turtle_master') || k.includes('resistance')) return 'turtle_master';
+    return null;
+  }
+
   /**
    * Classifies any potion or splash_potion reliably across MC 1.16–1.21.4+:
-   * returns 'heal2' | 'heal1' | 'regen' | 'strength' | 'swiftness' | 'fire_res' | 'harmful' | 'unknown_splash' | 'other'.
+   * returns 'heal2' | 'heal1' | 'regen' | 'strength' | 'swiftness' | 'fire_res' | 'turtle_master' | 'harmful' | 'unknown_splash' | 'unknown_drink' | 'other'.
    */
   _classifyPotion(item) {
     if (!item || !item.name) return 'other';
@@ -534,56 +635,41 @@ class SurvivalModule {
     const { text, potionId, effectIds } = this._extractPotionMetadata(item);
 
     // 1. Explicit string matching (MC <= 1.20.4 NBT & string-named components / custom kits)
-    const harmfulKeywords = [
-      'harming', 'instant_damage', 'poison', 'weakness', 'slowness',
-      'wither', 'oozing', 'weaving', 'infested', 'wind_charged'
-    ];
-    if (harmfulKeywords.some((kw) => text.includes(kw))) return 'harmful';
+    const byText = this._classifyPotionKey(text);
+    if (byText) return byText;
 
-    if (text.includes('strong_healing') || text.includes('instant_health_ii') || text.includes('healing ii')) {
-      return 'heal2';
+    // 2. Vanilla MC 1.20.5–1.21.4+ numeric `minecraft:potion` registry IDs (exact Potions1_20_5 0-based order)
+    if (typeof potionId === 'number' && potionId >= 0 && potionId < VANILLA_POTION_ID_TO_KEY.length) {
+      const potionKey = VANILLA_POTION_ID_TO_KEY[potionId];
+      const byId = this._classifyPotionKey(potionKey);
+      if (byId) return byId;
+      return 'other';
     }
-    if (text.includes('healing') || text.includes('instant_health') || text.includes('instant health')) {
-      return 'heal1';
-    }
-    if (text.includes('regeneration') || text.includes('regen')) {
-      return 'regen';
-    }
-    if (text.includes('strength')) return 'strength';
-    if (text.includes('swiftness') || text.includes('speed')) return 'swiftness';
-    if (text.includes('fire_resistance') || text.includes('fire resistance')) return 'fire_res';
-    if (text.includes('turtle_master') || text.includes('resistance')) return 'turtle_master';
 
-    // 2. Check custom effect IDs against bot.registry (handles 0-based 1.21+ & 1-based 1.20.4)
-    if (effectIds.length > 0 && this.bot && this.bot.registry && this.bot.registry.effects) {
+    // 3. Check custom effect IDs (both 0-based MC 1.20.5+ and bot.registry lookup)
+    if (effectIds.length > 0) {
+      const zeroBased = this._usesZeroBasedEffectIds();
       for (const eid of effectIds) {
-        const eff = this.bot.registry.effects[eid];
-        const ename = eff && eff.name ? eff.name.toLowerCase() : '';
-        if (ename.includes('instantdamage') || ename.includes('poison') || ename.includes('weakness') || ename.includes('slowness')) {
-          return 'harmful';
+        if (zeroBased && ZERO_BASED_EFFECT_TO_CLASS[eid]) {
+          return ZERO_BASED_EFFECT_TO_CLASS[eid];
         }
-        if (ename.includes('instanthealth') || ename.includes('healing')) return 'heal2';
-        if (ename.includes('regeneration')) return 'regen';
-        if (ename.includes('strength')) return 'strength';
-        if (ename.includes('speed') || ename.includes('swiftness')) return 'swiftness';
-        if (ename.includes('fireresistance')) return 'fire_res';
+        if (this.bot && this.bot.registry && this.bot.registry.effects) {
+          const regEffects = this.bot.registry.effects;
+          const registryStartsAtZero = Boolean(regEffects[0] && regEffects[0].name === 'Speed');
+          const lookupIdx = (!zeroBased && registryStartsAtZero) ? (eid - 1) : eid;
+          const eff = regEffects[lookupIdx] || regEffects[eid];
+          const ename = eff && eff.name ? eff.name.toLowerCase() : '';
+          if (ename.includes('instantdamage') || ename.includes('poison') || ename.includes('weakness') || ename.includes('slowness')) {
+            return 'harmful';
+          }
+          if (ename.includes('instanthealth') || ename.includes('healing')) return 'heal2';
+          if (ename.includes('regeneration')) return 'regen';
+          if (ename.includes('strength')) return 'strength';
+          if (ename.includes('speed') || ename.includes('swiftness')) return 'swiftness';
+          if (ename.includes('fireresistance')) return 'fire_res';
+          if (ename.includes('resistance')) return 'turtle_master';
+        }
       }
-    }
-
-    // 3. Vanilla MC 1.20.5–1.21+ numeric `minecraft:potion` registry IDs
-    // (0=water,1=mundane,2=thick,3=awkward, 12-13=fire_res, 14-16=swiftness, 17-19=slowness,
-    //  22-23=healing/strong_healing [or 23-24 in 1.21], 24-25=harming, 26-28=poison, 29-31=regen, 32-34=strength)
-    if (typeof potionId === 'number') {
-      if (potionId <= 3) return 'other';
-      if (potionId === 12 || potionId === 13) return 'fire_res';
-      if (potionId >= 14 && potionId <= 16) return 'swiftness';
-      if (potionId >= 17 && potionId <= 19) return 'harmful';
-      if (potionId === 23) return 'heal2';
-      if (potionId === 22) return 'heal1';
-      if (potionId >= 24 && potionId <= 28) return 'harmful';
-      if (potionId >= 29 && potionId <= 31) return 'regen';
-      if (potionId >= 32 && potionId <= 34) return 'strength';
-      if (potionId >= 35) return 'harmful';
     }
 
     // 4. Fallback: unidentified splash_potion in PvP kits is almost always Instant Health II
@@ -597,6 +683,24 @@ class SurvivalModule {
     }
 
     return 'other';
+  }
+
+  /**
+   * Diagnostic summary of all potions in inventory (used by !debug).
+   */
+  getPotionInventorySummary() {
+    if (!this.bot || !this.bot.inventory) return [];
+    return this.bot.inventory.items()
+      .filter((i) => i && (i.name === 'splash_potion' || i.name === 'potion' || i.name === 'lingering_potion'))
+      .map((i) => {
+        const meta = this._extractPotionMetadata(i);
+        return {
+          name: i.name,
+          slot: i.slot,
+          cls: this._classifyPotion(i),
+          potionId: meta.potionId
+        };
+      });
   }
 
   /**
@@ -985,12 +1089,41 @@ class SurvivalModule {
       });
   }
 
+  _queueSplashPotion(potion, isBuff = false, kind = null) {
+    this.isXpMending = false;
+    this.pendingSplashPotion = potion;
+    this.pendingSplashIsBuff = Boolean(isBuff);
+    this.pendingSplashKind = kind || null;
+    this.pendingSplashCreatedAt = Date.now();
+    this.pendingSplashSettleTicks = 0;
+    this.pendingSplashEquipStarted = false;
+  }
+
+  /**
+   * Checks whether the bot is currently holding the EXACT target item (matching slot for hotbar items,
+   * and matching potion classification for potions so Strength/Speed/Heal pots never collide).
+   */
+  _isHoldingExactItem(item) {
+    if (!item || !this.bot || !this.bot.heldItem) return false;
+    if (this.bot.heldItem.type !== item.type) return false;
+
+    const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+    if (typeof item.slot === 'number' && item.slot >= hotbarStart && item.slot < hotbarStart + 9) {
+      return this.bot.quickBarSlot === (item.slot - hotbarStart);
+    }
+
+    if (item.name === 'potion' || item.name === 'splash_potion' || item.name === 'lingering_potion') {
+      return this._classifyPotion(this.bot.heldItem) === this._classifyPotion(item);
+    }
+    return true;
+  }
+
   /**
    * Inline aggressive combat healing & buffing (runs inside ENGAGING without running away!):
    * - If HP <= inlinePotHealthThreshold (13) and splash healing pot exists -> quick pitch -90° & splash while moving!
-   * - If missing Strength/Swiftness/FireRes buff and splash buff pot exists -> quick splash at feet!
-   * - Refills hotbar healing pots from main inventory when hotbar runs dry.
-   * Returns true ONLY for the 2–4 ticks actively throwing a splash potion.
+   * - If missing Strength/Swiftness/FireRes buff and splash/drinkable buff pot exists -> apply cleanly!
+   * - Refills hotbar healing pots from main inventory when hotbar runs dry (only when idle).
+   * Returns true ONLY while actively throwing a splash potion, drinking a potion, or XP mending.
    */
   tickInlineCombatHeal(target) {
     if (!this.bot || !this.bot.entity || this.totemEquipInFlight) return false;
@@ -1002,7 +1135,7 @@ class SurvivalModule {
 
     // 0. If currently drinking a drinkable potion, walk safely without sprinting (abort only if rushed at low HP)
     if (this.isConsuming && this.isDrinkingPotion) {
-      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500) || (dist < 3.0 && this.bot.health < 10)) {
+      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500) || (dist < 2.8 && this.bot.health < 9)) {
         try { this.bot.deactivateItem(); } catch (_) {}
         this.isConsuming = false;
         this.isDrinkingPotion = false;
@@ -1017,25 +1150,26 @@ class SurvivalModule {
       return this._tickSplashPotionDownward(target, true);
     }
 
-    // Refill empty hotbar pot slots from main inventory passively
-    this._tryRefillHotbarPot();
-
     const potionCooldown = this.survCfg.potionCooldownMs || 450;
+    const isGlidingAirborne = Boolean(this.bot.entity.elytraFlying && !this.bot.entity.onGround);
 
     // 1. Inline Instant Health splash (or drinkable heal potion fallback) when HP <= 13
     const inlineThreshold = this.survCfg.inlinePotHealthThreshold || 13;
     if (this.bot.health <= inlineThreshold && (now - this.lastPotionTime) >= potionCooldown) {
-      const healPot = this.findHealingPotion();
+      const healPot = !isGlidingAirborne ? this.findHealingPotion() : null;
       if (healPot) {
-        this.isXpMending = false;
-        this.pendingSplashPotion = healPot;
-        this.pendingSplashIsBuff = false;
-        this._equipHotbarOrSafe(healPot);
+        this._queueSplashPotion(healPot, false, null);
         return this._tickSplashPotionDownward(target, true);
       }
 
       const drinkHeal = this.findDrinkableHealPotion();
-      if (drinkHeal && (dist >= 3.5 || this.bot.health <= 9)) {
+      if (
+        drinkHeal &&
+        !this.isConsuming &&
+        !this.equipBusy &&
+        (now - this.lastConsumeFailAt) >= 500 &&
+        (dist >= 3.0 || this.bot.health <= 11)
+      ) {
         this.isXpMending = false;
         this._startDrinkingPotion(drinkHeal);
         this._moveAwayWalk(target);
@@ -1043,26 +1177,30 @@ class SurvivalModule {
       }
     }
 
-    // 2. XP Bottle armor mending when any worn armor piece drops below 45% durability
-    if (this.tickArmorXpMend(target)) {
+    // 2. XP Bottle armor mending when any worn armor piece drops below 45% durability (grounded/low only)
+    if (!isGlidingAirborne && this.tickArmorXpMend(target)) {
       return true;
     }
 
     // 3. Combat buff potions (Splash OR Drinkable Strength / Swiftness / FireRes / Regen / Turtle Master)
-    if ((now - this.lastPotionTime) >= potionCooldown && (now - this.lastBuffAttemptTime) >= 4000 && this.bot.health >= 12) {
+    if ((now - this.lastPotionTime) >= potionCooldown && (now - this.lastBuffAttemptTime) >= 3500 && this.bot.health >= 12) {
       const buff = this.findNeededBuffPotion();
       if (buff) {
-        if (buff.isSplash) {
+        if (buff.isSplash && !isGlidingAirborne) {
           this.lastBuffAttemptTime = now;
-          this.pendingSplashPotion = buff.item;
-          this.pendingSplashIsBuff = true;
-          this.pendingSplashKind = buff.kind;
-          this._equipHotbarOrSafe(buff.item);
+          this._queueSplashPotion(buff.item, true, buff.kind);
           return this._tickSplashPotionDownward(target, true);
         }
 
-        const drinkMinDist = this.survCfg.drinkableBuffMinDist !== undefined ? this.survCfg.drinkableBuffMinDist : 4.2;
-        if (this.survCfg.drinkablePotionEnabled !== false && (dist >= drinkMinDist || this.bot.health >= 16)) {
+        const drinkMinDist = this.survCfg.drinkableBuffMinDist !== undefined ? this.survCfg.drinkableBuffMinDist : 3.5;
+        if (
+          !buff.isSplash &&
+          this.survCfg.drinkablePotionEnabled !== false &&
+          !this.isConsuming &&
+          !this.equipBusy &&
+          (now - this.lastConsumeFailAt) >= 500 &&
+          (dist >= drinkMinDist || this.bot.health >= 14)
+        ) {
           this.lastBuffAttemptTime = now;
           this._startDrinkingPotion(buff.item, buff.kind);
           this._moveAwayWalk(target);
@@ -1070,6 +1208,9 @@ class SurvivalModule {
         }
       }
     }
+
+    // 4. Passively refill empty hotbar pot slots from main inventory only when no heal/buff action ran this tick
+    this._tryRefillHotbarPot();
 
     return false;
   }
@@ -1080,7 +1221,7 @@ class SurvivalModule {
    */
   async _equipSingleForConsume(item) {
     if (!item || !this.bot) return false;
-    if (this.bot.heldItem && this.bot.heldItem.type === item.type) {
+    if (this._isHoldingExactItem(item)) {
       return true;
     }
 
@@ -1158,9 +1299,10 @@ class SurvivalModule {
 
   _equipHotbarOrSafe(item) {
     if (!item) return false;
-    if (this.bot.heldItem && this.bot.heldItem.type === item.type) return true;
+    if (this._isHoldingExactItem(item)) return true;
     const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
     if (
+      typeof item.slot === 'number' &&
       item.slot >= hotbarStart &&
       item.slot < hotbarStart + 9 &&
       typeof this.bot.setQuickBarSlot === 'function'
@@ -1358,23 +1500,39 @@ class SurvivalModule {
     }
     this.isXpMending = false;
     this.pendingSplashPotion = null;
+    this.pendingSplashIsBuff = false;
+    this.pendingSplashKind = null;
+    this.pendingSplashCreatedAt = 0;
+    this.pendingSplashSettleTicks = 0;
+    this.pendingSplashEquipStarted = false;
     this.pendingLosBlock = null;
     this.lowerShield();
   }
 
   /**
-   * Smoothly pitches downward to -90° (-PI/2) while moving forward, then throws the queued
-   * Splash Potion of Instant Health II so the bot runs straight into its own healing cloud.
+   * Smoothly pitches downward to -90° (-PI/2) while moving forward, equips the queued
+   * Splash Potion with a 1-tick packet-order settle (never slot-swap + throw on the same tick),
+   * and throws it once aligned so the bot runs straight into its own healing/buff cloud.
    * Returns true while handling the splash sequence.
    */
   _tickSplashPotionDownward(target, inlineCombat = false) {
     if (!this.pendingSplashPotion) return false;
 
+    const now = Date.now();
+    if (this.pendingSplashCreatedAt && (now - this.pendingSplashCreatedAt) > 1200) {
+      this.pendingSplashPotion = null;
+      this.pendingSplashIsBuff = false;
+      this.pendingSplashKind = null;
+      this.pendingSplashEquipStarted = false;
+      return false;
+    }
+
+    const potion = this.pendingSplashPotion;
     const desiredYaw = inlineCombat ? this.bot.entity.yaw : this._getAwayYaw(target);
     const targetPitch = -Math.PI / 2; // Exact -90° straight down
 
     const aimStatus = this.aimer.stepTowardsAngles(desiredYaw, targetPitch, {
-      speedMultiplier: 1.8,
+      speedMultiplier: 1.85,
       toleranceRad: 0.16
     });
 
@@ -1384,12 +1542,57 @@ class SurvivalModule {
     this.bot.setControlState('sprint', false);
     this.bot.setControlState('jump', false);
 
-    if (aimStatus.pitchErrorDeg <= 14) {
-      const potion = this.pendingSplashPotion;
+    // Step 1: Ensure exact potion is equipped (with 1-tick settle after slot switch)
+    let holdingPotion = this._isHoldingExactItem(potion);
+    if (!holdingPotion) {
+      const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+      const inHotbar = typeof potion.slot === 'number' &&
+        potion.slot >= hotbarStart &&
+        potion.slot < hotbarStart + 9;
+
+      if (inHotbar && typeof this.bot.setQuickBarSlot === 'function') {
+        const targetIdx = potion.slot - hotbarStart;
+        if (this.bot.quickBarSlot !== targetIdx) {
+          this.bot.setQuickBarSlot(targetIdx);
+          this.pendingSplashSettleTicks = 0;
+          return true; // Wait 1 tick for held_item_slot to settle before throwing
+        }
+        holdingPotion = true;
+      } else if (!this.pendingSplashEquipStarted && !this.equipBusy) {
+        this.pendingSplashEquipStarted = true;
+        this.pendingSplashSettleTicks = 0;
+        this._equipSafe(potion, 'hand');
+        return true;
+      } else if (this.equipBusy) {
+        this.pendingSplashSettleTicks = 0;
+        return true;
+      } else {
+        // After async bot.equip finished, check if we now hold a matching splash_potion
+        holdingPotion = Boolean(
+          this.bot.heldItem &&
+          this.bot.heldItem.name === 'splash_potion' &&
+          this._classifyPotion(this.bot.heldItem) === this._classifyPotion(potion)
+        );
+        if (!holdingPotion) {
+          // Equip failed or potion vanished — abort cleanly
+          this.pendingSplashPotion = null;
+          this.pendingSplashIsBuff = false;
+          this.pendingSplashKind = null;
+          this.pendingSplashEquipStarted = false;
+          return false;
+        }
+      }
+    }
+
+    this.pendingSplashSettleTicks++;
+
+    // Step 2: Fire once pitched down AND at least 1 tick has elapsed since equip
+    if (holdingPotion && this.pendingSplashSettleTicks >= 1 && aimStatus.pitchErrorDeg <= 14) {
       const buffKind = this.pendingSplashIsBuff ? this.pendingSplashKind : null;
       this.pendingSplashPotion = null;
       this.pendingSplashIsBuff = false;
       this.pendingSplashKind = null;
+      this.pendingSplashEquipStarted = false;
       this._throwSplashPotion(potion, buffKind);
     }
 
@@ -1398,27 +1601,14 @@ class SurvivalModule {
 
   _throwSplashPotion(potion, buffKind = null) {
     if (this.totemEquipInFlight || !potion) return;
-    const fire = () => {
-      try {
-        // Instant throwable item: send use_item only (no extra block_dig/deactivateItem packet)
-        this.bot.activateItem(false);
-        this.lastPotionTime = Date.now();
-        if (buffKind) {
-          this._markBuffApplied(buffKind);
-        }
-      } catch (_) {}
-    };
-
-    if (this._equipHotbarOrSafe(potion)) {
-      fire();
-      return;
-    }
-
-    this._equipSafe(potion, 'hand')
-      .then((ok) => {
-        if (ok) fire();
-      })
-      .catch(() => {});
+    try {
+      // Instant throwable item: send use_item only (no extra block_dig/deactivateItem packet)
+      this.bot.activateItem(false);
+      this.lastPotionTime = Date.now();
+      if (buffKind) {
+        this._markBuffApplied(buffKind);
+      }
+    } catch (_) {}
   }
 
   async _startEatingFood(food) {
@@ -1592,8 +1782,7 @@ class SurvivalModule {
       this.bot.health <= (this.survCfg.retreatHealthThreshold || 6) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
-      this.pendingSplashPotion = healPotion;
-      this._equipHotbarOrSafe(healPotion);
+      this._queueSplashPotion(healPotion, false, null);
       this._tickSplashPotionDownward(target);
       return;
     }
@@ -1668,8 +1857,7 @@ class SurvivalModule {
       this.bot.health <= (this.survCfg.healHealthThreshold || 11) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
-      this.pendingSplashPotion = healPotion;
-      this._equipHotbarOrSafe(healPotion);
+      this._queueSplashPotion(healPotion, false, null);
       this._tickSplashPotionDownward(target);
       return;
     }
@@ -1767,6 +1955,20 @@ class SurvivalModule {
       if (consecutiveFailures >= 2) return; // Inventory likely locked (e.g. lobby)
 
       const worn = this.bot.inventory.slots ? this.bot.inventory.slots[spec.slotIndex] : null;
+      // Preserve worn Elytra in Elytra Spear kits (Elytra + Firework Rocket + Spear/Trident, no Mace)
+      if (spec.dest === 'torso' && worn && worn.name === 'elytra') {
+        const hasRocket = allItems.some((i) => i && i.name === 'firework_rocket');
+        const hasSpear = allItems.some((i) => {
+          if (!i) return false;
+          const n = String(i.name || '').toLowerCase();
+          const c = String(i.customName || i.displayName || '').toLowerCase();
+          return n.includes('spear') || n.includes('trident') || c.includes('spear');
+        });
+        const hasMace = allItems.some((i) => i && i.name === 'mace');
+        if (hasRocket && hasSpear && !hasMace) {
+          continue;
+        }
+      }
       let bestItem = worn;
       let bestScore = worn ? this.scoreArmorItem(worn) : -1;
 

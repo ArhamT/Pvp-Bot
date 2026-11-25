@@ -568,9 +568,20 @@ class PvPBotController {
       const ctrlState = this.bot.controlState
         ? Object.entries(this.bot.controlState).filter(([, v]) => v).map(([k]) => k).join(',') || 'none'
         : 'N/A';
+      const pots = this.survival && typeof this.survival.getPotionInventorySummary === 'function'
+        ? this.survival.getPotionInventorySummary()
+        : [];
+      const potCounts = {};
+      for (const p of pots) {
+        const tag = `${p.name === 'splash_potion' ? 'sp' : 'dr'}:${p.cls}`;
+        potCounts[tag] = (potCounts[tag] || 0) + 1;
+      }
+      const potSummary = Object.entries(potCounts).map(([k, v]) => `${k}x${v}`).join(',') || 'none';
+      const aerialInfo = this.aerial ? `${this.aerial.mode}/${this.aerial.stage || '-'}` : 'off';
       reply(
         `[DEBUG] State=${this.state} Target=${this.activeTargetName || 'none'} (found=${Boolean(target)}, dist=${dist}) ` +
         `Auto=${this.autoFight} PendingDuel=${this.pendingDuelTarget || 'none'} Controls=[${ctrlState}] ` +
+        `Aerial=${aerialInfo} Pots=[${potSummary}] ` +
         `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +
         `Pkt/s=${this.getOutgoingPacketRate()}`
       );
