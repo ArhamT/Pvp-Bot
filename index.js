@@ -131,6 +131,11 @@ class PvPBotController {
     this.roamGlanceYaw = 0;
     this.roamGlancePitch = 0;
 
+    // Random "duel me, I'm a bot" spawn advertisement state
+    const advCfg = (cfg.bot && cfg.bot.advertise) || {};
+    this.advertiseEnabled = advCfg.enabled !== false;
+    this.advertiseTimer = null;
+    this.lastAdvertiseIndex = -1;
     this.initializedOnSpawn = false;
     this.loginAttempted = false;
     this.loginSentAt = 0;
@@ -253,6 +258,7 @@ class PvPBotController {
         this._resetSpawnRoam();
         this.transitionState(STATES.IDLE, 'initial spawn');
         this._startTickLoop();
+        this._scheduleAdvertise();
 
         // Fallback cracked-server /login if server prompts via Title/ActionBar instead of chat
         if (this.loginPassword) {
@@ -377,6 +383,7 @@ class PvPBotController {
       this._clearLoginFallbackTimer();
       this._clearDuelsRejoinTimer('disconnected');
       this._clearDuelAcceptTimer();
+      this._clearAdvertiseTimer();
       if (this.combat) this.combat.dispose();
       if (this.survival) this.survival.dispose();
       if (this.ranged) this.ranged.dispose();
@@ -735,7 +742,7 @@ class PvPBotController {
   executeBotCommand(command, args = [], caller = 'console', reply = (msg) => this.log(msg)) {
     if (command === 'help') {
       reply(
-        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !roam | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
+        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !roam | !ads | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
       );
       return;
     }
@@ -820,6 +827,17 @@ class PvPBotController {
         this._resetSpawnRoam();
       }
       reply(`Spawn roaming: ${this.roamInSpawn ? 'ON' : 'OFF'}.`);
+      return;
+    }
+
+    if (command === 'ads') {
+      this.advertiseEnabled = !this.advertiseEnabled;
+      if (this.advertiseEnabled) {
+        this._scheduleAdvertise();
+      } else {
+        this._clearAdvertiseTimer();
+      }
+      reply(`Duel advertisement messages: ${this.advertiseEnabled ? 'ON (every 10-30s while players are online)' : 'OFF'}.`);
       return;
     }
 
@@ -1214,10 +1232,70 @@ class PvPBotController {
     this._clearLoginFallbackTimer();
     this._clearDuelsRejoinTimer();
     this._clearDuelAcceptTimer();
+    this._clearAdvertiseTimer();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  _clearAdvertiseTimer() {
+    if (this.advertiseTimer) {
+      clearTimeout(this.advertiseTimer);
+      this.advertiseTimer = null;
+    }
+  }
+
+  /**
+   * Counts other real players on the server tab list (excluding the bot itself).
+   */
+  _countOtherOnlinePlayers() {
+    if (!this.bot || !this.bot.players) return 0;
+    const selfName = (this.bot.username || '').toLowerCase();
+    return Object.keys(this.bot.players).filter((name) => name && name.toLowerCase() !== selfName).length;
+  }
+
+  /**
+   * Schedules the next random "duel me, I'm a bot" chat message after a random 10–30s delay.
+   * Only speaks while IDLE (never mid-fight) and stays completely silent when nobody else is online.
+   */
+  _scheduleAdvertise() {
+    this._clearAdvertiseTimer();
+    if (!this.advertiseEnabled || this.shuttingDown) return;
+
+    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
+    const minDelay = Number.isFinite(advCfg.minDelayMs) ? advCfg.minDelayMs : 10000;
+    const maxDelay = Number.isFinite(advCfg.maxDelayMs) ? Math.max(minDelay, advCfg.maxDelayMs) : 30000;
+    const delayMs = Math.round(this._randRange(minDelay, maxDelay));
+
+    this.advertiseTimer = setTimeout(() => {
+      this.advertiseTimer = null;
+      this._sendAdvertise();
+      this._scheduleAdvertise();
+    }, delayMs);
+  }
+
+  _sendAdvertise() {
+    if (!this.advertiseEnabled || this.shuttingDown || !this.bot || !this.bot.entity) return false;
+    if (this.state !== STATES.IDLE || this.inDuelArena) return false;
+    if (this.loginPassword && !this.loginAttempted) return false;
+    if (this._countOtherOnlinePlayers() === 0) return false;
+
+    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
+    const messages = Array.isArray(advCfg.messages) ? advCfg.messages.filter((m) => typeof m === 'string' && m.trim()) : [];
+    if (messages.length === 0) return false;
+
+    // Pick a random message, never repeating the previous one back-to-back
+    let idx = Math.floor(Math.random() * messages.length);
+    if (messages.length > 1 && idx === this.lastAdvertiseIndex) {
+      idx = (idx + 1 + Math.floor(Math.random() * (messages.length - 1))) % messages.length;
+    }
+    this.lastAdvertiseIndex = idx;
+
+    const text = messages[idx].replace(/\{name\}/g, this.bot.username || 'me');
+    this.bot.chat(text);
+    this.log(`[ADS] ${text}`);
+    return true;
   }
 
   _scheduleReconnect() {

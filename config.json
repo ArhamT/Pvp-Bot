@@ -23,6 +23,20 @@
     "roamWalkMaxMs": 3200,
     "roamPauseMinMs": 2200,
     "roamPauseMaxMs": 4800,
+    "advertise": {
+      "enabled": true,
+      "minDelayMs": 10000,
+      "maxDelayMs": 30000,
+      "messages": [
+        "I'm a PvP bot - think you can beat me? Send me a duel!",
+        "Bored? Duel me! I'm a bot and I accept every challenge.",
+        "Beep boop, I'm a bot. Type /duel {name} if you're brave enough.",
+        "Need a sparring partner? I'm a bot - duel me anytime!",
+        "Practice your PvP against a bot! Just /duel {name} and I'll accept.",
+        "I never sleep and I never say no. Duel me! (I'm a bot)",
+        "Free PvP practice here - I'm a bot, send a duel and I'll be there."
+      ]
+    },
     "reconnect": {
       "enabled": true,
       "initialDelayMs": 5000,
