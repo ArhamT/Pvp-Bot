@@ -342,8 +342,8 @@ class SurvivalModule {
       ],
       offhand: false,
       returnToLastItem: true,
-      eatingTimeout: this.survCfg.eatTimeoutMs || 2200,
-      strictErrors: false
+      eatingTimeout: this.survCfg.eatTimeoutMs || 3500,
+      strictErrors: true
     });
   }
 
@@ -735,12 +735,16 @@ class SurvivalModule {
   }
 
   /**
-   * Finds highest-priority healing food (Enchanted Gapple -> Gapple -> Golden Carrot -> Steak, etc.).
+   * Finds highest-priority edible healing food.
+   * At full hunger (food >= 20), only returns always-edible foods (Enchanted/Golden Apples),
+   * because vanilla Minecraft refuses regular food at 20 food and hangs until eat timeout.
    */
   findBestHealFood() {
     if (!this.bot.inventory) return null;
     const items = this.bot.inventory.items();
-    for (const name of HEAL_FOOD_PRIORITY) {
+    const canEatNormalFood = typeof this.bot.food !== 'number' || this.bot.food < 20;
+    const list = canEatNormalFood ? HEAL_FOOD_PRIORITY : GAPPLE_PRIORITY;
+    for (const name of list) {
       const found = items.find((i) => i.name === name);
       if (found) return found;
     }
@@ -960,23 +964,40 @@ class SurvivalModule {
 
   async _startEatingFood(food) {
     if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !food) return;
+
+    // Never attempt to eat normal food at full hunger (vanilla MC rejects it and hangs until timeout)
+    const isAlwaysEdible = GAPPLE_PRIORITY.includes(food.name);
+    if (!isAlwaysEdible && typeof this.bot.food === 'number' && this.bot.food >= 20) {
+      return;
+    }
+
     this.isConsuming = true;
     this.consumeStartTime = Date.now();
     this.bot.setControlState('sprint', false);
 
+    const timeoutMs = this.survCfg.eatTimeoutMs || 3500;
+    let timeoutHandle = null;
+
     try {
-      if (this.bot.autoEat && !this.bot.autoEat.isEating) {
-        await this.bot.autoEat.eat({ food, offhand: false, equipOldItem: true });
-      } else {
+      this._equipHotbarOrSafe(food);
+      if (!this.bot.heldItem || this.bot.heldItem.type !== food.type) {
         await this.bot.equip(food, 'hand');
-        await this.bot.consume();
       }
+
+      await Promise.race([
+        this.bot.consume(),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error('eat_timeout')), timeoutMs);
+        })
+      ]);
+
       if (food.name && food.name.includes('golden_apple')) {
         this.justAteGappleAt = Date.now();
       }
     } catch (_) {
-      // Eating interrupted
+      try { this.bot.deactivateItem(); } catch (_) {}
     } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       this.isConsuming = false;
     }
   }

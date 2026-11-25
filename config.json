@@ -118,7 +118,7 @@
     "shieldCooldownMs": 1200,
     "potionCooldownMs": 450,
     "buffPotionEnabled": true,
-    "eatTimeoutMs": 2000,
+    "eatTimeoutMs": 3500,
     "retreatDistance": 7.5,
     "losBlockCooldownMs": 950,
     "autoSortHotbar": true,
