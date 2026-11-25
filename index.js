@@ -890,7 +890,7 @@ class PvPBotController {
       } else {
         this._clearAdvertiseTimer();
       }
-      reply(`Duel advertisement messages: ${this.advertiseEnabled ? 'ON (every 10-30s while players are online)' : 'OFF'}.`);
+      reply(`Duel advertisement messages: ${this.advertiseEnabled ? 'ON (every 1-3min while players are online)' : 'OFF'}.`);
       return;
     }
 
@@ -1312,7 +1312,7 @@ class PvPBotController {
   }
 
   /**
-   * Schedules the next random "duel me, I'm a bot" chat message after a random 10–30s delay.
+   * Schedules the next random "duel me, I'm a bot" chat message after a random 1–3min delay.
    * Only speaks while IDLE (never mid-fight) and stays completely silent when nobody else is online.
    */
   _scheduleAdvertise() {
@@ -1320,8 +1320,8 @@ class PvPBotController {
     if (!this.advertiseEnabled || this.shuttingDown) return;
 
     const advCfg = (this.config.bot && this.config.bot.advertise) || {};
-    const minDelay = Number.isFinite(advCfg.minDelayMs) ? advCfg.minDelayMs : 10000;
-    const maxDelay = Number.isFinite(advCfg.maxDelayMs) ? Math.max(minDelay, advCfg.maxDelayMs) : 30000;
+    const minDelay = Number.isFinite(advCfg.minDelayMs) ? advCfg.minDelayMs : 60000;
+    const maxDelay = Number.isFinite(advCfg.maxDelayMs) ? Math.max(minDelay, advCfg.maxDelayMs) : 180000;
     const delayMs = Math.round(this._randRange(minDelay, maxDelay));
 
     this.advertiseTimer = setTimeout(() => {

@@ -28,8 +28,8 @@
     "advertise": {
       "enabled": true,
       "colorPrefix": "&b",
-      "minDelayMs": 10000,
-      "maxDelayMs": 30000,
+      "minDelayMs": 60000,
+      "maxDelayMs": 180000,
       "messages": [
         "&bI'm a PvP bot - think you can beat me? Send me a duel!",
         "&bBored? Duel me! I'm a bot and I accept every challenge.",
