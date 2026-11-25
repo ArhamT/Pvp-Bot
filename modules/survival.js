@@ -95,6 +95,34 @@ const ARMOR_MAX_DURABILITY = {
   netherite_helmet: 407, netherite_chestplate: 592, netherite_leggings: 555, netherite_boots: 481
 };
 
+// Default fallback durations (ms) applied immediately when bot uses a buff potion
+// (overridden with exact server tick duration when `entityEffect` packet arrives)
+const DEFAULT_BUFF_DURATION_MS = {
+  strength: 80000,      // Strength II = 1:30 (90s)
+  swiftness: 80000,     // Speed II = 1:30 (90s)
+  fire_res: 165000,     // Fire Res = 3:00–8:00 (180s+)
+  regen: 20000,         // Regen II = 0:22
+  turtle_master: 18000, // Turtle Master = 0:20
+  unknown_drink: 85000
+};
+
+// Standard MC Java status effect IDs (0-based in >= 1.20.5, 1-based in <= 1.20.4)
+const ZERO_BASED_EFFECT_TO_KIND = {
+  0: 'swiftness',
+  4: 'strength',
+  9: 'regen',
+  10: 'turtle_master',
+  11: 'fire_res'
+};
+
+const ONE_BASED_EFFECT_TO_KIND = {
+  1: 'swiftness',
+  5: 'strength',
+  10: 'regen',
+  11: 'turtle_master',
+  12: 'fire_res'
+};
+
 /**
  * Highest-priority survival module handling:
  * 1. Event-driven + per-tick Totem of Undying management (slot 45, <100ms, preempts all inventory actions).
@@ -134,8 +162,10 @@ class SurvivalModule {
     this.lastBuffAttemptTime = 0;
     this.pendingSplashPotion = null;
     this.pendingSplashIsBuff = false;
+    this.pendingSplashKind = null;
     this.pendingPotRefillTime = 0;
     this.justAteGappleAt = 0;
+    this.activeBuffUntil = new Map();
     this.isXpMending = false;
     this.lastXpThrowTime = 0;
 
@@ -145,20 +175,27 @@ class SurvivalModule {
     this.lastLosBlockTime = 0;
     this.pendingLosBlock = null;
 
-    // Bind immediate event listeners for <100ms Totem of Undying re-equip
+    // Bind immediate event listeners for <100ms Totem of Undying re-equip & accurate buff tracking
     this._onUpdateSlot = this._handleUpdateSlot.bind(this);
     this._onHealth = this._handleHealth.bind(this);
+    this._onEntityEffect = this._handleEntityEffect.bind(this);
+    this._onEntityEffectEnd = this._handleEntityEffectEnd.bind(this);
+    this._onClearBuffs = this._handleClearBuffs.bind(this);
 
     if (this.bot.inventory && typeof this.bot.inventory.on === 'function') {
       this.bot.inventory.on('updateSlot', this._onUpdateSlot);
     }
     if (typeof this.bot.on === 'function') {
       this.bot.on('health', this._onHealth);
+      this.bot.on('entityEffect', this._onEntityEffect);
+      this.bot.on('entityEffectEnd', this._onEntityEffectEnd);
+      this.bot.on('death', this._onClearBuffs);
+      this.bot.on('respawn', this._onClearBuffs);
     }
   }
 
   /**
-   * Unbinds inventory and health listeners cleanly on disconnect.
+   * Unbinds inventory, health, and effect listeners cleanly on disconnect.
    */
   dispose() {
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
@@ -166,7 +203,12 @@ class SurvivalModule {
     }
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('health', this._onHealth);
+      this.bot.removeListener('entityEffect', this._onEntityEffect);
+      this.bot.removeListener('entityEffectEnd', this._onEntityEffectEnd);
+      this.bot.removeListener('death', this._onClearBuffs);
+      this.bot.removeListener('respawn', this._onClearBuffs);
     }
+    this.activeBuffUntil.clear();
     this.stopConsumption();
   }
 
@@ -757,25 +799,116 @@ class SurvivalModule {
   }
 
   /**
-   * Checks whether the bot currently has a named status effect active (works across 1.20.4 & 1.21+).
+   * Determines whether the current Minecraft protocol sends 0-based effect IDs (>= 1.20.5)
+   * or 1-based effect IDs (<= 1.20.4).
    */
-  _hasActiveEffect(keyword) {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.effects) return false;
-    const effectsMap = this.bot.entity.effects;
-    const registryEffects = (this.bot.registry && this.bot.registry.effects) || {};
-    const kw = keyword.toLowerCase();
-
-    for (const eff of Object.values(effectsMap)) {
-      if (!eff) continue;
-      const reg = registryEffects[eff.id];
-      const name = reg && reg.name ? reg.name.toLowerCase() : '';
-      if (name.includes(kw)) return true;
+  _usesZeroBasedEffectIds() {
+    if (!this.bot) return true;
+    if (typeof this.bot.version === 'string') {
+      const m = this.bot.version.match(/^1\.(\d+)(?:\.(\d+))?/);
+      if (m) {
+        const minor = parseInt(m[1], 10);
+        const patch = m[2] ? parseInt(m[2], 10) : 0;
+        if (minor > 20 || (minor === 20 && patch >= 5)) return true;
+        return false;
+      }
+    }
+    // Fallback: check if minecraft-data registry itself starts at 0
+    if (this.bot.registry && this.bot.registry.effects && this.bot.registry.effects[0]) {
+      return true;
     }
     return false;
   }
 
   /**
-   * Finds a missing combat buff potion (Strength, Swiftness, or Fire Resistance).
+   * Maps a protocol status effect ID to our internal buff kind ('swiftness', 'strength', 'fire_res', 'regen', 'turtle_master').
+   * Fixes the off-by-1 mismatch where minecraft-data uses 0-based keys even when MC 1.20.4 sends 1-based effect IDs.
+   */
+  _mapEffectIdToKind(effectId) {
+    if (typeof effectId !== 'number') return null;
+    const zeroBased = this._usesZeroBasedEffectIds();
+    const table = zeroBased ? ZERO_BASED_EFFECT_TO_KIND : ONE_BASED_EFFECT_TO_KIND;
+    if (table[effectId]) return table[effectId];
+
+    // Also try registry lookup adjusting for 1-based protocol vs 0-based minecraft-data table
+    const regEffects = this.bot && this.bot.registry && this.bot.registry.effects;
+    if (regEffects) {
+      const registryStartsAtZero = Boolean(regEffects[0] && regEffects[0].name === 'Speed');
+      const lookupIdx = (!zeroBased && registryStartsAtZero) ? (effectId - 1) : effectId;
+      const reg = regEffects[lookupIdx];
+      if (reg) {
+        const norm = String((reg.name || '') + ' ' + (reg.displayName || '')).toLowerCase().replace(/[\s_-]+/g, '');
+        if (norm.includes('fireresistance')) return 'fire_res';
+        if (norm.includes('strength')) return 'strength';
+        if (norm.includes('speed') || norm.includes('swiftness')) return 'swiftness';
+        if (norm.includes('regeneration')) return 'regen';
+        if (norm.includes('resistance')) return 'turtle_master';
+      }
+    }
+    return null;
+  }
+
+  _handleEntityEffect(entity, effect) {
+    if (!this.bot || !this.bot.entity || !entity || entity.id !== this.bot.entity.id || !effect) return;
+    const kind = this._mapEffectIdToKind(effect.id);
+    if (!kind) return;
+
+    // effect.duration === -1 means infinite; otherwise duration is in ticks (50ms each)
+    const expiresAt = effect.duration < 0
+      ? Infinity
+      : Date.now() + Math.max(0, effect.duration * 50 - 3000);
+    this.activeBuffUntil.set(kind, expiresAt);
+  }
+
+  _handleEntityEffectEnd(entity, effect) {
+    if (!this.bot || !this.bot.entity || !entity || entity.id !== this.bot.entity.id || !effect) return;
+    const kind = this._mapEffectIdToKind(effect.id);
+    if (kind) {
+      this.activeBuffUntil.delete(kind);
+    }
+  }
+
+  _handleClearBuffs() {
+    this.activeBuffUntil.clear();
+  }
+
+  _markBuffApplied(kind) {
+    if (!kind) return;
+    const durationMs = DEFAULT_BUFF_DURATION_MS[kind] || 80000;
+    const targetUntil = Date.now() + durationMs;
+    const existing = this.activeBuffUntil.get(kind) || 0;
+    if (targetUntil > existing) {
+      this.activeBuffUntil.set(kind, targetUntil);
+    }
+  }
+
+  /**
+   * Returns true if buff `kind` ('strength', 'swiftness', 'fire_res', 'regen', 'turtle_master', 'unknown_drink')
+   * is currently active with > 3 seconds remaining (checking both tracked expiry timers and `bot.entity.effects`).
+   */
+  isBuffActive(kind) {
+    const now = Date.now();
+    const until = this.activeBuffUntil.get(kind);
+    if (until && until > now) {
+      return true;
+    }
+
+    if (!this.bot || !this.bot.entity || !this.bot.entity.effects) return false;
+    for (const eff of Object.values(this.bot.entity.effects)) {
+      if (!eff) continue;
+      if (this._mapEffectIdToKind(eff.id) === kind) {
+        // Only treat as active if duration is infinite (-1) or > 60 ticks (> 3 seconds)
+        if (eff.duration === undefined || eff.duration < 0 || eff.duration > 60) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Finds a missing combat buff potion (Strength, Swiftness, Fire Resistance, Regeneration, Turtle Master).
+   * Never re-drinks or re-splashes a buff that still has remaining duration.
    */
   findNeededBuffPotion() {
     if (!this.bot.inventory || this.survCfg.buffPotionEnabled === false) return null;
@@ -783,11 +916,11 @@ class SurvivalModule {
     const allowDrinkable = this.survCfg.drinkablePotionEnabled !== false;
 
     const wantTypes = [];
-    if (!this._hasActiveEffect('strength')) wantTypes.push('strength');
-    if (!this._hasActiveEffect('speed') && !this._hasActiveEffect('swiftness')) wantTypes.push('swiftness');
-    if (!this._hasActiveEffect('fireresistance') && !this._hasActiveEffect('fire_resistance')) wantTypes.push('fire_res');
-    if (this.bot.health <= 16 && !this._hasActiveEffect('regeneration')) wantTypes.push('regen');
-    if (this.bot.health <= 15 && !this._hasActiveEffect('resistance')) wantTypes.push('turtle_master');
+    if (!this.isBuffActive('strength')) wantTypes.push('strength');
+    if (!this.isBuffActive('swiftness')) wantTypes.push('swiftness');
+    if (!this.isBuffActive('fire_res')) wantTypes.push('fire_res');
+    if (this.bot.health <= 16 && !this.isBuffActive('regen')) wantTypes.push('regen');
+    if (this.bot.health <= 15 && !this.isBuffActive('turtle_master')) wantTypes.push('turtle_master');
 
     for (const want of wantTypes) {
       const splash = items.find((i) => i.name === 'splash_potion' && this._classifyPotion(i) === want);
@@ -798,10 +931,10 @@ class SurvivalModule {
       }
     }
 
-    // Fallback: drink unidentified custom buff potion if present and healthy
-    if (allowDrinkable) {
+    // Fallback: drink unidentified custom buff potion at most once per buff window
+    if (allowDrinkable && !this.isBuffActive('unknown_drink')) {
       const customDrink = items.find((i) => i.name === 'potion' && this._classifyPotion(i) === 'unknown_drink');
-      if (customDrink && !this._hasActiveEffect('strength') && !this._hasActiveEffect('speed')) {
+      if (customDrink && !this.isBuffActive('strength') && !this.isBuffActive('swiftness')) {
         return { item: customDrink, isSplash: false, kind: 'unknown_drink' };
       }
     }
@@ -924,6 +1057,7 @@ class SurvivalModule {
           this.lastBuffAttemptTime = now;
           this.pendingSplashPotion = buff.item;
           this.pendingSplashIsBuff = true;
+          this.pendingSplashKind = buff.kind;
           this._equipHotbarOrSafe(buff.item);
           return this._tickSplashPotionDownward(target, true);
         }
@@ -931,7 +1065,7 @@ class SurvivalModule {
         const drinkMinDist = this.survCfg.drinkableBuffMinDist !== undefined ? this.survCfg.drinkableBuffMinDist : 4.2;
         if (this.survCfg.drinkablePotionEnabled !== false && (dist >= drinkMinDist || this.bot.health >= 16)) {
           this.lastBuffAttemptTime = now;
-          this._startDrinkingPotion(buff.item);
+          this._startDrinkingPotion(buff.item, buff.kind);
           this._moveAwayWalk(target);
           return true;
         }
@@ -945,7 +1079,7 @@ class SurvivalModule {
    * Drinks a regular `potion` (Strength, Swiftness, Fire Resistance, Healing, Regen, etc.)
    * cleanly via Mineflayer's `bot.consume()` with timeout & anti-NoSlow sprint disable.
    */
-  async _startDrinkingPotion(potionItem) {
+  async _startDrinkingPotion(potionItem, buffKind = null) {
     if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !potionItem) return;
     this.isConsuming = true;
     this.isDrinkingPotion = true;
@@ -968,6 +1102,9 @@ class SurvivalModule {
         })
       ]);
       this.lastPotionTime = Date.now();
+      if (buffKind) {
+        this._markBuffApplied(buffKind);
+      }
     } catch (_) {
       try { this.bot.deactivateItem(); } catch (_) {}
     } finally {
@@ -1204,20 +1341,25 @@ class SurvivalModule {
 
     if (aimStatus.pitchErrorDeg <= 14) {
       const potion = this.pendingSplashPotion;
+      const buffKind = this.pendingSplashIsBuff ? this.pendingSplashKind : null;
       this.pendingSplashPotion = null;
       this.pendingSplashIsBuff = false;
-      this._throwSplashPotion(potion);
+      this.pendingSplashKind = null;
+      this._throwSplashPotion(potion, buffKind);
     }
 
     return true;
   }
 
-  _throwSplashPotion(potion) {
+  _throwSplashPotion(potion, buffKind = null) {
     if (this.totemEquipInFlight || !potion) return;
     const fire = () => {
       try {
         this.bot.activateItem(false);
         this.lastPotionTime = Date.now();
+        if (buffKind) {
+          this._markBuffApplied(buffKind);
+        }
         setTimeout(() => {
           try { this.bot.deactivateItem(); } catch (_) {}
         }, 60);
