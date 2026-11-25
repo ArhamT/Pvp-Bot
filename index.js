@@ -1032,7 +1032,7 @@ class PvPBotController {
 
     for (const entity of Object.values(this.bot.entities)) {
       if (!entity || !entity.isValid || !entity.position) continue;
-      const isItemDrop = entity.name === 'item' || entity.objectType === 'Item';
+      const isItemDrop = entity.name === 'item' || entity.displayName === 'Item';
       if (!isItemDrop) continue;
 
       const dist = this.bot.entity.position.distanceTo(entity.position);

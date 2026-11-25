@@ -194,7 +194,7 @@ class AerialModule {
     if (this.aerialCfg.pearlCatchEnabled === false) return;
     if (!entity || !entity.position || !this.bot || !this.bot.entity || !this.bot.entity.position) return;
 
-    const name = String(entity.name || entity.objectType || '').toLowerCase();
+    const name = String(entity.name || entity.displayName || '').toLowerCase();
     if (!name.includes('ender_pearl') && !name.includes('thrownenderpearl')) return;
 
     // Ignore pearls spawned directly at our own eyes (our own thrown pearls)
