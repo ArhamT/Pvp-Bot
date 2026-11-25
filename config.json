@@ -17,6 +17,12 @@
     "autoRejoinDuels": true,
     "duelsServerName": "duels",
     "duelsRejoinDelayMs": 15000,
+    "roamInSpawn": true,
+    "roamRadius": 10,
+    "roamWalkMinMs": 1400,
+    "roamWalkMaxMs": 3200,
+    "roamPauseMinMs": 2200,
+    "roamPauseMaxMs": 4800,
     "reconnect": {
       "enabled": true,
       "initialDelayMs": 5000,

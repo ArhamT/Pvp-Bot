@@ -4,11 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const mineflayer = require('mineflayer');
+const { Vec3 } = require('vec3');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
 const armorManager = require('mineflayer-armor-manager');
 
-const { SmoothAimer } = require('./modules/aim');
+const { SmoothAimer, normalizeAngle } = require('./modules/aim');
 const { PredictionModule } = require('./modules/prediction');
 const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
@@ -25,6 +26,7 @@ const STATES = Object.freeze({
 });
 
 const DUEL_REQUEST_REGEX = /(?:^|[\s•|:\]>»-])([A-Za-z0-9_]{3,16})\s+(?:has\s+sent(?:\s+you)?\s+a\s+duel\s+request|sent(?:\s+you)?\s+a\s+duel\s+request|challenged\s+you\s+to\s+a\s+duel)/i;
+const DUEL_START_CUE_REGEX = /(?:^|[\s•|:\]>»-])(?:go!+|fight!+)(?:$|[\s!.,])/i;
 
 /**
  * Strips legacy Minecraft color/formatting codes (§x / &x) and trims whitespace.
@@ -112,9 +114,22 @@ class PvPBotController {
     this.pendingDuelTarget = null;
     this.pendingDuelReady = false;
     this.autoStartDuelUntil = 0;
+    this.duelEndedAt = 0;
+    this.inDuelArena = false;
     this.autoFight = false;
     this.lastKnownHealth = 20;
     this.lootStartedAt = 0;
+
+    // Gentle casual spawn roaming state while IDLE in spawn/lobby
+    this.roamInSpawn = cfg.bot ? cfg.bot.roamInSpawn !== false : true;
+    this.spawnAnchorPos = null;
+    this.roamPhase = 'PAUSED'; // 'PAUSED' | 'WALKING'
+    this.roamPhaseUntil = 0;
+    this.roamTargetPos = null;
+    this.roamLastLookAt = 0;
+    this.roamNextGlanceAt = 0;
+    this.roamGlanceYaw = 0;
+    this.roamGlancePitch = 0;
 
     this.initializedOnSpawn = false;
     this.loginAttempted = false;
@@ -234,6 +249,8 @@ class PvPBotController {
         // Passive read-only hotbar scan (sends zero packets)
         this.combat.scanHotbarSlots();
 
+        this.spawnAnchorPos = bot.entity.position.clone();
+        this._resetSpawnRoam();
         this.transitionState(STATES.IDLE, 'initial spawn');
         this._startTickLoop();
 
@@ -249,18 +266,35 @@ class PvPBotController {
       } else {
         // Backend server transfer (e.g. /server duels) or arena teleport:
         // Stay quiet in IDLE so locked lobby GUI items never trigger packet-rate kicks,
-        // while arming pendingDuelTarget (from /duel <player>) once teleported into an arena!
+        // and never attack players in spawn after a duel ends.
         this.log(`Switched world/server — spawned at ${bot.entity.position.floored()}.`);
         this.activeTargetName = null;
         this.activeTargetEntityId = null;
         this.targetLastSeenPos = null;
         this.targetLostAt = 0;
-        if (this.pendingDuelTarget) {
-          this.pendingDuelReady = true;
-        }
-        // If wearing combat armor on teleport into a 1v1 arena (autoStartDuel), arm 15s arena auto-engage window
-        if (this.config.bot.autoStartDuel !== false && this._isWearingCombatArmor()) {
-          this.autoStartDuelUntil = Date.now() + 15000;
+        this.spawnAnchorPos = bot.entity.position.clone();
+        this._resetSpawnRoam();
+
+        const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
+        const nearbyCount = this._listNearbyPlayers().length;
+        const wearingArmor = this._isWearingCombatArmor();
+
+        if (recentlyEndedDuel || nearbyCount >= 4) {
+          this.pendingDuelTarget = null;
+          this.pendingDuelReady = false;
+          this.autoStartDuelUntil = 0;
+          this.inDuelArena = false;
+        } else {
+          if (this.pendingDuelTarget && (wearingArmor || (nearbyCount >= 1 && nearbyCount <= 2))) {
+            this.pendingDuelReady = true;
+            this.inDuelArena = true;
+          } else {
+            this.pendingDuelReady = false;
+          }
+          if (this.config.bot.autoStartDuel !== false && wearingArmor && nearbyCount <= 3) {
+            this.autoStartDuelUntil = Date.now() + 15000;
+            this.inDuelArena = true;
+          }
         }
         this.lastKnownHealth = typeof bot.health === 'number' ? bot.health : 20;
         if (this.prediction) this.prediction.clear();
@@ -309,11 +343,22 @@ class PvPBotController {
       this.activeTargetName = null;
       this.activeTargetEntityId = null;
       this.pendingDuelTarget = null;
+      this.pendingDuelReady = false;
+      this.autoStartDuelUntil = 0;
+      this.inDuelArena = false;
+      this.duelEndedAt = Date.now();
       this.transitionState(STATES.IDLE, 'death');
     });
 
     bot.on('respawn', () => {
       this.log('Respawned. Ready in IDLE (use !kit, !sort, or !duel when in arena).');
+      this.inDuelArena = false;
+      this.autoStartDuelUntil = 0;
+      this.pendingDuelReady = false;
+      if (this.bot && this.bot.entity && this.bot.entity.position) {
+        this.spawnAnchorPos = this.bot.entity.position.clone();
+        this._resetSpawnRoam();
+      }
       if (this.survival) this.survival.setCombatActive(false);
       if (this.combat) this.combat.scanHotbarSlots();
     });
@@ -491,6 +536,8 @@ class PvPBotController {
     this.pendingDuelTarget = null;
     this.pendingDuelReady = false;
     this.autoStartDuelUntil = 0;
+    this.inDuelArena = false;
+    this.duelEndedAt = Date.now();
     this._clearDuelAcceptTimer();
     this.transitionState(STATES.IDLE, 'kicked from duels');
 
@@ -579,7 +626,7 @@ class PvPBotController {
       const cmd = `/duel accept ${senderLower}`;
       this.bot.chat(cmd);
       this.pendingDuelTarget = sender;
-      this.pendingDuelReady = true;
+      this.pendingDuelReady = false; // Wait for arena teleport or "GO!" cue — never attack challenger in spawn!
       this.log(`[DUELS] Accepted duel request from ${sender} -> ${cmd}`);
     }, delayMs);
 
@@ -595,49 +642,65 @@ class PvPBotController {
     if (!text || this.config.bot.autoStartDuel === false) return;
     const lower = text.toLowerCase();
 
-    // Match end -> stop fighting cleanly so we don't attack players back in lobby
+    // Match end -> stop fighting cleanly and clear pending duel flags so we don't fight in spawn!
     if (
       lower.includes('won the duel') ||
       lower.includes('won the match') ||
+      lower.includes('won the fight') ||
+      lower.includes('lost the fight') ||
+      lower.includes('you won the fight') ||
+      lower.includes('you lost the fight') ||
+      lower.includes('click here to replay') ||
       lower.includes('match ended') ||
       lower.includes('duel ended') ||
       lower.includes('you won!') ||
       lower.includes('you lost!')
     ) {
+      this.activeTargetName = null;
+      this.activeTargetEntityId = null;
+      this.targetLastSeenPos = null;
+      this.targetLostAt = 0;
+      this.pendingDuelTarget = null;
+      this.pendingDuelReady = false;
+      this.autoStartDuelUntil = 0;
+      this.inDuelArena = false;
+      this.duelEndedAt = Date.now();
       if (this.state !== STATES.IDLE) {
-        this.activeTargetName = null;
-        this.activeTargetEntityId = null;
-        this.targetLastSeenPos = null;
-        this.pendingDuelTarget = null;
-        this.pendingDuelReady = false;
-        this.autoStartDuelUntil = 0;
         this.transitionState(STATES.IDLE, 'duel ended');
       }
       return;
     }
 
-    // Match start -> immediately arm and engage nearest opponent!
+    // Match start -> immediately arm and engage nearest opponent (never within 2s after match end or in crowded hubs)
     if (
       lower.includes('duel has started') ||
       lower.includes('match has started') ||
       lower.includes('the duel begins') ||
       lower.includes('match started') ||
       lower.includes('starting duel') ||
-      /\bfight!\b/.test(lower) ||
-      /\bgo!\b/.test(lower)
+      DUEL_START_CUE_REGEX.test(text)
     ) {
+      const now = Date.now();
+      if ((now - this.duelEndedAt) < 2000) return;
+
       this._clearDuelsRejoinTimer('duel started');
-      this.autoStartDuelUntil = Date.now() + 12000;
+      const preferred = this.pendingDuelTarget ? this._findPlayerEntity(this.pendingDuelTarget) : null;
+      const nearby = this._listNearbyPlayers();
+      const validArena = Boolean(preferred) ||
+        this._isWearingCombatArmor() ||
+        (nearby.length >= 1 && nearby.length <= 3);
+      if (!validArena) return;
+
+      this.inDuelArena = true;
+      this.autoStartDuelUntil = now + 12000;
       if (this.pendingDuelTarget) this.pendingDuelReady = true;
 
       if (this.state === STATES.IDLE && this.bot && this.bot.entity) {
         const engageRange = this.config.combat.engageRange || 36.0;
-        const preferred = this.pendingDuelTarget ? this._findPlayerEntity(this.pendingDuelTarget) : null;
         if (preferred && this.bot.entity.position.distanceTo(preferred.position) <= engageRange) {
           this._engageTarget(preferred, 'duel start cue');
           return;
         }
-        const nearby = this._listNearbyPlayers();
         if (nearby.length > 0 && nearby[0].dist <= engageRange) {
           this._engageTarget(nearby[0].entity, 'duel start cue');
         }
@@ -672,7 +735,7 @@ class PvPBotController {
   executeBotCommand(command, args = [], caller = 'console', reply = (msg) => this.log(msg)) {
     if (command === 'help') {
       reply(
-        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
+        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !roam | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
       );
       return;
     }
@@ -745,6 +808,18 @@ class PvPBotController {
     if (command === 'auto') {
       this.autoFight = !this.autoFight;
       reply(`Auto-engage mode: ${this.autoFight ? 'ON (will automatically attack nearest player in range)' : 'OFF'}.`);
+      return;
+    }
+
+    if (command === 'roam') {
+      this.roamInSpawn = !this.roamInSpawn;
+      if (!this.roamInSpawn && this.state === STATES.IDLE) {
+        this._stopSpawnRoam();
+      } else if (this.roamInSpawn && this.bot && this.bot.entity && this.bot.entity.position) {
+        this.spawnAnchorPos = this.bot.entity.position.clone();
+        this._resetSpawnRoam();
+      }
+      reply(`Spawn roaming: ${this.roamInSpawn ? 'ON' : 'OFF'}.`);
       return;
     }
 
@@ -944,14 +1019,19 @@ class PvPBotController {
     if (this.config.bot.autoRetaliate === false) return false;
     if (!this.bot || !this.bot.entity || this.state !== STATES.IDLE) return false;
 
-    if (this.pendingDuelTarget) {
+    const nearby = this._listNearbyPlayers();
+    const recentlyEnded = (Date.now() - this.duelEndedAt) < 8000;
+    if (!this.inDuelArena && !this._isWearingCombatArmor() && (nearby.length >= 3 || recentlyEnded)) {
+      return false;
+    }
+
+    if (this.pendingDuelTarget && this.pendingDuelReady) {
       const pending = this._findPlayerEntity(this.pendingDuelTarget);
       if (pending && this.bot.entity.position.distanceTo(pending.position) <= (this.config.combat.engageRange || 24.0)) {
         return this._engageTarget(pending, `auto-retaliate (${reason})`);
       }
     }
 
-    const nearby = this._listNearbyPlayers();
     if (nearby.length > 0 && nearby[0].dist <= 14.0) {
       return this._engageTarget(nearby[0].entity, `auto-retaliate (${reason})`);
     }
@@ -1081,6 +1161,16 @@ class PvPBotController {
 
     if (nextState === STATES.LOOTING) {
       this.lootStartedAt = Date.now();
+    }
+
+    if (nextState === STATES.IDLE) {
+      if (!this.spawnAnchorPos && this.bot && this.bot.entity && this.bot.entity.position) {
+        this.spawnAnchorPos = this.bot.entity.position.clone();
+      }
+      this._resetSpawnRoam();
+    } else {
+      this.roamPhase = 'PAUSED';
+      this.roamTargetPos = null;
     }
   }
 
@@ -1221,11 +1311,12 @@ class PvPBotController {
   }
 
   _tickIdle() {
-    // Stay calm and zero-packet in IDLE lobbies.
-    // Read-only memory checks for armed duel target, arena auto-start, or !auto mode:
+    // Stay calm and zero-spam in IDLE lobbies while optionally roaming gently around spawn.
     const engageRange = this.config.combat.engageRange || 36.0;
+    const nearby = this._listNearbyPlayers();
+    const canEngagePending = this.inDuelArena || this._isWearingCombatArmor() || nearby.length <= 3;
 
-    if (this.pendingDuelTarget && this.pendingDuelReady) {
+    if (this.pendingDuelTarget && this.pendingDuelReady && canEngagePending) {
       const pending = this._findPlayerEntity(this.pendingDuelTarget);
       if (pending && this.bot.entity.position.distanceTo(pending.position) <= engageRange) {
         this._engageTarget(pending, `duel start (${this.pendingDuelTarget})`);
@@ -1235,13 +1326,244 @@ class PvPBotController {
 
     const now = Date.now();
     if (this.autoFight || now < this.autoStartDuelUntil) {
-      const nearby = this._listNearbyPlayers();
       // For arena autoStartDuel (not explicit !auto), only auto-engage when 1–2 opponents exist (prevents attacking crowded hubs!)
       const looksLikeArena = this.autoFight || (nearby.length >= 1 && nearby.length <= 2);
       if (looksLikeArena && nearby.length > 0 && nearby[0].dist <= engageRange) {
         this._engageTarget(nearby[0].entity, this.autoFight ? '!auto nearest target' : 'arena auto-start');
         return;
       }
+    }
+
+    this._tickSpawnRoam();
+  }
+
+  _randRange(minVal, maxVal) {
+    return minVal + Math.random() * Math.max(0, maxVal - minVal);
+  }
+
+  _stopSpawnRoam() {
+    if (this.bot && typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('forward', false);
+      this.bot.setControlState('back', false);
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('jump', false);
+    }
+    this.roamTargetPos = null;
+  }
+
+  _resetSpawnRoam() {
+    const botCfg = this.config.bot || {};
+    const pauseMin = botCfg.roamPauseMinMs !== undefined ? botCfg.roamPauseMinMs : 2200;
+    const pauseMax = botCfg.roamPauseMaxMs !== undefined ? botCfg.roamPauseMaxMs : 4800;
+    const now = Date.now();
+    this._stopSpawnRoam();
+    this.roamPhase = 'PAUSED';
+    this.roamPhaseUntil = now + this._randRange(Math.min(1200, pauseMin), pauseMax);
+    this.roamNextGlanceAt = now + this._randRange(1800, 3200);
+    if (this.bot && this.bot.entity) {
+      this.roamGlanceYaw = this.bot.entity.yaw || 0;
+      this.roamGlancePitch = 0;
+    }
+  }
+
+  _isRoamStepSafe(yaw) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) {
+      return { safe: false, shouldStepUp: false };
+    }
+    if (typeof this.bot.blockAt !== 'function') {
+      return { safe: true, shouldStepUp: false };
+    }
+
+    const pos = this.bot.entity.position;
+    const stepX = pos.x - Math.sin(yaw) * 1.1;
+    const stepZ = pos.z - Math.cos(yaw) * 1.1;
+    const baseY = Math.floor(pos.y);
+
+    const hazardNames = new Set([
+      'water', 'flowing_water', 'lava', 'flowing_lava',
+      'fire', 'soul_fire', 'campfire', 'soul_campfire',
+      'cobweb', 'cactus', 'magma_block', 'sweet_berry_bush', 'wither_rose'
+    ]);
+
+    const feetBlock = this.bot.blockAt(new Vec3(pos.x, baseY, pos.z));
+    if (feetBlock && hazardNames.has(feetBlock.name)) {
+      return { safe: false, shouldStepUp: false };
+    }
+
+    const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
+    const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
+    const aheadAbove = this.bot.blockAt(new Vec3(stepX, baseY + 2, stepZ));
+    const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
+    const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
+
+    if (
+      (aheadFeet && hazardNames.has(aheadFeet.name)) ||
+      (aheadHead && hazardNames.has(aheadHead.name)) ||
+      (aheadFloor0 && hazardNames.has(aheadFloor0.name))
+    ) {
+      return { safe: false, shouldStepUp: false };
+    }
+
+    const solidFeet = Boolean(aheadFeet && aheadFeet.boundingBox === 'block');
+    const solidHead = Boolean(aheadHead && aheadHead.boundingBox === 'block');
+    const solidAbove = Boolean(aheadAbove && aheadAbove.boundingBox === 'block');
+
+    // Reject 2-block walls or tight overhangs
+    if (solidHead || (solidFeet && solidAbove)) {
+      return { safe: false, shouldStepUp: false };
+    }
+
+    // Require solid footing within 2 blocks down to avoid void drops / spawn ledges
+    const hasSupport =
+      solidFeet ||
+      Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
+      Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
+    if (!hasSupport) {
+      return { safe: false, shouldStepUp: false };
+    }
+
+    return {
+      safe: true,
+      shouldStepUp: solidFeet && !solidHead && !solidAbove && Boolean(this.bot.entity.onGround)
+    };
+  }
+
+  _pickRoamTarget() {
+    const pos = this.bot.entity.position;
+    const anchor = this.spawnAnchorPos || pos;
+    const botCfg = this.config.bot || {};
+    const radius = botCfg.roamRadius !== undefined ? botCfg.roamRadius : 10;
+
+    const dxFromAnchor = pos.x - anchor.x;
+    const dzFromAnchor = pos.z - anchor.z;
+    const distFromAnchor = Math.sqrt(dxFromAnchor * dxFromAnchor + dzFromAnchor * dzFromAnchor);
+
+    // If drifted far from spawn anchor, steer gently back toward anchor center
+    if (distFromAnchor > radius * 0.8) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const backYaw = Math.atan2(-(anchor.x - pos.x), -(anchor.z - pos.z)) + (attempt * 0.45 * (attempt % 2 === 0 ? 1 : -1));
+        if (this._isRoamStepSafe(backYaw).safe) {
+          const dist = Math.min(radius * 0.7, Math.max(2.5, distFromAnchor));
+          return new Vec3(
+            pos.x - Math.sin(backYaw) * dist,
+            pos.y,
+            pos.z - Math.cos(backYaw) * dist
+          );
+        }
+      }
+    }
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const r = this._randRange(2.5, Math.max(3.5, radius));
+      const candidate = new Vec3(
+        anchor.x + Math.cos(angle) * r,
+        pos.y,
+        anchor.z + Math.sin(angle) * r
+      );
+      const yaw = Math.atan2(-(candidate.x - pos.x), -(candidate.z - pos.z));
+      if (this._isRoamStepSafe(yaw).safe) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  _tickSpawnRoam() {
+    if (!this.roamInSpawn || this.state !== STATES.IDLE || this.inDuelArena) return;
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return;
+
+    const botCfg = this.config.bot || {};
+    const walkMin = botCfg.roamWalkMinMs !== undefined ? botCfg.roamWalkMinMs : 1400;
+    const walkMax = botCfg.roamWalkMaxMs !== undefined ? botCfg.roamWalkMaxMs : 3200;
+    const pauseMin = botCfg.roamPauseMinMs !== undefined ? botCfg.roamPauseMinMs : 2200;
+    const pauseMax = botCfg.roamPauseMaxMs !== undefined ? botCfg.roamPauseMaxMs : 4800;
+
+    const now = Date.now();
+    const pos = this.bot.entity.position;
+    if (!this.spawnAnchorPos) {
+      this.spawnAnchorPos = pos.clone();
+    }
+
+    if (this.roamPhase === 'PAUSED') {
+      // Gentle occasional head glance (throttled <= 10 Hz) while standing relaxed
+      if (now >= this.roamNextGlanceAt) {
+        this.roamNextGlanceAt = now + this._randRange(1800, 3200);
+        const curYaw = this.bot.entity.yaw || 0;
+        this.roamGlanceYaw = normalizeAngle(curYaw + this._randRange(-0.6, 0.6));
+        this.roamGlancePitch = this._randRange(-0.14, 0.14);
+      }
+
+      if (this.aimer && (now - this.roamLastLookAt) >= 100) {
+        const yawDiff = Math.abs(normalizeAngle(this.roamGlanceYaw - (this.bot.entity.yaw || 0)));
+        const pitchDiff = Math.abs(this.roamGlancePitch - (this.bot.entity.pitch || 0));
+        if (yawDiff > 0.04 || pitchDiff > 0.04) {
+          this.roamLastLookAt = now;
+          this.aimer.stepTowardsAngles(this.roamGlanceYaw, this.roamGlancePitch, { speedMultiplier: 0.35 });
+        }
+      }
+
+      if (now >= this.roamPhaseUntil) {
+        const nextDest = this._pickRoamTarget();
+        if (nextDest) {
+          this.roamTargetPos = nextDest;
+          this.roamPhase = 'WALKING';
+          this.roamPhaseUntil = now + this._randRange(walkMin, walkMax);
+        } else {
+          this.roamPhaseUntil = now + this._randRange(600, 1400);
+        }
+      }
+      return;
+    }
+
+    // WALKING phase
+    const dest = this.roamTargetPos;
+    if (!dest || now >= this.roamPhaseUntil) {
+      this._stopSpawnRoam();
+      this.roamPhase = 'PAUSED';
+      this.roamPhaseUntil = now + this._randRange(pauseMin, pauseMax);
+      return;
+    }
+
+    const dx = dest.x - pos.x;
+    const dz = dest.z - pos.z;
+    const horizDist = Math.sqrt(dx * dx + dz * dz);
+    if (horizDist < 1.1) {
+      this._stopSpawnRoam();
+      this.roamPhase = 'PAUSED';
+      this.roamPhaseUntil = now + this._randRange(pauseMin, pauseMax);
+      return;
+    }
+
+    const yawToDest = Math.atan2(-dx, -dz);
+    const stepCheck = this._isRoamStepSafe(yawToDest);
+    if (!stepCheck.safe) {
+      this._stopSpawnRoam();
+      this.roamPhase = 'PAUSED';
+      this.roamPhaseUntil = now + this._randRange(500, 1200);
+      return;
+    }
+
+    let yawErrorDeg = Math.abs(normalizeAngle(yawToDest - (this.bot.entity.yaw || 0))) * (180 / Math.PI);
+    if (this.aimer && (now - this.roamLastLookAt) >= 100) {
+      this.roamLastLookAt = now;
+      const aimStatus = this.aimer.stepTowardsAngles(yawToDest, 0, {
+        speedMultiplier: 0.5,
+        toleranceRad: 0.25
+      });
+      yawErrorDeg = aimStatus.yawErrorDeg;
+    }
+
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('forward', yawErrorDeg < 45);
+      this.bot.setControlState('back', false);
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('jump', stepCheck.shouldStepUp);
     }
   }
 
