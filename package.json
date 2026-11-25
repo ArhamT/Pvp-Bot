@@ -1,0 +1,22 @@
+{
+  "name": "pvpbot",
+  "version": "1.0.0",
+  "description": "Modular Mineflayer PvP bot with 20-TPS state machine and smooth anticheat-safe movement",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node -e \"require('./modules/aim'); require('./modules/prediction'); require('./modules/combat'); require('./modules/survival'); require('./modules/ranged'); require('./modules/burst'); require('./modules/aerial'); console.log('All modules loaded cleanly.');\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-auto-eat": "^5.0.3",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-pvp": "^1.3.2",
+    "vec3": "^0.2.0"
+  }
+}
