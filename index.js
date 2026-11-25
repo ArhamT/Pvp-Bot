@@ -24,6 +24,16 @@ const STATES = Object.freeze({
   LOOTING: 'LOOTING'
 });
 
+const DUEL_REQUEST_REGEX = /(?:^|[\s•|:\]>»-])([A-Za-z0-9_]{3,16})\s+(?:has\s+sent(?:\s+you)?\s+a\s+duel\s+request|sent(?:\s+you)?\s+a\s+duel\s+request|challenged\s+you\s+to\s+a\s+duel)/i;
+
+/**
+ * Strips legacy Minecraft color/formatting codes (§x / &x) and trims whitespace.
+ */
+function stripColorCodes(text) {
+  if (!text) return '';
+  return String(text).replace(/§.|&[0-9a-fk-orx]/gi, '').trim();
+}
+
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const baseConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 
@@ -110,6 +120,10 @@ class PvPBotController {
     this.loginAttempted = false;
     this.loginSentAt = 0;
     this.loginFallbackTimer = null;
+    this.duelsRejoinTimer = null;
+    this.lastDuelsRejoinSentAt = 0;
+    this.duelAcceptTimer = null;
+    this._recentDuelAccepts = new Map();
     this._physicsTickHandler = null;
     this._packetTimestamps = [];
 
@@ -277,10 +291,12 @@ class PvPBotController {
     });
 
     bot.on('messagestr', (message) => {
-      const text = (message || '').trim();
+      const text = stripColorCodes(message);
       if (!text) return;
       this.log(`[CHAT] ${text}`);
       this._handleServerAuthPrompt(text);
+      this._handleDuelsRejoinTrigger(text);
+      this._handleDuelRequestTrigger(text);
       this._handleDuelChatTriggers(text);
     });
 
@@ -313,6 +329,9 @@ class PvPBotController {
     bot.on('end', (reason) => {
       this.log(`Disconnected (${reason || 'unknown'}).`);
       this._stopTickLoop();
+      this._clearLoginFallbackTimer();
+      this._clearDuelsRejoinTimer('disconnected');
+      this._clearDuelAcceptTimer();
       if (this.combat) this.combat.dispose();
       if (this.survival) this.survival.dispose();
       if (this.ranged) this.ranged.dispose();
@@ -328,6 +347,23 @@ class PvPBotController {
     if (this.loginFallbackTimer) {
       clearTimeout(this.loginFallbackTimer);
       this.loginFallbackTimer = null;
+    }
+  }
+
+  _clearDuelsRejoinTimer(reason = '') {
+    if (this.duelsRejoinTimer) {
+      clearTimeout(this.duelsRejoinTimer);
+      this.duelsRejoinTimer = null;
+      if (reason) {
+        this.log(`[DUELS] Cancelled pending /server rejoin (${reason}).`);
+      }
+    }
+  }
+
+  _clearDuelAcceptTimer() {
+    if (this.duelAcceptTimer) {
+      clearTimeout(this.duelAcceptTimer);
+      this.duelAcceptTimer = null;
     }
   }
 
@@ -401,10 +437,161 @@ class PvPBotController {
   }
 
   /**
+   * Detects proxy/network kicks from the duels backend server (e.g. LEGOCRAFT packet-rate kicks)
+   * and schedules a single debounced /server <duelsServerName> rejoin after proxy settlement delay.
+   */
+  _handleDuelsRejoinTrigger(rawText) {
+    const text = stripColorCodes(rawText);
+    if (!text) return false;
+
+    const botCfg = this.config.bot || {};
+    if (botCfg.autoRejoinDuels === false) return false;
+
+    const duelsServer = (botCfg.duelsServerName || 'duels').trim() || 'duels';
+    const duelsLower = duelsServer.toLowerCase();
+    const lower = text.toLowerCase();
+
+    // Cancel pending rejoin if chat confirms we entered or are already on the duels server
+    if (
+      !lower.includes('disconnected') &&
+      !lower.includes('unable to') &&
+      !lower.includes('kicked') &&
+      (
+        lower.includes(`already connected to ${duelsLower}`) ||
+        lower.includes('already connected to this server') ||
+        lower.includes(`connected to ${duelsLower}`) ||
+        lower.includes(`welcome to ${duelsLower}`)
+      )
+    ) {
+      this._clearDuelsRejoinTimer(`already on ${duelsServer}`);
+      return false;
+    }
+
+    const escapedServer = duelsLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mentionsDuels = new RegExp(`\\b${escapedServer}\\b`, 'i').test(text);
+    const hasReason = /\breason\s*:|kicked\s+(?:from|for|by)|too many packets|disconnected\s+from|connection\s+lost|timed\s+out/i.test(text);
+
+    const isDirectDuelsKick =
+      lower.includes(`disconnected from ${duelsLower}`) ||
+      lower.includes(`kicked from ${duelsLower}`) ||
+      lower.includes(`unable to connect to ${duelsLower}`);
+
+    const isGenericKickOrLobby =
+      lower.includes('you were kicked from') ||
+      ((lower.includes('sent to lobby') || lower.includes('moved to lobby') || lower.includes('connected to hub')) &&
+        (mentionsDuels || hasReason));
+
+    if (!isDirectDuelsKick && !isGenericKickOrLobby) return false;
+
+    // Reset combat cleanly before waiting for proxy settlement
+    this.activeTargetName = null;
+    this.activeTargetEntityId = null;
+    this.targetLastSeenPos = null;
+    this.targetLostAt = 0;
+    this.pendingDuelTarget = null;
+    this.pendingDuelReady = false;
+    this.autoStartDuelUntil = 0;
+    this._clearDuelAcceptTimer();
+    this.transitionState(STATES.IDLE, 'kicked from duels');
+
+    const configuredDelay = Number(botCfg.duelsRejoinDelayMs);
+    const delayMs = Number.isFinite(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : 15000;
+
+    // Rate-limit / backoff guard: never fire more than once every duelsRejoinDelayMs
+    const now = Date.now();
+    const sinceLast = this.lastDuelsRejoinSentAt > 0 ? (now - this.lastDuelsRejoinSentAt) : Infinity;
+    const waitMs = sinceLast < delayMs ? Math.max(delayMs, delayMs - sinceLast) : delayMs;
+
+    // Single debounced timer
+    if (this.duelsRejoinTimer) {
+      clearTimeout(this.duelsRejoinTimer);
+      this.duelsRejoinTimer = null;
+    }
+
+    this.log(`[DUELS] Detected kick/disconnect from ${duelsServer} — scheduling /server ${duelsServer} in ${(waitMs / 1000).toFixed(1)}s.`);
+    this.duelsRejoinTimer = setTimeout(() => {
+      this.duelsRejoinTimer = null;
+      if (this.shuttingDown || !this.bot) return;
+      if (this.state !== STATES.IDLE) return;
+
+      const elapsed = this.lastDuelsRejoinSentAt > 0 ? (Date.now() - this.lastDuelsRejoinSentAt) : Infinity;
+      const minInterval = Math.max(0, delayMs - 20);
+      if (elapsed < minInterval) return;
+
+      this.lastDuelsRejoinSentAt = Date.now();
+      const cmd = `/server ${duelsServer}`;
+      this.bot.chat(cmd);
+      this.log(`[DUELS] Rejoining ${cmd}...`);
+    }, waitMs);
+
+    return true;
+  }
+
+  /**
+   * Detects incoming duel request chat messages and automatically sends /duel accept <sender>
+   * after a short human-like delay while arming pendingDuelTarget for arena auto-engage.
+   */
+  _handleDuelRequestTrigger(rawText) {
+    const text = stripColorCodes(rawText);
+    if (!text) return false;
+
+    const botCfg = this.config.bot || {};
+    if (botCfg.autoAcceptDuels === false) return false;
+    if (this.state !== STATES.IDLE) return false;
+
+    const match = text.match(DUEL_REQUEST_REGEX);
+    if (!match || !match[1]) return false;
+
+    const sender = match[1].trim();
+    const senderLower = sender.toLowerCase();
+    const selfName = ((this.bot && this.bot.username) || botCfg.username || '').toLowerCase();
+
+    if (!sender || senderLower === 'you' || (selfName && senderLower === selfName)) {
+      return false;
+    }
+
+    const now = Date.now();
+    const lastAcceptedAt = this._recentDuelAccepts.get(senderLower) || 0;
+    if (now - lastAcceptedAt < 5000) {
+      return false;
+    }
+
+    if (this._recentDuelAccepts.size > 32) {
+      for (const [key, ts] of this._recentDuelAccepts.entries()) {
+        if (now - ts >= 5000) this._recentDuelAccepts.delete(key);
+      }
+    }
+    this._recentDuelAccepts.set(senderLower, now);
+
+    const configuredDelay = Number(botCfg.duelAcceptDelayMs);
+    const delayMs = Number.isFinite(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : 750;
+
+    this._clearDuelAcceptTimer();
+    this.duelAcceptTimer = setTimeout(() => {
+      this.duelAcceptTimer = null;
+      if (this.shuttingDown || !this.bot) return;
+      if (this.state !== STATES.IDLE) return;
+
+      const cmd = `/duel accept ${senderLower}`;
+      this.bot.chat(cmd);
+      this.pendingDuelTarget = sender;
+      this.pendingDuelReady = true;
+      this.log(`[DUELS] Accepted duel request from ${sender} -> ${cmd}`);
+    }, delayMs);
+
+    return true;
+  }
+
+  /**
    * Detects server duel start / match end chat announcements so the bot engages
    * immediately when a duel starts (without waiting to be hit first) and stops cleanly on win/loss.
    */
-  _handleDuelChatTriggers(text) {
+  _handleDuelChatTriggers(rawText) {
+    const text = stripColorCodes(rawText);
     if (!text || this.config.bot.autoStartDuel === false) return;
     const lower = text.toLowerCase();
 
@@ -439,6 +626,7 @@ class PvPBotController {
       /\bfight!\b/.test(lower) ||
       /\bgo!\b/.test(lower)
     ) {
+      this._clearDuelsRejoinTimer('duel started');
       this.autoStartDuelUntil = Date.now() + 12000;
       if (this.pendingDuelTarget) this.pendingDuelReady = true;
 
@@ -674,10 +862,13 @@ class PvPBotController {
       return;
     }
 
-    if (line.toLowerCase().startsWith('/server ') && this.loginSentAt > 0) {
-      const sinceLoginMs = Date.now() - this.loginSentAt;
-      if (sinceLoginMs < 15000) {
-        this.log(`Tip: Only ${(sinceLoginMs / 1000).toFixed(1)}s since login — some proxies prefer waiting ~15s before /server transfers.`);
+    if (/^\/server(?:\s|$)/i.test(line)) {
+      this._clearDuelsRejoinTimer('manual /server command');
+      if (line.toLowerCase().startsWith('/server ') && this.loginSentAt > 0) {
+        const sinceLoginMs = Date.now() - this.loginSentAt;
+        if (sinceLoginMs < 15000) {
+          this.log(`Tip: Only ${(sinceLoginMs / 1000).toFixed(1)}s since login — some proxies prefer waiting ~15s before /server transfers.`);
+        }
       }
     }
 
@@ -931,6 +1122,8 @@ class PvPBotController {
   _clearTimers() {
     this._stopTickLoop();
     this._clearLoginFallbackTimer();
+    this._clearDuelsRejoinTimer();
+    this._clearDuelAcceptTimer();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1316,4 +1509,4 @@ if (require.main === module) {
   controller.start();
 }
 
-module.exports = { PvPBotController, STATES, loadRuntimeConfig };
+module.exports = { PvPBotController, STATES, loadRuntimeConfig, stripColorCodes };

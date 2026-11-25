@@ -193,7 +193,7 @@ const ONE_BASED_EFFECT_TO_KIND = {
 
 /**
  * Highest-priority survival module handling:
- * 1. Event-driven + per-tick Totem of Undying management (slot 45, <100ms, preempts all inventory actions).
+ * 1. Event-driven + per-tick Totem of Undying management (slot 45, human-like reaction delay + anti-InventoryMove pause).
  * 2. Smart Retreating (<= 11 HP): smooth 180° turn, sprint-jump escape, line-of-sight block placement behind,
  *    Golden Apple / Enchanted Golden Apple eating, and downward (-90° pitch) Splash Instant Health II throws while moving forward.
  * 3. Smart Shielding: raises offhand shield against bow draws within 12 blocks or sword/axe rushes during weapon cooldown.
@@ -202,13 +202,20 @@ const ONE_BASED_EFFECT_TO_KIND = {
 class SurvivalModule {
   constructor(bot, config, aimer) {
     this.bot = bot;
-    this.config = config;
-    this.survCfg = config.survival;
+    this.config = config || {};
+    this.survCfg = (config && config.survival) ? config.survival : {};
     this.aimer = aimer;
 
     // Priority locks & packet-rate / locked-lobby backoff state
     this.activeInCombat = true;
+    this._disposed = false;
     this.totemEquipInFlight = false;
+    this.totemSwapPending = false;
+    this._totemMovementPaused = false;
+    this.totemDelayTimer = null;
+    this._totemDelayResolve = null;
+    this._totemPauseTimer = null;
+    this._totemPauseResolve = null;
     this.totemEquipPromise = null;
     this.lastTotemAttemptAt = 0;
     this.totemRetryBackoffMs = 0;
@@ -247,7 +254,7 @@ class SurvivalModule {
     this.lastLosBlockTime = 0;
     this.pendingLosBlock = null;
 
-    // Bind immediate event listeners for <100ms Totem of Undying re-equip & accurate buff tracking
+    // Bind event listeners for human-paced Totem of Undying re-equip & accurate buff tracking
     this._onUpdateSlot = this._handleUpdateSlot.bind(this);
     this._onHealth = this._handleHealth.bind(this);
     this._onEntityEffect = this._handleEntityEffect.bind(this);
@@ -267,9 +274,15 @@ class SurvivalModule {
   }
 
   /**
-   * Unbinds inventory, health, and effect listeners cleanly on disconnect.
+   * Unbinds inventory, health, and effect listeners and cancels pending timers cleanly on disconnect.
    */
   dispose() {
+    this._disposed = true;
+    this.activeInCombat = false;
+    this._cancelPendingTotemTimers();
+    this.totemEquipInFlight = false;
+    this.totemEquipPromise = null;
+
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
       this.bot.inventory.removeListener('updateSlot', this._onUpdateSlot);
     }
@@ -293,6 +306,8 @@ class SurvivalModule {
     if (active) {
       this.totemRetryBackoffMs = 0;
       this.offhandRetryBackoffMs = 0;
+    } else {
+      this._cancelPendingTotemTimers();
     }
   }
 
@@ -300,11 +315,70 @@ class SurvivalModule {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  _sleepTotemPause(ms) {
+    return new Promise((resolve) => {
+      if (ms <= 0) {
+        resolve();
+        return;
+      }
+      this._totemPauseResolve = resolve;
+      this._totemPauseTimer = setTimeout(() => {
+        this._totemPauseTimer = null;
+        const done = this._totemPauseResolve;
+        this._totemPauseResolve = null;
+        if (done) done();
+      }, ms);
+    });
+  }
+
+  _cancelPendingTotemTimers() {
+    if (this.totemDelayTimer) {
+      clearTimeout(this.totemDelayTimer);
+      this.totemDelayTimer = null;
+    }
+    if (this._totemDelayResolve) {
+      const resolve = this._totemDelayResolve;
+      this._totemDelayResolve = null;
+      resolve();
+    }
+    if (this._totemPauseTimer) {
+      clearTimeout(this._totemPauseTimer);
+      this._totemPauseTimer = null;
+    }
+    if (this._totemPauseResolve) {
+      const resolve = this._totemPauseResolve;
+      this._totemPauseResolve = null;
+      resolve();
+    }
+    this.totemSwapPending = false;
+    this._totemMovementPaused = false;
+    if (!this.totemEquipInFlight) {
+      this.totemEquipPromise = null;
+    }
+  }
+
+  _pauseMovementForTotemSwap() {
+    if (!this.bot || typeof this.bot.setControlState !== 'function') return;
+    this.bot.setControlState('sprint', false);
+    this.bot.setControlState('forward', false);
+    this.bot.setControlState('back', false);
+    this.bot.setControlState('left', false);
+    this.bot.setControlState('right', false);
+    this.bot.setControlState('jump', false);
+  }
+
+  _isHotbarSlot(slot) {
+    if (typeof slot !== 'number') return false;
+    const hotbarStart = (this.bot && this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+    return slot >= hotbarStart && slot < hotbarStart + 9;
+  }
+
   /**
-   * Immediate inventory slot listener: if offhand slot 45 loses its Totem during combat, re-equip in <100ms.
+   * Inventory slot listener: if offhand slot 45 loses its Totem during combat,
+   * schedule a human-paced replacement swap (never 0ms instant click).
    */
   _handleUpdateSlot(slot, _oldItem, newItem) {
-    if (!this.activeInCombat) return;
+    if (!this.activeInCombat || this._disposed) return;
     const offhandSlot = this._getOffhandSlotIndex();
     if (slot === offhandSlot && (!newItem || newItem.name !== 'totem_of_undying')) {
       this.ensureTotemPriority();
@@ -312,10 +386,10 @@ class SurvivalModule {
   }
 
   /**
-   * Health change hook: immediately double-check offhand Totem on damage/pop during combat.
+   * Health change hook: schedule a human-paced offhand Totem check on damage/pop during combat.
    */
   _handleHealth() {
-    if (!this.activeInCombat) return;
+    if (!this.activeInCombat || this._disposed) return;
     this.ensureTotemPriority();
   }
 
@@ -335,12 +409,17 @@ class SurvivalModule {
   }
 
   /**
-   * Finds a Totem of Undying anywhere in inventory outside the offhand slot.
+   * Finds a Totem of Undying anywhere in inventory outside the offhand slot (preferring hotbar).
    */
   findTotemInInventory() {
     if (!this.bot || !this.bot.inventory) return null;
     const offhandSlot = this._getOffhandSlotIndex();
-    return this.bot.inventory.items().find(
+    const items = this.bot.inventory.items();
+    const hotbarTotem = items.find(
+      (item) => item && item.name === 'totem_of_undying' && item.slot !== offhandSlot && this._isHotbarSlot(item.slot)
+    );
+    if (hotbarTotem) return hotbarTotem;
+    return items.find(
       (item) => item && item.name === 'totem_of_undying' && item.slot !== offhandSlot
     ) || null;
   }
@@ -356,64 +435,180 @@ class SurvivalModule {
   }
 
   /**
-   * HIGHEST PRIORITY: Immediately equips a Totem of Undying to offhand (slot 45).
-   * Preempts all other inventory operations (sorting, armor, weapon equips) and executes in <100ms.
-   * Returns true if a totem swap was triggered or is currently in flight.
+   * Executes the actual offhand Totem swap after the human-like reaction delay expires.
+   * For main-inventory totems (slots 9–35), pauses movement controls briefly (`totemPauseMovementMs`)
+   * before sending the `window_click` packet to prevent InventoryMove / AutoTotemA flags.
    */
-  ensureTotemPriority() {
-    if (!this.activeInCombat || !this.survCfg.totemAutoEquip || !this.bot || !this.bot.inventory) return false;
+  async _executeTotemSwap() {
+    if (this._disposed || !this.activeInCombat || !this.survCfg.totemAutoEquip || !this.bot || !this.bot.inventory) {
+      return;
+    }
+    if (this.totemEquipInFlight) return;
 
     const offhand = this.getOffhandItem();
     if (offhand && offhand.name === 'totem_of_undying') {
       this.totemRetryBackoffMs = 0;
+      return;
+    }
+
+    const initialTotem = this.findTotemInInventory();
+    if (!initialTotem) return;
+
+    this.totemSwapPending = true;
+    this.totemEquipInFlight = true;
+    this.lastTotemAttemptAt = Date.now();
+
+    try {
+      const isMainInventory = !this._isHotbarSlot(initialTotem.slot);
+      if (isMainInventory) {
+        const pauseMs = (typeof this.survCfg.totemPauseMovementMs === 'number' && this.survCfg.totemPauseMovementMs >= 0)
+          ? this.survCfg.totemPauseMovementMs
+          : 70;
+        this._totemMovementPaused = true;
+        this._pauseMovementForTotemSwap();
+        if (pauseMs > 0) {
+          await this._sleepTotemPause(pauseMs);
+        }
+        if (this._disposed || !this.activeInCombat || !this.bot || !this.bot.inventory) {
+          return;
+        }
+      }
+
+      const offhandNow = this.getOffhandItem();
+      if (offhandNow && offhandNow.name === 'totem_of_undying') {
+        this.totemRetryBackoffMs = 0;
+        return;
+      }
+
+      const freshTotem = this.findTotemInInventory();
+      if (!freshTotem) return;
+
+      // If the fresh totem is now in main inventory (e.g. hotbar changed during delay) and we haven't paused yet
+      if (!this._isHotbarSlot(freshTotem.slot) && !this._totemMovementPaused) {
+        const pauseMs = (typeof this.survCfg.totemPauseMovementMs === 'number' && this.survCfg.totemPauseMovementMs >= 0)
+          ? this.survCfg.totemPauseMovementMs
+          : 70;
+        this._totemMovementPaused = true;
+        this._pauseMovementForTotemSwap();
+        if (pauseMs > 0) {
+          await this._sleepTotemPause(pauseMs);
+        }
+        if (this._disposed || !this.activeInCombat || !this.bot || !this.bot.inventory) {
+          return;
+        }
+      }
+
+      if (this._totemMovementPaused) {
+        this._pauseMovementForTotemSwap();
+      }
+
+      const targetTotem = this.findTotemInInventory();
+      if (!targetTotem) return;
+
+      await Promise.resolve(this.bot.equip(targetTotem, 'off-hand'));
+
+      const after = this.getOffhandItem();
+      if (after && after.name === 'totem_of_undying') {
+        this.totemRetryBackoffMs = 0;
+      } else {
+        // Server reverted or rejected the click (e.g. locked inventory) -> back off to prevent packet kicks
+        this.lastTotemAttemptAt = Date.now();
+        this.totemRetryBackoffMs = Math.min(2500, Math.max(300, (this.totemRetryBackoffMs || 150) * 2));
+      }
+    } catch (_) {
+      this.lastTotemAttemptAt = Date.now();
+      this.totemRetryBackoffMs = Math.min(2500, Math.max(300, (this.totemRetryBackoffMs || 150) * 2));
+    } finally {
+      this.totemEquipInFlight = false;
+      this.totemSwapPending = false;
+      this._totemMovementPaused = false;
+    }
+  }
+
+  /**
+   * HIGHEST PRIORITY: Schedules a human-paced Totem of Undying re-equip to offhand (slot 45).
+   * Non-blocking and strictly deduplicated (never queues duplicate timers or 0ms instant clicks).
+   * Returns true ONLY while actively executing the brief movement-pause + equip window (`totemSwapPending` / `totemEquipInFlight`).
+   */
+  ensureTotemPriority() {
+    if (this._disposed || !this.activeInCombat || !this.survCfg.totemAutoEquip || !this.bot || !this.bot.inventory) {
       return false;
     }
 
-    const totem = this.findTotemInInventory();
-    if (!totem) return false;
+    const offhand = this.getOffhandItem();
+    if (offhand && offhand.name === 'totem_of_undying') {
+      this.totemRetryBackoffMs = 0;
+      this._cancelPendingTotemTimers();
+      return false;
+    }
 
-    if (this.totemEquipInFlight) return true;
+    if (this.totemSwapPending || this.totemEquipInFlight) {
+      if (this._totemMovementPaused) {
+        this._pauseMovementForTotemSwap();
+      }
+      return true;
+    }
+
+    const totem = this.findTotemInInventory();
+    if (!totem) {
+      this._cancelPendingTotemTimers();
+      return false;
+    }
+
+    // Already waiting on the human reaction delay timer — skip duplicate scheduling
+    if (this.totemDelayTimer) {
+      return false;
+    }
 
     const now = Date.now();
     if (this.totemRetryBackoffMs > 0 && (now - this.lastTotemAttemptAt) < this.totemRetryBackoffMs) {
       return false;
     }
 
-    this.totemEquipInFlight = true;
-    this.lastTotemAttemptAt = now;
-    // Direct immediate dispatch — bypasses equipBusy / sorting locks for <100ms reaction
-    this.totemEquipPromise = Promise.resolve(this.bot.equip(totem, 'off-hand'))
-      .then(() => {
-        const after = this.getOffhandItem();
-        if (after && after.name === 'totem_of_undying') {
-          this.totemRetryBackoffMs = 0;
-        } else {
-          // Server reverted or rejected the click (e.g. locked inventory) -> back off to prevent packet kicks
-          this.totemRetryBackoffMs = Math.min(2500, Math.max(300, (this.totemRetryBackoffMs || 150) * 2));
-        }
-      })
-      .catch(() => {
-        this.totemRetryBackoffMs = Math.min(2500, Math.max(300, (this.totemRetryBackoffMs || 150) * 2));
-      })
-      .finally(() => {
-        this.totemEquipInFlight = false;
-        this.totemEquipPromise = null;
-      });
+    const minDelayMs = (typeof this.survCfg.totemEquipDelayMinMs === 'number' && this.survCfg.totemEquipDelayMinMs >= 0)
+      ? this.survCfg.totemEquipDelayMinMs
+      : 140;
+    const maxDelayRaw = (typeof this.survCfg.totemEquipDelayMaxMs === 'number' && this.survCfg.totemEquipDelayMaxMs >= 0)
+      ? this.survCfg.totemEquipDelayMaxMs
+      : 260;
+    const maxDelayMs = Math.max(minDelayMs, maxDelayRaw);
+    const delayMs = minDelayMs + Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1));
 
-    return true;
+    this.totemEquipPromise = new Promise((resolve) => {
+      this._totemDelayResolve = resolve;
+      this.totemDelayTimer = setTimeout(() => {
+        this.totemDelayTimer = null;
+        const finish = this._totemDelayResolve;
+        this._totemDelayResolve = null;
+
+        this._executeTotemSwap()
+          .catch(() => {})
+          .finally(() => {
+            if (!this.totemDelayTimer && !this.totemEquipInFlight) {
+              this.totemEquipPromise = null;
+            }
+            if (finish) finish();
+          });
+      }, delayMs);
+    });
+
+    return false;
   }
 
   /**
    * Ensures offhand safety every tick during active combat:
-   * - Priority 1: Totem of Undying in slot 45 (preempts everything)
+   * - Priority 1: Totem of Undying in slot 45 (human-paced reaction + anti-InventoryMove pause)
    * - Priority 2: Shield in slot 45 if no totems remain in inventory (with failure backoff)
-   * Returns true if an emergency totem swap is currently in progress.
+   * Returns true while an emergency totem movement-pause/equip swap is actively in progress.
    */
   ensureOffhandSafety() {
-    if (!this.activeInCombat) return false;
+    if (!this.activeInCombat || this._disposed) return false;
     if (this.ensureTotemPriority()) return true;
 
-    // Do not fall through to shield equip if totem equip is currently in locked-inventory backoff
+    // Do not fall through to shield equip if a totem swap is already scheduled or in locked-inventory backoff
+    if (this.totemDelayTimer || this.totemSwapPending || this.totemEquipInFlight) {
+      return Boolean(this.totemSwapPending || this.totemEquipInFlight);
+    }
     if (this.totemRetryBackoffMs > 0 && this.findTotemInInventory()) {
       return false;
     }
@@ -810,7 +1005,7 @@ class SurvivalModule {
    * Returns true while actively throwing XP bottles.
    */
   tickArmorXpMend(target) {
-    if (this.survCfg.xpMendEnabled === false || !this.bot || !this.bot.entity || this.totemEquipInFlight) {
+    if (this.survCfg.xpMendEnabled === false || !this.bot || !this.bot.entity || this.totemEquipInFlight || this.totemSwapPending) {
       this.isXpMending = false;
       return false;
     }
@@ -1048,7 +1243,7 @@ class SurvivalModule {
    * Pulls a spare healing splash potion from main inventory (9–35) into hotbar slots 6–8 if hotbar has no healing pots.
    */
   _tryRefillHotbarPot() {
-    if (!this.bot.inventory || this.sortingInProgress || this.totemEquipInFlight || this.equipBusy) return;
+    if (!this.bot.inventory || this.sortingInProgress || this.totemEquipInFlight || this.totemSwapPending || this.totemDelayTimer || this.equipBusy) return;
     if (typeof this.bot.moveSlotItem !== 'function') return;
 
     const now = Date.now();
@@ -1126,7 +1321,10 @@ class SurvivalModule {
    * Returns true ONLY while actively throwing a splash potion, drinking a potion, or XP mending.
    */
   tickInlineCombatHeal(target) {
-    if (!this.bot || !this.bot.entity || this.totemEquipInFlight) return false;
+    if (!this.bot || !this.bot.entity || this.totemEquipInFlight || this.totemSwapPending) {
+      if (this._totemMovementPaused) this._pauseMovementForTotemSwap();
+      return false;
+    }
     const now = Date.now();
 
     const dist = (target && target.isValid && target.position)
@@ -1259,7 +1457,7 @@ class SurvivalModule {
    * cleanly via Mineflayer's `bot.consume()` with single-equip settle, timeout, & retry backoff.
    */
   async _startDrinkingPotion(potionItem, buffKind = null) {
-    if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !potionItem) return;
+    if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || this.totemSwapPending || !potionItem) return;
     if ((Date.now() - this.lastConsumeFailAt) < 500) return;
 
     this.isConsuming = true;
@@ -1356,7 +1554,7 @@ class SurvivalModule {
   }
 
   async _equipSafe(item, destination) {
-    if (this.totemEquipInFlight || this.equipBusy || !item) return false;
+    if (this.totemEquipInFlight || this.totemSwapPending || this.equipBusy || !item) return false;
     this.equipBusy = true;
     try {
       await this.bot.equip(item, destination);
@@ -1438,7 +1636,7 @@ class SurvivalModule {
    * Returns true while actively blocking so melee combat does not swing concurrently.
    */
   tickShield(target, weaponCooldownProgress = 1.0) {
-    if (!this.survCfg.shieldEnabled || this.totemEquipInFlight) {
+    if (!this.survCfg.shieldEnabled || this.totemEquipInFlight || this.totemSwapPending) {
       this.lowerShield();
       return false;
     }
@@ -1600,7 +1798,7 @@ class SurvivalModule {
   }
 
   _throwSplashPotion(potion, buffKind = null) {
-    if (this.totemEquipInFlight || !potion) return;
+    if (this.totemEquipInFlight || this.totemSwapPending || !potion) return;
     try {
       // Instant throwable item: send use_item only (no extra block_dig/deactivateItem packet)
       this.bot.activateItem(false);
@@ -1612,7 +1810,7 @@ class SurvivalModule {
   }
 
   async _startEatingFood(food) {
-    if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !food) return;
+    if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || this.totemSwapPending || !food) return;
     if ((Date.now() - this.lastConsumeFailAt) < 500) return;
 
     // Never attempt to eat normal food at full hunger (vanilla MC rejects it and hangs until timeout)
@@ -1728,7 +1926,7 @@ class SurvivalModule {
   }
 
   async _placeLosBlock(action) {
-    if (this.totemEquipInFlight) return;
+    if (this.totemEquipInFlight || this.totemSwapPending) return;
     try {
       await this.bot.equip(action.item, 'hand');
       const refBlock = this.bot.blockAt(action.refPos);
@@ -1750,7 +1948,10 @@ class SurvivalModule {
    * 5. Smoothly turn 180° away from enemy and sprint-jump with serpentine strafing
    */
   tickRetreating(target) {
-    if (this.ensureOffhandSafety()) return;
+    if (this.totemSwapPending || this.ensureOffhandSafety()) {
+      if (this._totemMovementPaused) this._pauseMovementForTotemSwap();
+      return;
+    }
     this.lowerShield();
 
     if (!this.bot.entity) return;
@@ -1833,7 +2034,10 @@ class SurvivalModule {
    * 20-TPS tick handler for HEALING state (used when safe distance is achieved or topping up).
    */
   tickHealing(target) {
-    if (this.ensureOffhandSafety()) return;
+    if (this.totemSwapPending || this.ensureOffhandSafety()) {
+      if (this._totemMovementPaused) this._pauseMovementForTotemSwap();
+      return;
+    }
     this.lowerShield();
 
     const now = Date.now();
@@ -1941,14 +2145,14 @@ class SurvivalModule {
    */
   async equipBestArmor() {
     if (!this.bot || !this.bot.inventory) return;
-    if (this.ensureTotemPriority()) return;
+    if (this.ensureTotemPriority() || this.totemDelayTimer || this.totemSwapPending || this.totemEquipInFlight) return;
 
     const clickDelayMs = this.survCfg.inventoryClickDelayMs !== undefined ? this.survCfg.inventoryClickDelayMs : 120;
     const allItems = this.bot.inventory.items();
     let consecutiveFailures = 0;
 
     for (const spec of ARMOR_SLOTS) {
-      if (this.needsTotemSwap() || this.totemEquipInFlight) {
+      if (this.needsTotemSwap() || this.totemEquipInFlight || this.totemSwapPending || this.totemDelayTimer) {
         this.ensureTotemPriority();
         return;
       }
@@ -2014,7 +2218,7 @@ class SurvivalModule {
    */
   async sortHotbar() {
     if (!this.survCfg.autoSortHotbar || !this.bot || !this.bot.inventory) return;
-    if (this.sortingInProgress || this.totemEquipInFlight) return;
+    if (this.sortingInProgress || this.totemEquipInFlight || this.totemSwapPending || this.totemDelayTimer) return;
     if (typeof this.bot.moveSlotItem !== 'function') return;
 
     this.sortingInProgress = true;
@@ -2049,7 +2253,7 @@ class SurvivalModule {
     try {
       for (const rule of layoutPlan) {
         // Totem priority always preempts hotbar sorting
-        if (this.needsTotemSwap() || this.totemEquipInFlight) {
+        if (this.needsTotemSwap() || this.totemEquipInFlight || this.totemSwapPending || this.totemDelayTimer) {
           this.ensureTotemPriority();
           return;
         }
