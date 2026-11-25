@@ -78,9 +78,13 @@ class CombatModule {
     this.hitSelectCounterWindowUntil = 0;
     this.lastHitSelectTriggerTime = 0;
 
-    // Hotbar weapon & Breach Mace enchantment slots (0–8, or -1 if absent)
+    // Hotbar weapon & Mace enchantment slots (0–8, or -1 if absent)
     this.breachMaceSlot = -1;
     this.breachLevel = 0;
+    this.windBurstMaceSlot = -1;
+    this.windBurstLevel = 0;
+    this.densityMaceSlot = -1;
+    this.densityLevel = 0;
     this.maceSlot = -1;
     this.swordSlot = -1;
     this.axeSlot = -1;
@@ -170,6 +174,10 @@ class CombatModule {
     return {
       breachMaceSlot: this.breachMaceSlot,
       breachLevel: this.breachLevel,
+      windBurstMaceSlot: this.windBurstMaceSlot,
+      windBurstLevel: this.windBurstLevel,
+      densityMaceSlot: this.densityMaceSlot,
+      densityLevel: this.densityLevel,
       maceSlot: this.maceSlot,
       swordSlot: this.swordSlot,
       axeSlot: this.axeSlot,
@@ -338,6 +346,10 @@ class CombatModule {
   scanHotbarSlots() {
     this.breachMaceSlot = -1;
     this.breachLevel = 0;
+    this.windBurstMaceSlot = -1;
+    this.windBurstLevel = 0;
+    this.densityMaceSlot = -1;
+    this.densityLevel = 0;
     this.maceSlot = -1;
     this.swordSlot = -1;
     this.axeSlot = -1;
@@ -403,13 +415,26 @@ class CombatModule {
           this.breachLevel = Math.min(4, breachLvl);
           this.breachMaceSlot = hotbarIndex;
           this.maceSlot = hotbarIndex;
-        } else if (enchantedMaceFallback === -1 && this._itemHasAnyEnchants(item)) {
+        }
+        const windBurstLvl = this._getEnchantmentLevel(item, 'wind_burst');
+        if (windBurstLvl >= 1 && windBurstLvl > this.windBurstLevel) {
+          this.windBurstLevel = Math.min(3, windBurstLvl);
+          this.windBurstMaceSlot = hotbarIndex;
+          if (this.maceSlot === -1) this.maceSlot = hotbarIndex;
+        }
+        const densityLvl = this._getEnchantmentLevel(item, 'density');
+        if (densityLvl >= 1 && densityLvl > this.densityLevel) {
+          this.densityLevel = Math.min(5, densityLvl);
+          this.densityMaceSlot = hotbarIndex;
+          if (this.maceSlot === -1) this.maceSlot = hotbarIndex;
+        }
+        if (enchantedMaceFallback === -1 && this._itemHasAnyEnchants(item)) {
           enchantedMaceFallback = hotbarIndex;
         }
       }
     }
 
-    // MC 1.21+ fallback: if enchantments are encoded as numeric registry IDs, still allow breach swap with enchanted mace
+    // MC 1.21+ fallback: if enchantments are encoded as numeric registry IDs, still allow breach/wind-burst mace use
     if (this.breachMaceSlot === -1 && enchantedMaceFallback !== -1) {
       this.breachMaceSlot = enchantedMaceFallback;
       this.breachLevel = 1;

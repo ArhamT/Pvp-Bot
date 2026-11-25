@@ -38,10 +38,15 @@ const AERIAL_MODES = Object.freeze({
   IDLE: 'IDLE',
   STUN_SLAM: 'STUN_SLAM',
   MACE_LAUNCH: 'MACE_LAUNCH',
+  PEARL_CATCH: 'PEARL_CATCH',
   SPEAR_MACE: 'SPEAR_MACE',
   ELYTRA_DIVE: 'ELYTRA_DIVE',
   CLUTCH: 'CLUTCH'
 });
+
+const PEARL_SPEED = 1.5;
+const PEARL_GRAVITY = 0.03;
+const PEARL_DRAG = 0.99;
 
 /**
  * Advanced aerial PvP module implementing:
@@ -63,9 +68,11 @@ class AerialModule {
     this.prediction = prediction;
     this.combat = combat;
 
-    // Fall distance tracking
+    // Fall distance & teleport detection tracking
     this.fallDistance = 0;
     this.lastY = (bot && bot.entity && bot.entity.position) ? bot.entity.position.y : null;
+    this.lastBotPos = (bot && bot.entity && bot.entity.position) ? bot.entity.position.clone() : null;
+    this.teleportedThisTick = false;
 
     // Active aerial state machine
     this.mode = AERIAL_MODES.IDLE;
@@ -79,12 +86,22 @@ class AerialModule {
     // Stun Slam state
     this.stunSlamAxeSwapped = false;
 
-    // Spear-to-Mace & Direct Mace Launch state
+    // Spear-to-Mace, Wind Burst Chain & Direct Mace Launch state
     this.lastSpearMaceTime = 0;
     this.lastMaceLaunchTime = 0;
     this.spearThrustDone = false;
     this.spearLaunchTicks = 0;
     this.spearDeactivatePending = false;
+    this.windBurstBounceTicks = 0;
+    this.windBurstChainCount = 0;
+    this.maceJumpTicks = 0;
+
+    // Wind Burst Pearl Catching state (both self-pearl catch & enemy-pearl interception)
+    this.lastPearlCatchTime = 0;
+    this.pearlCatchLandingTarget = null;
+    this.pearlCatchTicks = 0;
+    this.pearlDeactivatePending = false;
+    this.trackedEnemyPearl = null; // { entity, landingPos, expiresAt }
 
     // Elytra Mace Dive state
     this.savedChestplateName = null;
@@ -104,11 +121,13 @@ class AerialModule {
     this.clutchActivated = false;
     this.clutchDeactivatePending = false;
 
-    // Bind death/respawn cleanup safely
+    // Bind death/respawn cleanup & enemy Ender Pearl projectile tracking safely
     this._onDeath = this._handleDeathOrRespawn.bind(this);
+    this._onEntitySpawn = this._handleEntitySpawn.bind(this);
     if (this.bot && typeof this.bot.on === 'function') {
       this.bot.on('death', this._onDeath);
       this.bot.on('respawn', this._onDeath);
+      this.bot.on('entitySpawn', this._onEntitySpawn);
     }
   }
 
@@ -133,10 +152,13 @@ class AerialModule {
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('death', this._onDeath);
       this.bot.removeListener('respawn', this._onDeath);
+      this.bot.removeListener('entitySpawn', this._onEntitySpawn);
     }
     this.cancel();
     this.fallDistance = 0;
     this.lastY = null;
+    this.lastBotPos = null;
+    this.trackedEnemyPearl = null;
   }
 
   _handleDeathOrRespawn() {
@@ -144,10 +166,153 @@ class AerialModule {
     this.lastY = (this.bot && this.bot.entity && this.bot.entity.position)
       ? this.bot.entity.position.y
       : null;
+    this.lastBotPos = (this.bot && this.bot.entity && this.bot.entity.position)
+      ? this.bot.entity.position.clone()
+      : null;
+    this.trackedEnemyPearl = null;
+    this.windBurstChainCount = 0;
     this._resetState();
     this.elytraSwappedIn = false;
     this.pendingChestplateRestore = false;
     this.savedChestplateName = null;
+  }
+
+  /**
+   * Tracks enemy-thrown Ender Pearl projectiles in mid-air and simulates their exact landing point
+   * so the bot can pearl-catch the enemy on landing with a Wind Burst Mace smash.
+   */
+  _handleEntitySpawn(entity) {
+    if (this.aerialCfg.pearlCatchEnabled === false) return;
+    if (!entity || !entity.position || !this.bot || !this.bot.entity || !this.bot.entity.position) return;
+
+    const name = String(entity.name || entity.objectType || '').toLowerCase();
+    if (!name.includes('ender_pearl') && !name.includes('thrownenderpearl')) return;
+
+    // Ignore pearls spawned directly at our own eyes (our own thrown pearls)
+    const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
+    if (eyePos.distanceTo(entity.position) < 1.8) return;
+
+    const landingPos = this._predictProjectileLanding(entity.position, entity.velocity);
+    this.trackedEnemyPearl = {
+      entity,
+      landingPos,
+      expiresAt: Date.now() + 3500
+    };
+  }
+
+  /**
+   * Simulates an Ender Pearl's discrete Minecraft flight (drag 0.99, gravity 0.03)
+   * until hitting a solid block or reaching 60 ticks, returning predicted landing Vec3.
+   */
+  _predictProjectileLanding(startPos, startVel) {
+    let x = startPos.x;
+    let y = startPos.y;
+    let z = startPos.z;
+    const vel = startVel || new Vec3(0, 0, 0);
+    let vx = vel.x;
+    let vy = vel.y;
+    let vz = vel.z;
+
+    for (let t = 0; t < 60; t++) {
+      const nextX = x + vx;
+      const nextY = y + vy;
+      const nextZ = z + vz;
+
+      if (this.bot && typeof this.bot.blockAt === 'function') {
+        const block = this.bot.blockAt(new Vec3(nextX, nextY, nextZ));
+        if (block && block.boundingBox === 'block') {
+          return new Vec3(x, Math.floor(nextY) + 1, z);
+        }
+      }
+
+      x = nextX;
+      y = nextY;
+      z = nextZ;
+      vx *= PEARL_DRAG;
+      vy = vy * PEARL_DRAG - PEARL_GRAVITY;
+      vz *= PEARL_DRAG;
+
+      if (y < -64) break;
+    }
+
+    return new Vec3(x, y, z);
+  }
+
+  /**
+   * Solves ballistic (yaw, pitch) for throwing an Ender Pearl to land directly at `targetPos`.
+   */
+  _solvePearlBallistics(targetPos, targetVel = null) {
+    const eye = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
+    const vel = targetVel || new Vec3(0, 0, 0);
+
+    let flightTicks = clamp(eye.distanceTo(targetPos) / PEARL_SPEED, 1, 45);
+    let bestYaw = 0;
+    let bestPitch = 0;
+
+    for (let iter = 0; iter < 3; iter++) {
+      const predX = targetPos.x + vel.x * flightTicks;
+      const predY = targetPos.y + (Math.abs(vel.y) > 0.05 ? vel.y * flightTicks * 0.35 : 0);
+      const predZ = targetPos.z + vel.z * flightTicks;
+
+      const dx = predX - eye.x;
+      const dy = predY - eye.y;
+      const dz = predZ - eye.z;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      bestYaw = Math.atan2(-dx, -dz);
+
+      if (horizDist < 0.5) {
+        bestPitch = clamp(Math.atan2(dy, Math.max(0.1, horizDist)), -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05);
+        break;
+      }
+
+      // Binary search pitch in [-82°, +45°] using exact discrete pearl drag/gravity
+      let low = -82 * DEG_TO_RAD;
+      let high = 45 * DEG_TO_RAD;
+      let lastTicks = flightTicks;
+
+      for (let step = 0; step < 14; step++) {
+        const mid = (low + high) * 0.5;
+        let vx = PEARL_SPEED * Math.cos(mid);
+        let vy = PEARL_SPEED * Math.sin(mid);
+        let x = 0;
+        let y = 0;
+        let reached = false;
+        let yAtDist = -Infinity;
+        let ticks = 60;
+
+        for (let t = 1; t <= 60; t++) {
+          const px = x;
+          const py = y;
+          x += vx;
+          y += vy;
+          vx *= PEARL_DRAG;
+          vy = vy * PEARL_DRAG - PEARL_GRAVITY;
+          if (x >= horizDist) {
+            const frac = (x - px) > 1e-6 ? (horizDist - px) / (x - px) : 0;
+            yAtDist = py + (y - py) * frac;
+            ticks = (t - 1) + frac;
+            reached = true;
+            break;
+          }
+        }
+
+        if (!reached || yAtDist < dy) {
+          low = mid;
+        } else {
+          high = mid;
+          lastTicks = ticks;
+        }
+      }
+
+      bestPitch = (low + high) * 0.5;
+      flightTicks = lastTicks;
+    }
+
+    return {
+      yaw: bestYaw,
+      pitch: clamp(bestPitch, -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05),
+      flightTicks
+    };
   }
 
   /**
@@ -421,19 +586,63 @@ class AerialModule {
     return null;
   }
 
-  _findMace() {
+  _hasWindBurstEnchant(item) {
+    if (!item || item.name !== 'mace') return false;
+    if (this.combat && typeof this.combat._getEnchantmentLevel === 'function') {
+      return this.combat._getEnchantmentLevel(item, 'wind_burst') >= 1;
+    }
+    try {
+      const parts = [];
+      if (item.enchants) parts.push(JSON.stringify(item.enchants));
+      if (item.nbt) parts.push(JSON.stringify(item.nbt));
+      if (item.components) parts.push(JSON.stringify(item.components));
+      if (item.componentMap instanceof Map) {
+        for (const [k, v] of item.componentMap.entries()) parts.push(String(k), JSON.stringify(v));
+      }
+      return parts.join(' ').toLowerCase().includes('wind_burst');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Finds the optimal Mace for aerial smashes:
+   * - When `preferWindBurst` is true (chaining bounces & pearl catching), prioritizes Wind Burst Mace.
+   * - Otherwise prioritizes Breach / Density / Wind Burst / any Mace.
+   */
+  _findMace(preferWindBurst = false) {
     const hotbarStart = this._getHotbarStart();
     const slots = this._getCombatHotbarSlots();
+
+    if (preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false) {
+      if (slots && typeof slots.windBurstMaceSlot === 'number' && slots.windBurstMaceSlot >= 0) {
+        const wbItem = this._getSlotItem(hotbarStart + slots.windBurstMaceSlot);
+        if (wbItem && wbItem.name === 'mace') {
+          return { item: wbItem, hotbarIndex: slots.windBurstMaceSlot, isWindBurst: true, isBreach: this._hasBreachEnchant(wbItem) };
+        }
+      }
+      const items = this._getInventoryItems();
+      const wbDirect = items.find((i) => i.name === 'mace' && this._hasWindBurstEnchant(i));
+      if (wbDirect) return { ...this._makeSelection(wbDirect), isWindBurst: true, isBreach: this._hasBreachEnchant(wbDirect) };
+    }
 
     // Priority 1: CombatModule-detected Breach Mace hotbar slot
     if (slots && typeof slots.breachMaceSlot === 'number' && slots.breachMaceSlot >= 0) {
       const slotItem = this._getSlotItem(hotbarStart + slots.breachMaceSlot);
       if (slotItem && slotItem.name === 'mace') {
-        return { item: slotItem, hotbarIndex: slots.breachMaceSlot, isBreach: true };
+        return { item: slotItem, hotbarIndex: slots.breachMaceSlot, isBreach: true, isWindBurst: this._hasWindBurstEnchant(slotItem) };
       }
     }
 
-    // Priority 2: Direct scan for a Breach-enchanted Mace (hotbar first)
+    // Priority 2: Density Mace hotbar slot (highest fall-damage multiplier)
+    if (slots && typeof slots.densityMaceSlot === 'number' && slots.densityMaceSlot >= 0) {
+      const slotItem = this._getSlotItem(hotbarStart + slots.densityMaceSlot);
+      if (slotItem && slotItem.name === 'mace') {
+        return { item: slotItem, hotbarIndex: slots.densityMaceSlot, isBreach: false, isWindBurst: this._hasWindBurstEnchant(slotItem) };
+      }
+    }
+
+    // Priority 3: Direct scan for a Breach-enchanted Mace (hotbar first)
     const items = this._getInventoryItems();
     const breachHotbar = items.find(
       (i) => i.name === 'mace' &&
@@ -442,22 +651,22 @@ class AerialModule {
         i.slot < hotbarStart + 9 &&
         this._hasBreachEnchant(i)
     );
-    if (breachHotbar) return { ...this._makeSelection(breachHotbar), isBreach: true };
+    if (breachHotbar) return { ...this._makeSelection(breachHotbar), isBreach: true, isWindBurst: this._hasWindBurstEnchant(breachHotbar) };
 
     const breachInv = items.find((i) => i.name === 'mace' && this._hasBreachEnchant(i));
-    if (breachInv) return { ...this._makeSelection(breachInv), isBreach: true };
+    if (breachInv) return { ...this._makeSelection(breachInv), isBreach: true, isWindBurst: this._hasWindBurstEnchant(breachInv) };
 
-    // Priority 3: CombatModule-detected standard Mace hotbar slot
+    // Priority 4: CombatModule-detected standard Mace hotbar slot
     if (slots && typeof slots.maceSlot === 'number' && slots.maceSlot >= 0) {
       const slotItem = this._getSlotItem(hotbarStart + slots.maceSlot);
       if (slotItem && slotItem.name === 'mace') {
-        return { item: slotItem, hotbarIndex: slots.maceSlot, isBreach: false };
+        return { item: slotItem, hotbarIndex: slots.maceSlot, isBreach: false, isWindBurst: this._hasWindBurstEnchant(slotItem) };
       }
     }
 
-    // Priority 4: Any Mace in hotbar or inventory
+    // Priority 5: Any Mace in hotbar or inventory
     const anyMace = this._findItemByName('mace');
-    return anyMace ? { ...anyMace, isBreach: false } : null;
+    return anyMace ? { ...anyMace, isBreach: false, isWindBurst: this._hasWindBurstEnchant(anyMace.item) } : null;
   }
 
   _findAxe() {
@@ -700,8 +909,15 @@ class AerialModule {
       return false;
     }
 
-    // 1. Always track accurate fall distance every tick
+    // 1. Always track accurate fall distance & teleport jumps every tick
     this._updateFallDistance();
+    const curPos = this.bot.entity.position;
+    this.teleportedThisTick = Boolean(this.lastBotPos && curPos.distanceTo(this.lastBotPos) > 2.5);
+    this.lastBotPos = curPos.clone();
+
+    if (this.trackedEnemyPearl && Date.now() > this.trackedEnemyPearl.expiresAt) {
+      this.trackedEnemyPearl = null;
+    }
 
     // Release any pending item activation from the previous tick
     if (this.fireworkDeactivatePending) {
@@ -712,6 +928,12 @@ class AerialModule {
     }
     if (this.spearDeactivatePending) {
       this.spearDeactivatePending = false;
+      if (typeof this.bot.deactivateItem === 'function') {
+        try { this.bot.deactivateItem(); } catch (_) {}
+      }
+    }
+    if (this.pearlDeactivatePending) {
+      this.pearlDeactivatePending = false;
       if (typeof this.bot.deactivateItem === 'function') {
         try { this.bot.deactivateItem(); } catch (_) {}
       }
@@ -732,6 +954,9 @@ class AerialModule {
     // 2. Continue active aerial state machine if already engaged
     if (this.mode === AERIAL_MODES.CLUTCH) {
       return this._tickClutch();
+    }
+    if (this.mode === AERIAL_MODES.PEARL_CATCH) {
+      return this._tickPearlCatch(target);
     }
     if (this.mode === AERIAL_MODES.STUN_SLAM) {
       return this._tickStunSlam(target);
@@ -766,6 +991,13 @@ class AerialModule {
       return this._tickStunSlam(target);
     }
 
+    //    (a1) Wind Burst Pearl Catch (high airborne + enemy dodged horizontally OR threw escape pearl!)
+    const pearlCatchPlan = this._evaluatePearlCatchTrigger(target);
+    if (pearlCatchPlan) {
+      this._enterPearlCatch(pearlCatchPlan);
+      return this._tickPearlCatch(target);
+    }
+
     //    (a2) Opportunistic Aerial Mace Smash (already falling >1.8b near unshielded enemy with Mace!)
     if (this._canStartOpportunisticMaceSmash(target)) {
       this.mode = AERIAL_MODES.MACE_LAUNCH;
@@ -791,13 +1023,237 @@ class AerialModule {
       return this._tickSpearMace(target);
     }
 
-    //    (d) Direct Wind Charge Mace Launch -> Stun Slam / Breach Mace Smash (open sky, 3–12b)
+    //    (d) Direct Jump -> Airborne Angled Wind Charge Mace Launch -> Wind Burst Chain / Pearl Catch
     if (this._canStartMaceLaunch(target)) {
       this.mode = AERIAL_MODES.MACE_LAUNCH;
-      this.stage = 'WIND_CHARGE_LAUNCH';
+      this.stage = 'JUMP_INIT';
       this.stageTicks = 0;
+      this.maceJumpTicks = 0;
       this.spearLaunchTicks = 0;
+      this.windBurstBounceTicks = 0;
       return this._tickMaceLaunch(target);
+    }
+
+    return false;
+  }
+
+  /**
+   * 3D airborne steering: aims smoothly at target's predicted hitbox and drives
+   * forward/back/sprint controls to land directly on top of the opponent.
+   */
+  _steerAirborneToward(target, leadTicks = 2) {
+    const aimStatus = this._aimAtTarget(target, leadTicks, {
+      speedMultiplier: 1.75,
+      toleranceRad: 0.34
+    });
+
+    const pos = this.bot.entity.position;
+    const predPos = this._getPredictedPosition(target, leadTicks);
+    const dx = predPos.x - pos.x;
+    const dz = predPos.z - pos.z;
+    const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+    if (typeof this.bot.setControlState === 'function') {
+      const facing = aimStatus.yawErrorDeg < 55;
+      this.bot.setControlState('forward', facing && horizDist > 1.0);
+      this.bot.setControlState('back', facing && horizDist < 0.6);
+      this.bot.setControlState('sprint', facing && horizDist > 2.2);
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
+    }
+
+    return { aimStatus, horizDist };
+  }
+
+  /**
+   * Evaluates whether to execute a Wind Burst Pearl Catch:
+   * - Case 1 (Enemy Pearl Catch): enemy threw an Ender Pearl while we are airborne -> pearl to their predicted landing!
+   * - Case 2 (Wind Burst Self-Pearl Catch): we are high airborne (>= 3.5b above target OR fallDistance >= 3.5 OR Wind Burst bounce velY > 0.35)
+   *   and enemy dodged/ran horizontally >= 4.2b out from underneath us -> pearl directly onto their predicted path & smash!
+   */
+  _evaluatePearlCatchTrigger(target) {
+    if (this.aerialCfg.pearlCatchEnabled === false) return null;
+    if (!target || !target.isValid || !this.bot || !this.bot.entity) return null;
+
+    const now = Date.now();
+    const cooldownMs = this.aerialCfg.pearlCatchCooldownMs !== undefined ? this.aerialCfg.pearlCatchCooldownMs : 2200;
+    if ((now - this.lastPearlCatchTime) < cooldownMs) return null;
+
+    const { onGround, inWater, inLava } = this._getEnvironmentFlags();
+    if (onGround || inWater || inLava) return null;
+
+    if (!this._findItemByName('ender_pearl') || !this._findMace(true)) return null;
+
+    const pos = this.bot.entity.position;
+    const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
+    const heightAboveTarget = pos.y - target.position.y;
+    const dx = target.position.x - pos.x;
+    const dz = target.position.z - pos.z;
+    const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+    const minHeight = this.aerialCfg.pearlCatchMinHeight !== undefined ? this.aerialCfg.pearlCatchMinHeight : 3.5;
+    const minHoriz = this.aerialCfg.pearlCatchMinHorizDist !== undefined ? this.aerialCfg.pearlCatchMinHorizDist : 4.2;
+    const maxDist = this.aerialCfg.pearlCatchMaxDist !== undefined ? this.aerialCfg.pearlCatchMaxDist : 45.0;
+
+    // Case 1: Intercept an enemy-thrown Ender Pearl while airborne!
+    if (
+      this.trackedEnemyPearl &&
+      now <= this.trackedEnemyPearl.expiresAt &&
+      (heightAboveTarget >= 2.2 || this.fallDistance >= 2.0 || velY > 0.3)
+    ) {
+      const catchDist = pos.distanceTo(this.trackedEnemyPearl.landingPos);
+      if (catchDist >= 3.5 && catchDist <= maxDist) {
+        return {
+          reason: 'enemy_pearl_intercept',
+          catchPos: this.trackedEnemyPearl.landingPos.clone(),
+          useTargetVel: false
+        };
+      }
+    }
+
+    // Case 2: Wind Burst / high-altitude self-pearl catch when enemy strafes/runs out from under our smash!
+    const hasWindBurstAltitude = heightAboveTarget >= minHeight || this.fallDistance >= minHeight || velY > 0.35;
+    if (hasWindBurstAltitude && horizDist >= minHoriz && horizDist <= maxDist) {
+      const pred = this._getPredictedPosition(target, 3);
+      return {
+        reason: 'windburst_self_pearl_catch',
+        catchPos: pred.offset(0, 0.3, 0),
+        useTargetVel: true
+      };
+    }
+
+    return null;
+  }
+
+  _enterPearlCatch(plan) {
+    this.mode = AERIAL_MODES.PEARL_CATCH;
+    this.stage = 'PEARL_AIM_THROW';
+    this.stageTicks = 0;
+    this.pearlCatchTicks = 0;
+    this.pearlCatchLandingTarget = plan;
+  }
+
+  /**
+   * Executes Wind Burst Pearl Catching:
+   * 1. PEARL_AIM_THROW: Smoothly solves ballistic pearl arc to catch spot (enemy pearl landing or target path) and throws pearl.
+   * 2. PEARL_WAIT_TP: Pre-equips Wind Burst / Breach / Density Mace mid-flight, tracks target, and on teleport/arrival
+   *    executes Stun Slam (if shielded) or immediate Mace Smash -> transitions into WIND_BURST_BOUNCE!
+   */
+  _tickPearlCatch(target) {
+    this.stageTicks++;
+    this.pearlCatchTicks++;
+
+    if (this.stage === 'SWORD_RESTORE') {
+      return this._tickSwordRestore();
+    }
+
+    const { onGround, inWater } = this._getEnvironmentFlags();
+    const reach = this.combatCfg.reach || DEFAULT_REACH;
+
+    // Stage 1: Aim & throw Ender Pearl onto target/landing zone
+    if (this.stage === 'PEARL_AIM_THROW') {
+      if (this.stageTicks > 18 || !this.pearlCatchLandingTarget) {
+        this.mode = AERIAL_MODES.MACE_LAUNCH;
+        this.stage = 'AIRBORNE_DESCENT';
+        return true;
+      }
+
+      const pearlSel = this._findItemByName('ender_pearl');
+      if (!pearlSel) {
+        this.mode = AERIAL_MODES.MACE_LAUNCH;
+        this.stage = 'AIRBORNE_DESCENT';
+        return true;
+      }
+
+      const eq = this._equipHand(pearlSel);
+      const targetPos = (this.pearlCatchLandingTarget.useTargetVel && target && target.isValid)
+        ? target.position.offset(0, 0.3, 0)
+        : this.pearlCatchLandingTarget.catchPos;
+      const targetVel = (this.pearlCatchLandingTarget.useTargetVel && target && target.velocity)
+        ? target.velocity
+        : null;
+
+      const sol = this._solvePearlBallistics(targetPos, targetVel);
+      const aimStatus = this.aimer.stepTowardsAngles(sol.yaw, sol.pitch, {
+        speedMultiplier: 2.0,
+        toleranceRad: 0.14
+      });
+
+      if (eq.ready && !eq.swapped && aimStatus.aligned) {
+        if (typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+        }
+        this.pearlDeactivatePending = true;
+        this.lastPearlCatchTime = Date.now();
+        this.trackedEnemyPearl = null;
+        this.stage = 'PEARL_WAIT_TP';
+        this.stageTicks = 0;
+        return true;
+      }
+      return true;
+    }
+
+    // Stage 2: Pre-equip Wind Burst / Breach Mace while pearl flies -> instant smash on teleport/arrival!
+    if (this.stage === 'PEARL_WAIT_TP') {
+      if (!target || !target.isValid) {
+        if (this._shouldTriggerClutch(null, true)) {
+          this._enterClutch();
+          return this._tickClutch();
+        }
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+
+      const reachDist = this._getReachDistance(target);
+      const { aimStatus } = this._steerAirborneToward(target, 1);
+
+      // If target raised a shield right where we land -> Stun Slam!
+      if (
+        this.aerialCfg.stunSlamEnabled !== false &&
+        this._isTargetRaisingShield(target) &&
+        reachDist <= 3.6 &&
+        this._findAxe() &&
+        this._findMace(true)
+      ) {
+        this.mode = AERIAL_MODES.STUN_SLAM;
+        this.stage = 'AXE_BREAK';
+        this.stageTicks = 0;
+        this.stunSlamAxeSwapped = false;
+        return this._tickStunSlam(target);
+      }
+
+      const maceSel = this._findMace(true);
+      if (maceSel) {
+        const eq = this._equipHand(maceSel);
+        // Immediate Mace Smash as soon as pearl teleports us into reach (or we dive into reach)
+        const arrivedInReach = reachDist <= reach + 0.25 && (this.teleportedThisTick || aimStatus.aligned || aimStatus.yawErrorDeg < 35);
+        if (eq.ready && !eq.swapped && arrivedInReach) {
+          if (typeof this.bot.setControlState === 'function') {
+            this.bot.setControlState('sprint', false);
+          }
+          this.bot.attack(target);
+          this.windBurstChainCount++;
+          // Enter WIND_BURST_BOUNCE so a Wind Burst hit immediately chains into the next aerial launch!
+          this.mode = AERIAL_MODES.MACE_LAUNCH;
+          this.stage = 'WIND_BURST_BOUNCE';
+          this.stageTicks = 0;
+          this.windBurstBounceTicks = 0;
+          return true;
+        }
+      }
+
+      // Timeout or landed away from target -> recover cleanly
+      if (this.stageTicks > 35 || ((onGround || inWater) && this.stageTicks > 6 && !this.teleportedThisTick)) {
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+
+      if (this._shouldTriggerClutch(target, true)) {
+        this._enterClutch();
+        return this._tickClutch();
+      }
+
+      return true;
     }
 
     return false;
@@ -822,8 +1278,8 @@ class AerialModule {
       ? this.aerialCfg.stunSlamMinFallDistance
       : 1.8;
     if (velY >= -0.05 || this.fallDistance < minFall) return false;
-    if (!this._findMace()) return false;
-    return this.bot.entity.position.distanceTo(target.position) <= 5.5;
+    if (!this._findMace(true)) return false;
+    return this.bot.entity.position.distanceTo(target.position) <= 6.5;
   }
 
   _canStartMaceLaunch(target) {
@@ -833,18 +1289,26 @@ class AerialModule {
     if (!onGround || inWater || inLava) return false;
 
     const now = Date.now();
-    const cooldown = this.aerialCfg.maceLaunchCooldownMs || 2800;
+    const cooldown = this.aerialCfg.maceLaunchCooldownMs || 1800;
     if ((now - this.lastMaceLaunchTime) < cooldown) return false;
 
     const dist = this.bot.entity.position.distanceTo(target.position);
-    if (dist < 2.5 || dist > 12.0) return false;
+    if (dist < 2.2 || dist > 13.0) return false;
 
-    if (!this._findMace() || !this._findItemByName('wind_charge')) return false;
+    if (!this._findMace(true) || !this._findItemByName('wind_charge')) return false;
     if (!this._hasClearSkyAbove(5)) return false;
 
     return true;
   }
 
+  /**
+   * High-tier Mace Launch + 3D Air Steering + Wind Burst Chaining + Pearl Catching:
+   * 1. JUMP_INIT: Face target, sprint-jump off ground first while equipping wind_charge & pitching down.
+   * 2. WIND_CHARGE_LAUNCH: Fire angled wind_charge 1–2 ticks AFTER leaving ground (full 7–10b launch up + toward enemy!).
+   * 3. AIRBORNE_DESCENT: 3D air-steer onto predicted target, check Pearl Catch if enemy dodges/pearls,
+   *    Stun Slam if shielded, or pre-equip Wind Burst/Breach/Density Mace and SMASH!
+   * 4. WIND_BURST_BOUNCE: Detects upward Wind Burst bounce (`velY > 0.35`) after smash and immediately chains!
+   */
   _tickMaceLaunch(target) {
     this.stageTicks++;
     if (this.stage === 'SWORD_RESTORE') {
@@ -864,9 +1328,50 @@ class AerialModule {
     const reach = this.combatCfg.reach || DEFAULT_REACH;
     const reachDist = this._getReachDistance(target);
     const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
+    const pos = this.bot.entity.position;
+    const predPos = this._getPredictedPosition(target, 3);
+    const dx = predPos.x - pos.x;
+    const dz = predPos.z - pos.z;
+    const horizDist = Math.sqrt(dx * dx + dz * dz);
+    const yawToTarget = Math.atan2(-dx, -dz);
 
+    // Compute angled downward pitch so Wind Charge propels us UP AND FORWARD toward target!
+    // Close (<3.5b): -86° (high vertical); Mid (3.5-7b): -80°; Far (>7b): -75° (forward arc)
+    const launchPitchDeg = horizDist < 3.5 ? -86 : (horizDist < 7.0 ? -80 : -75);
+    const launchPitchRad = launchPitchDeg * DEG_TO_RAD;
+
+    // Stage 1: Jump off ground FIRST while equipping wind_charge and starting downward pitch
+    if (this.stage === 'JUMP_INIT') {
+      this.maceJumpTicks++;
+      const windSel = this._findItemByName('wind_charge');
+      if (!windSel || this.maceJumpTicks > 12) {
+        this.cancel();
+        return false;
+      }
+
+      this._equipHand(windSel);
+      this.aimer.stepTowardsAngles(yawToTarget, launchPitchRad, {
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2
+      });
+
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', true);
+        this.bot.setControlState('jump', onGround);
+      }
+
+      // Transition to fire wind_charge strictly AFTER jumping off ground (1-2 ticks) for max 8+ block height!
+      if (!onGround || this.maceJumpTicks >= 2) {
+        this.stage = 'WIND_CHARGE_LAUNCH';
+        this.stageTicks = 0;
+      }
+      return true;
+    }
+
+    // Stage 2: Fire angled Wind Charge while airborne right after jump
     if (this.stage === 'WIND_CHARGE_LAUNCH') {
-      if (this.stageTicks > 20) {
+      if (this.stageTicks > 15) {
         this.cancel();
         return false;
       }
@@ -877,16 +1382,17 @@ class AerialModule {
       }
 
       const eq = this._equipHand(windSel);
-      const aimStatus = this.aimer.stepTowardsAngles(this.bot.entity.yaw, -Math.PI / 2, {
-        speedMultiplier: 1.9,
-        toleranceRad: 0.18
+      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, launchPitchRad, {
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2
       });
 
-      if (eq.ready && !eq.swapped && aimStatus.pitchErrorDeg <= 12) {
-        if (typeof this.bot.setControlState === 'function') {
-          this.bot.setControlState('jump', true);
-          this.bot.setControlState('forward', true);
-        }
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('jump', false);
+        this.bot.setControlState('forward', true);
+      }
+
+      if (eq.ready && !eq.swapped && aimStatus.pitchErrorDeg <= 14) {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
@@ -900,40 +1406,75 @@ class AerialModule {
       return true;
     }
 
+    // Stage 3: Post-Smash Wind Burst Bounce Detection -> Chains straight into next aerial smash / Pearl Catch!
+    if (this.stage === 'WIND_BURST_BOUNCE') {
+      this.windBurstBounceTicks++;
+      this._steerAirborneToward(target, 2);
+
+      // Check immediately if opponent dodged/pearled during our Wind Burst bounce -> Pearl Catch!
+      const pearlPlan = this._evaluatePearlCatchTrigger(target);
+      if (pearlPlan) {
+        this._enterPearlCatch(pearlPlan);
+        return this._tickPearlCatch(target);
+      }
+
+      // Detected Wind Burst sky-bounce (upward velocity spike or sustained height) -> chain next descent!
+      if (!onGround && velY > 0.35 && this.aerialCfg.windBurstChainEnabled !== false) {
+        this.fallDistance = 0;
+        this.stage = 'AIRBORNE_DESCENT';
+        this.stageTicks = 0;
+        this.spearLaunchTicks = 2;
+        return true;
+      }
+
+      if (onGround || inWater || this.windBurstBounceTicks >= 6) {
+        this.windBurstChainCount = 0;
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+      return true;
+    }
+
+    // Stage 4: Airborne Ascent + Descent (3D Air-Steering, Pearl Catching, Stun Slam, Wind Burst Smash)
     if (this.stage === 'AIRBORNE_DESCENT') {
       this.spearLaunchTicks++;
       if (this.spearLaunchTicks === 1 && typeof this.bot.setControlState === 'function') {
         this.bot.setControlState('jump', false);
       }
 
-      if ((onGround || inWater) && this.spearLaunchTicks > 2) {
+      if ((onGround || inWater) && this.spearLaunchTicks > 3) {
+        this.windBurstChainCount = 0;
         this.stage = 'SWORD_RESTORE';
         return this._tickSwordRestore();
       }
-      if (this.spearLaunchTicks > 75) {
+      if (this.spearLaunchTicks > 85) {
+        this.windBurstChainCount = 0;
         this.stage = 'SWORD_RESTORE';
         return this._tickSwordRestore();
       }
 
-      // Actively steer horizontally toward predicted target so smash lands cleanly on target
-      const aimStatus = this._aimAtTarget(target, 2, {
-        speedMultiplier: 1.6,
-        toleranceRad: 0.34
-      });
-      this._setAirborneMove(aimStatus.yawErrorDeg < 50 && reachDist > 1.8, false);
+      // Full 3D air-steering directly onto target's predicted hitbox
+      const { aimStatus } = this._steerAirborneToward(target, 2);
+
+      // Wind Burst Pearl Catch check if enemy ran/dodged out from under us OR threw an escape pearl!
+      const pearlPlan = this._evaluatePearlCatchTrigger(target);
+      if (pearlPlan) {
+        this._enterPearlCatch(pearlPlan);
+        return this._tickPearlCatch(target);
+      }
 
       const minFall = this.aerialCfg.stunSlamMinFallDistance !== undefined
         ? this.aerialCfg.stunSlamMinFallDistance
         : 1.8;
 
       if (velY < -0.05) {
-        // If target raised shield while we descend -> Stun Slam (Axe break -> next-tick Breach Mace smash!)
+        // Branch A: Target raised shield while we descend -> Stun Slam!
         if (
           this.aerialCfg.stunSlamEnabled !== false &&
           this.fallDistance >= minFall &&
           this._isTargetRaisingShield(target) &&
           this._findAxe() &&
-          this._findMace()
+          this._findMace(true)
         ) {
           this.mode = AERIAL_MODES.STUN_SLAM;
           this.stage = 'AXE_BREAK';
@@ -942,8 +1483,9 @@ class AerialModule {
           return this._tickStunSlam(target);
         }
 
-        // Pre-equip Breach Mace / Mace on descent and smash on impact!
-        const maceSel = this._findMace();
+        // Branch B: Pre-equip Wind Burst (preferred for chaining) / Breach / Density Mace & SMASH on impact!
+        const preferWb = this.aerialCfg.windBurstChainEnabled !== false;
+        const maceSel = this._findMace(preferWb);
         if (maceSel) {
           const eq = this._equipHand(maceSel);
           if (
@@ -951,10 +1493,17 @@ class AerialModule {
             !eq.swapped &&
             this.fallDistance >= minFall &&
             reachDist <= reach + 0.15 &&
-            (aimStatus.aligned || aimStatus.yawErrorDeg < 28)
+            (aimStatus.aligned || aimStatus.yawErrorDeg < 30)
           ) {
+            // Drop sprint on smash tick so fall-damage smash registers cleanly
+            if (typeof this.bot.setControlState === 'function') {
+              this.bot.setControlState('sprint', false);
+            }
             this.bot.attack(target);
-            this.stage = 'SWORD_RESTORE';
+            this.windBurstChainCount++;
+            this.stage = 'WIND_BURST_BOUNCE';
+            this.stageTicks = 0;
+            this.windBurstBounceTicks = 0;
             return true;
           }
         }
@@ -1062,18 +1611,29 @@ class AerialModule {
       return true;
     }
 
-    // --- Stage 2 (Very next tick): Swap to Breach Mace & land smash before ground ---
+    // --- Stage 2 (Very next tick): Swap to Wind Burst / Breach Mace & land smash before ground ---
     if (this.stage === 'MACE_SMASH') {
-      const maceSel = this._findMace();
+      const maceSel = this._findMace(this.aerialCfg.windBurstChainEnabled !== false);
       if (!maceSel) {
         this.stage = 'SWORD_RESTORE';
         return this._tickSwordRestore();
       }
 
       const eq = this._equipHand(maceSel);
-      if (eq.ready && reachDist <= reach && aimStatus.aligned) {
+      if (eq.ready && reachDist <= reach + 0.15 && (aimStatus.aligned || aimStatus.yawErrorDeg < 30)) {
+        if (typeof this.bot.setControlState === 'function') {
+          this.bot.setControlState('sprint', false);
+        }
         this.bot.attack(target);
-        this.stage = 'SWORD_RESTORE';
+        if (this.aerialCfg.windBurstChainEnabled !== false && maceSel.isWindBurst) {
+          this.windBurstChainCount++;
+          this.mode = AERIAL_MODES.MACE_LAUNCH;
+          this.stage = 'WIND_BURST_BOUNCE';
+          this.stageTicks = 0;
+          this.windBurstBounceTicks = 0;
+        } else {
+          this.stage = 'SWORD_RESTORE';
+        }
         return true;
       }
 
