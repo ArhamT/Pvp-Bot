@@ -919,30 +919,18 @@ class AerialModule {
       this.trackedEnemyPearl = null;
     }
 
-    // Release any pending item activation from the previous tick
+    // Release any pending continuous-use item activation (not needed for instant throwables like pearls/wind charges)
     if (this.fireworkDeactivatePending) {
       this.fireworkDeactivatePending = false;
-      if (typeof this.bot.deactivateItem === 'function') {
-        try { this.bot.deactivateItem(); } catch (_) {}
-      }
     }
     if (this.spearDeactivatePending) {
       this.spearDeactivatePending = false;
-      if (typeof this.bot.deactivateItem === 'function') {
-        try { this.bot.deactivateItem(); } catch (_) {}
-      }
     }
     if (this.pearlDeactivatePending) {
       this.pearlDeactivatePending = false;
-      if (typeof this.bot.deactivateItem === 'function') {
-        try { this.bot.deactivateItem(); } catch (_) {}
-      }
     }
     if (this.clutchDeactivatePending) {
       this.clutchDeactivatePending = false;
-      if (typeof this.bot.deactivateItem === 'function') {
-        try { this.bot.deactivateItem(); } catch (_) {}
-      }
     }
 
     // Complete deferred safe chestplate restore if we cancelled mid-air earlier

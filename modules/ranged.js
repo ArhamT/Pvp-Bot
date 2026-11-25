@@ -914,11 +914,9 @@ class RangedModule {
       if (!equipped) return;
 
       if (action.type === 'pearl') {
+        // Instant throwable item: send use_item only (no extra block_dig/deactivateItem packet)
         this.bot.activateItem(false);
         this.lastPearlTime = now;
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 80);
       } else if (action.type === 'cobweb') {
         const refBlock = this.bot.blockAt(action.refBlockPos);
         if (refBlock && refBlock.boundingBox === 'block') {
@@ -930,15 +928,9 @@ class RangedModule {
         this.lastLavaTime = now;
         this.activeLavaPos = action.placePos;
         this.activeLavaPlacedAt = now;
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 100);
       } else if (action.type === 'lava_pickup') {
         this.bot.activateItem(false);
         this.activeLavaPos = null;
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 100);
       }
     } catch (_) {
       // Action interrupted

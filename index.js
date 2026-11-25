@@ -1193,15 +1193,16 @@ class PvPBotController {
       return;
     }
 
-    // Once sufficient separation is achieved, finish healing cleanly in HEALING state
-    if (dist >= retreatDist && this.survival.needsHealing()) {
+    // Once sufficient separation is achieved (and not mid-gapple bite), finish healing cleanly in HEALING state
+    if (dist >= retreatDist && !this.survival.isConsuming && this.survival.needsHealing()) {
       this.transitionState(STATES.HEALING, `created ${dist.toFixed(1)}b separation`);
       return;
     }
 
-    // Defensive escape Ender Pearl if < 6 HP and trapped in a combo or cobweb
+    // Defensive escape Ender Pearl if < 6 HP and trapped in a combo or cobweb (never interrupt active gapple bite)
     if (
       !this.ranged.isBusy() &&
+      !this.survival.isConsuming &&
       !this.survival.pendingSplashPotion &&
       !this.survival.pendingLosBlock
     ) {
@@ -1217,8 +1218,8 @@ class PvPBotController {
   }
 
   _tickHealing(target) {
-    // If enemy rushes us while health is critical, retreat to gain space first
-    if (target && target.isValid) {
+    // Never interrupt an active Golden Apple / potion consumption mid-bite!
+    if (target && target.isValid && !this.survival.isConsuming) {
       const dist = this.bot.entity.position.distanceTo(target.position);
       if (this.survival.needsRetreat() && dist < 5.0 && !this.survival.pendingSplashPotion) {
         this.transitionState(STATES.RETREATING, 'rushed while healing at critical HP');
@@ -1226,8 +1227,8 @@ class PvPBotController {
       }
     }
 
-    // Resume combat once recovered or out of healing items
-    if (this.survival.isRecovered() || !this.survival.hasHealingSupplies()) {
+    // Resume combat once recovered or out of healing items (after finishing active bite)
+    if (!this.survival.isConsuming && (this.survival.isRecovered() || !this.survival.hasHealingSupplies())) {
       if (target && target.isValid) {
         this.transitionState(STATES.ENGAGING, 'healing complete');
       } else {

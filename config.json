@@ -130,7 +130,7 @@
     "xpMendDurabilityRatio": 0.45,
     "xpMendStopRatio": 0.78,
     "xpMendMinHealth": 13,
-    "xpMendThrowIntervalMs": 100,
+    "xpMendThrowIntervalMs": 150,
     "eatTimeoutMs": 3500,
     "retreatDistance": 7.5,
     "losBlockCooldownMs": 950,

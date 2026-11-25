@@ -158,6 +158,7 @@ class SurvivalModule {
     this.isConsuming = false;
     this.isDrinkingPotion = false;
     this.consumeStartTime = 0;
+    this.lastConsumeFailAt = 0;
     this.lastPotionTime = 0;
     this.lastBuffAttemptTime = 0;
     this.pendingSplashPotion = null;
@@ -753,10 +754,8 @@ class SurvivalModule {
     if (ready && aimStatus.pitchErrorDeg <= 14 && (now - this.lastXpThrowTime) >= throwIntervalMs) {
       this.lastXpThrowTime = now;
       try {
+        // Instant throwable item: send use_item only (no bogus block_dig/deactivateItem packet)
         this.bot.activateItem(false);
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 40);
       } catch (_) {}
     }
 
@@ -1076,11 +1075,52 @@ class SurvivalModule {
   }
 
   /**
+   * Equips an item cleanly ONCE (no overlapping equip calls!) and waits 1 tick (55ms)
+   * so held_item_slot / window_click settles before calling bot.consume().
+   */
+  async _equipSingleForConsume(item) {
+    if (!item || !this.bot) return false;
+    if (this.bot.heldItem && this.bot.heldItem.type === item.type) {
+      return true;
+    }
+
+    const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+    if (
+      typeof item.slot === 'number' &&
+      item.slot >= hotbarStart &&
+      item.slot < hotbarStart + 9 &&
+      typeof this.bot.setQuickBarSlot === 'function'
+    ) {
+      const targetIdx = item.slot - hotbarStart;
+      if (this.bot.quickBarSlot !== targetIdx) {
+        this.bot.setQuickBarSlot(targetIdx);
+        await this._sleep(55); // 1-tick settle for Paper/GrimAC packet order
+      }
+      return true;
+    }
+
+    // Main inventory (slots 9–35): single sequential bot.equip without parallel overlap
+    if (this.equipBusy) return false;
+    this.equipBusy = true;
+    try {
+      await this.bot.equip(item, 'hand');
+      await this._sleep(55);
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      this.equipBusy = false;
+    }
+  }
+
+  /**
    * Drinks a regular `potion` (Strength, Swiftness, Fire Resistance, Healing, Regen, etc.)
-   * cleanly via Mineflayer's `bot.consume()` with timeout & anti-NoSlow sprint disable.
+   * cleanly via Mineflayer's `bot.consume()` with single-equip settle, timeout, & retry backoff.
    */
   async _startDrinkingPotion(potionItem, buffKind = null) {
     if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !potionItem) return;
+    if ((Date.now() - this.lastConsumeFailAt) < 500) return;
+
     this.isConsuming = true;
     this.isDrinkingPotion = true;
     this.consumeStartTime = Date.now();
@@ -1090,9 +1130,10 @@ class SurvivalModule {
     let timeoutHandle = null;
 
     try {
-      this._equipHotbarOrSafe(potionItem);
-      if (!this.bot.heldItem || this.bot.heldItem.type !== potionItem.type) {
-        await this.bot.equip(potionItem, 'hand');
+      const equipped = await this._equipSingleForConsume(potionItem);
+      if (!equipped) {
+        this.lastConsumeFailAt = Date.now();
+        return;
       }
 
       await Promise.race([
@@ -1106,6 +1147,7 @@ class SurvivalModule {
         this._markBuffApplied(buffKind);
       }
     } catch (_) {
+      this.lastConsumeFailAt = Date.now();
       try { this.bot.deactivateItem(); } catch (_) {}
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -1123,7 +1165,10 @@ class SurvivalModule {
       item.slot < hotbarStart + 9 &&
       typeof this.bot.setQuickBarSlot === 'function'
     ) {
-      this.bot.setQuickBarSlot(item.slot - hotbarStart);
+      const targetIdx = item.slot - hotbarStart;
+      if (this.bot.quickBarSlot !== targetIdx) {
+        this.bot.setQuickBarSlot(targetIdx);
+      }
       return true;
     }
     this._equipSafe(item, 'hand');
@@ -1355,14 +1400,12 @@ class SurvivalModule {
     if (this.totemEquipInFlight || !potion) return;
     const fire = () => {
       try {
+        // Instant throwable item: send use_item only (no extra block_dig/deactivateItem packet)
         this.bot.activateItem(false);
         this.lastPotionTime = Date.now();
         if (buffKind) {
           this._markBuffApplied(buffKind);
         }
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 60);
       } catch (_) {}
     };
 
@@ -1380,6 +1423,7 @@ class SurvivalModule {
 
   async _startEatingFood(food) {
     if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !food) return;
+    if ((Date.now() - this.lastConsumeFailAt) < 500) return;
 
     // Never attempt to eat normal food at full hunger (vanilla MC rejects it and hangs until timeout)
     const isAlwaysEdible = GAPPLE_PRIORITY.includes(food.name);
@@ -1388,6 +1432,7 @@ class SurvivalModule {
     }
 
     this.isConsuming = true;
+    this.isDrinkingPotion = false;
     this.consumeStartTime = Date.now();
     this.bot.setControlState('sprint', false);
 
@@ -1395,9 +1440,10 @@ class SurvivalModule {
     let timeoutHandle = null;
 
     try {
-      this._equipHotbarOrSafe(food);
-      if (!this.bot.heldItem || this.bot.heldItem.type !== food.type) {
-        await this.bot.equip(food, 'hand');
+      const equipped = await this._equipSingleForConsume(food);
+      if (!equipped) {
+        this.lastConsumeFailAt = Date.now();
+        return;
       }
 
       await Promise.race([
@@ -1411,6 +1457,7 @@ class SurvivalModule {
         this.justAteGappleAt = Date.now();
       }
     } catch (_) {
+      this.lastConsumeFailAt = Date.now();
       try { this.bot.deactivateItem(); } catch (_) {}
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -1529,45 +1576,42 @@ class SurvivalModule {
     // 3. If currently eating a Golden Apple, keep walking away smoothly (no sprint -> no NoSlow)
     if (this.isConsuming) {
       this._moveAwayWalk(target);
-      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 2200)) {
-        this.bot.deactivateItem();
+      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500)) {
+        try { this.bot.deactivateItem(); } catch (_) {}
         this.isConsuming = false;
+        this.isDrinkingPotion = false;
       }
       return;
     }
 
     // 4. Priority Instant Health II splash potion while moving forward
-    const potionCooldown = this.survCfg.potionCooldownMs || 900;
+    const potionCooldown = this.survCfg.potionCooldownMs || 450;
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.retreatHealthThreshold || 11) &&
+      this.bot.health <= (this.survCfg.retreatHealthThreshold || 6) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this.pendingSplashPotion = healPotion;
-      this._equipSafe(healPotion, 'hand');
+      this._equipHotbarOrSafe(healPotion);
       this._tickSplashPotionDownward(target);
       return;
     }
 
-    // 5. Smooth 180-degree turn away from target & sprint-jump escape
-    const awayYaw = this._getAwayYaw(target);
-    const aimStatus = this.aimer.stepTowardsAngles(awayYaw, 0.0, { speedMultiplier: 1.25 });
-
-    const dist = target && target.isValid
-      ? this.bot.entity.position.distanceTo(target.position)
-      : Infinity;
-
-    // 6. Place a block behind to break line of sight when pursued closely
-    if (aimStatus.yawErrorDeg < 50 && this._tryQueueLosBlock(target)) {
+    // 5. Immediately eat a Golden Apple if available (don't wait to run 5.5b away without eating!)
+    const gapple = this.findGoldenApple() || this.findBestHealFood();
+    if (gapple && !healPotion && this.bot.health < (this.survCfg.safeHealthThreshold || 15)) {
+      this._startEatingFood(gapple);
+      this._moveAwayWalk(target);
       return;
     }
 
-    // 7. Once we have modest breathing room (> 5.5b) or no splash potions left, eat a Golden Apple
-    const gapple = this.findGoldenApple() || this.findBestHealFood();
-    if (gapple && (dist >= 5.5 || !healPotion) && this.bot.health < (this.survCfg.safeHealthThreshold || 16)) {
-      this._startEatingFood(gapple);
-      this._moveAwayWalk(target);
+    // 6. Smooth 180-degree turn away from target & sprint-jump escape
+    const awayYaw = this._getAwayYaw(target);
+    const aimStatus = this.aimer.stepTowardsAngles(awayYaw, 0.0, { speedMultiplier: 1.25 });
+
+    // 7. Place a block behind to break line of sight when pursued closely
+    if (aimStatus.yawErrorDeg < 50 && this._tryQueueLosBlock(target)) {
       return;
     }
 
