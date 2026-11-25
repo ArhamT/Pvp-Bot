@@ -85,6 +85,16 @@ const ARMOR_MATERIAL_SCORE = {
   leather: 15
 };
 
+const ARMOR_MAX_DURABILITY = {
+  leather_helmet: 55, leather_chestplate: 80, leather_leggings: 75, leather_boots: 65,
+  golden_helmet: 77, golden_chestplate: 112, golden_leggings: 105, golden_boots: 91,
+  chainmail_helmet: 165, chainmail_chestplate: 240, chainmail_leggings: 225, chainmail_boots: 195,
+  iron_helmet: 165, iron_chestplate: 240, iron_leggings: 225, iron_boots: 195,
+  turtle_helmet: 275,
+  diamond_helmet: 363, diamond_chestplate: 528, diamond_leggings: 495, diamond_boots: 429,
+  netherite_helmet: 407, netherite_chestplate: 592, netherite_leggings: 555, netherite_boots: 481
+};
+
 /**
  * Highest-priority survival module handling:
  * 1. Event-driven + per-tick Totem of Undying management (slot 45, <100ms, preempts all inventory actions).
@@ -116,8 +126,9 @@ class SurvivalModule {
     this.shieldTicksRemaining = 0;
     this.lastShieldEndTime = 0;
 
-    // Consumption & potion state
+    // Consumption, potion & XP armor mending state
     this.isConsuming = false;
+    this.isDrinkingPotion = false;
     this.consumeStartTime = 0;
     this.lastPotionTime = 0;
     this.lastBuffAttemptTime = 0;
@@ -125,6 +136,8 @@ class SurvivalModule {
     this.pendingSplashIsBuff = false;
     this.pendingPotRefillTime = 0;
     this.justAteGappleAt = 0;
+    this.isXpMending = false;
+    this.lastXpThrowTime = 0;
 
     // Retreat & LOS block placement state
     this.retreatStrafeDir = Math.random() < 0.5 ? -1 : 1;
@@ -413,7 +426,7 @@ class SurvivalModule {
   }
 
   hasHealingSupplies() {
-    return Boolean(this.findHealingPotion() || this.findBestHealFood());
+    return Boolean(this.findHealingPotion() || this.findDrinkableHealPotion() || this.findBestHealFood());
   }
 
   /**
@@ -496,6 +509,7 @@ class SurvivalModule {
     if (text.includes('strength')) return 'strength';
     if (text.includes('swiftness') || text.includes('speed')) return 'swiftness';
     if (text.includes('fire_resistance') || text.includes('fire resistance')) return 'fire_res';
+    if (text.includes('turtle_master') || text.includes('resistance')) return 'turtle_master';
 
     // 2. Check custom effect IDs against bot.registry (handles 0-based 1.21+ & 1-based 1.20.4)
     if (effectIds.length > 0 && this.bot && this.bot.registry && this.bot.registry.effects) {
@@ -533,8 +547,178 @@ class SurvivalModule {
     if (item.name === 'splash_potion') {
       return 'unknown_splash';
     }
+    if (item.name === 'potion') {
+      const isPlainWater = text.includes('water') || text.includes('mundane') ||
+        text.includes('thick') || text.includes('awkward');
+      if (!isPlainWater) return 'unknown_drink';
+    }
 
     return 'other';
+  }
+
+  /**
+   * Finds a drinkable healing or regeneration potion (`potion` item) in inventory.
+   */
+  findDrinkableHealPotion() {
+    if (!this.bot.inventory || this.survCfg.drinkablePotionEnabled === false) return null;
+    const items = this.bot.inventory.items();
+    const hotbarStart = this.bot.inventory.hotbarStart || HOTBAR_START;
+
+    const rankOf = (item) => {
+      if (!item || item.name !== 'potion') return 0;
+      const cls = this._classifyPotion(item);
+      let base = 0;
+      if (cls === 'heal2') base = 40;
+      else if (cls === 'heal1') base = 30;
+      else if (cls === 'regen') base = 20;
+      if (base === 0) return 0;
+      const inHotbar = item.slot >= hotbarStart && item.slot < hotbarStart + 9;
+      return base + (inHotbar ? 5 : 0);
+    };
+
+    let best = null;
+    let bestRank = 0;
+    for (const item of items) {
+      const r = rankOf(item);
+      if (r > bestRank) {
+        bestRank = r;
+        best = item;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Returns durability remaining ratio in [0.0, 1.0] for an armor/tool item across
+   * legacy NBT (`Damage`), `item.durabilityUsed`, and MC 1.20.5+ `damage` components.
+   */
+  getItemDurabilityRatio(item) {
+    if (!item || !item.name) return 1.0;
+    const maxDur = (typeof item.maxDurability === 'number' && item.maxDurability > 0)
+      ? item.maxDurability
+      : (ARMOR_MAX_DURABILITY[item.name] || 0);
+    if (maxDur <= 0) return 1.0;
+
+    let damage = 0;
+    if (typeof item.durabilityUsed === 'number' && item.durabilityUsed > 0) {
+      damage = item.durabilityUsed;
+    } else if (item.componentMap instanceof Map) {
+      const dmgComp = item.componentMap.get('damage') || item.componentMap.get('minecraft:damage');
+      if (typeof dmgComp === 'number') damage = dmgComp;
+      else if (dmgComp && typeof dmgComp.data === 'number') damage = dmgComp.data;
+      else if (dmgComp && typeof dmgComp.value === 'number') damage = dmgComp.value;
+    } else if (Array.isArray(item.components)) {
+      const dmgComp = item.components.find((c) => c && (c.type === 'damage' || c.type === 'minecraft:damage'));
+      if (dmgComp) {
+        if (typeof dmgComp.data === 'number') damage = dmgComp.data;
+        else if (typeof dmgComp.value === 'number') damage = dmgComp.value;
+      }
+    } else if (item.nbt && item.nbt.value && item.nbt.value.Damage) {
+      const val = item.nbt.value.Damage.value !== undefined ? item.nbt.value.Damage.value : item.nbt.value.Damage;
+      if (typeof val === 'number') damage = val;
+    }
+
+    return Math.max(0, Math.min(1, (maxDur - damage) / maxDur));
+  }
+
+  /**
+   * Inspects worn armor slots (5=helmet, 6=chestplate, 7=leggings, 8=boots)
+   * and returns the lowest durability piece `{ ratio, slot, item }` (or null if no armor worn).
+   */
+  getLowestWornArmorDurability() {
+    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return null;
+    let lowest = null;
+
+    for (const spec of ARMOR_SLOTS) {
+      const piece = this.bot.inventory.slots[spec.slotIndex];
+      if (!piece || !piece.name) continue;
+      if (!ARMOR_MAX_DURABILITY[piece.name] && typeof piece.maxDurability !== 'number') continue;
+
+      const ratio = this.getItemDurabilityRatio(piece);
+      if (!lowest || ratio < lowest.ratio) {
+        lowest = { ratio, slot: spec.slotIndex, item: piece };
+      }
+    }
+    return lowest;
+  }
+
+  /**
+   * Finds an XP Bottle (`experience_bottle`) in inventory (preferring hotbar).
+   */
+  findXpBottle() {
+    if (!this.bot || !this.bot.inventory) return null;
+    const hotbarStart = this.bot.inventory.hotbarStart || HOTBAR_START;
+    const items = this.bot.inventory.items();
+    const hotbarXp = items.find(
+      (i) => i && i.name === 'experience_bottle' && i.slot >= hotbarStart && i.slot < hotbarStart + 9
+    );
+    if (hotbarXp) return hotbarXp;
+    return items.find((i) => i && i.name === 'experience_bottle') || null;
+  }
+
+  /**
+   * Throws XP bottles smoothly downward at feet when any worn armor piece drops below
+   * `xpMendDurabilityRatio` (default 45%), stopping once repaired to `xpMendStopRatio` (78%)
+   * or if health drops below `xpMendMinHealth` (13).
+   * Returns true while actively throwing XP bottles.
+   */
+  tickArmorXpMend(target) {
+    if (this.survCfg.xpMendEnabled === false || !this.bot || !this.bot.entity || this.totemEquipInFlight) {
+      this.isXpMending = false;
+      return false;
+    }
+
+    const minHealth = this.survCfg.xpMendMinHealth !== undefined ? this.survCfg.xpMendMinHealth : 13;
+    const startRatio = this.survCfg.xpMendDurabilityRatio !== undefined ? this.survCfg.xpMendDurabilityRatio : 0.45;
+    const stopRatio = this.survCfg.xpMendStopRatio !== undefined ? this.survCfg.xpMendStopRatio : 0.78;
+    const throwIntervalMs = this.survCfg.xpMendThrowIntervalMs !== undefined ? this.survCfg.xpMendThrowIntervalMs : 100;
+
+    const lowest = this.getLowestWornArmorDurability();
+    const xpBottle = this.findXpBottle();
+
+    if (!lowest || !xpBottle || this.bot.health < minHealth) {
+      this.isXpMending = false;
+      return false;
+    }
+
+    const dist = (target && target.isValid && target.position)
+      ? this.bot.entity.position.distanceTo(target.position)
+      : Infinity;
+
+    if (!this.isXpMending) {
+      if (lowest.ratio >= startRatio) return false;
+      // Don't start XP mending while getting point-blank comboed at moderate HP
+      if (dist < 3.0 && this.bot.health < 16) return false;
+      this.isXpMending = true;
+    } else if (lowest.ratio >= stopRatio || (dist < 2.8 && this.bot.health < 14)) {
+      this.isXpMending = false;
+      return false;
+    }
+
+    // Smoothly pitch down to -90° (-PI/2) and throw XP bottles at feet (paced at throwIntervalMs)
+    const aimStatus = this.aimer.stepTowardsAngles(this.bot.entity.yaw, -Math.PI / 2, {
+      speedMultiplier: 1.85,
+      toleranceRad: 0.16
+    });
+
+    this.bot.setControlState('sprint', false);
+    this.bot.setControlState('forward', false);
+    this.bot.setControlState('back', dist < 4.5);
+    this.bot.setControlState('jump', false);
+
+    const ready = this._equipHotbarOrSafe(xpBottle);
+    const now = Date.now();
+    if (ready && aimStatus.pitchErrorDeg <= 14 && (now - this.lastXpThrowTime) >= throwIntervalMs) {
+      this.lastXpThrowTime = now;
+      try {
+        this.bot.activateItem(false);
+        setTimeout(() => {
+          try { this.bot.deactivateItem(); } catch (_) {}
+        }, 40);
+      } catch (_) {}
+    }
+
+    return true;
   }
 
   /**
@@ -596,17 +780,30 @@ class SurvivalModule {
   findNeededBuffPotion() {
     if (!this.bot.inventory || this.survCfg.buffPotionEnabled === false) return null;
     const items = this.bot.inventory.items();
+    const allowDrinkable = this.survCfg.drinkablePotionEnabled !== false;
 
     const wantTypes = [];
     if (!this._hasActiveEffect('strength')) wantTypes.push('strength');
     if (!this._hasActiveEffect('speed') && !this._hasActiveEffect('swiftness')) wantTypes.push('swiftness');
     if (!this._hasActiveEffect('fireresistance') && !this._hasActiveEffect('fire_resistance')) wantTypes.push('fire_res');
+    if (this.bot.health <= 16 && !this._hasActiveEffect('regeneration')) wantTypes.push('regen');
+    if (this.bot.health <= 15 && !this._hasActiveEffect('resistance')) wantTypes.push('turtle_master');
 
     for (const want of wantTypes) {
       const splash = items.find((i) => i.name === 'splash_potion' && this._classifyPotion(i) === want);
       if (splash) return { item: splash, isSplash: true, kind: want };
-      const drink = items.find((i) => i.name === 'potion' && this._classifyPotion(i) === want);
-      if (drink) return { item: drink, isSplash: false, kind: want };
+      if (allowDrinkable) {
+        const drink = items.find((i) => i.name === 'potion' && this._classifyPotion(i) === want);
+        if (drink) return { item: drink, isSplash: false, kind: want };
+      }
+    }
+
+    // Fallback: drink unidentified custom buff potion if present and healthy
+    if (allowDrinkable) {
+      const customDrink = items.find((i) => i.name === 'potion' && this._classifyPotion(i) === 'unknown_drink');
+      if (customDrink && !this._hasActiveEffect('strength') && !this._hasActiveEffect('speed')) {
+        return { item: customDrink, isSplash: false, kind: 'unknown_drink' };
+      }
     }
     return null;
   }
@@ -667,6 +864,22 @@ class SurvivalModule {
     if (!this.bot || !this.bot.entity || this.totemEquipInFlight) return false;
     const now = Date.now();
 
+    const dist = (target && target.isValid && target.position)
+      ? this.bot.entity.position.distanceTo(target.position)
+      : Infinity;
+
+    // 0. If currently drinking a drinkable potion, walk safely without sprinting (abort only if rushed at low HP)
+    if (this.isConsuming && this.isDrinkingPotion) {
+      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500) || (dist < 3.0 && this.bot.health < 10)) {
+        try { this.bot.deactivateItem(); } catch (_) {}
+        this.isConsuming = false;
+        this.isDrinkingPotion = false;
+        return false;
+      }
+      this._moveAwayWalk(target);
+      return true;
+    }
+
     // Continue active quick-splash throw
     if (this.pendingSplashPotion) {
       return this._tickSplashPotionDownward(target, true);
@@ -676,33 +889,92 @@ class SurvivalModule {
     this._tryRefillHotbarPot();
 
     const potionCooldown = this.survCfg.potionCooldownMs || 450;
-    if ((now - this.lastPotionTime) < potionCooldown) return false;
 
-    // 1. Inline Instant Health splash when HP <= 13 (stays right in the fight!)
+    // 1. Inline Instant Health splash (or drinkable heal potion fallback) when HP <= 13
     const inlineThreshold = this.survCfg.inlinePotHealthThreshold || 13;
-    if (this.bot.health <= inlineThreshold) {
+    if (this.bot.health <= inlineThreshold && (now - this.lastPotionTime) >= potionCooldown) {
       const healPot = this.findHealingPotion();
       if (healPot) {
+        this.isXpMending = false;
         this.pendingSplashPotion = healPot;
         this.pendingSplashIsBuff = false;
         this._equipHotbarOrSafe(healPot);
         return this._tickSplashPotionDownward(target, true);
       }
+
+      const drinkHeal = this.findDrinkableHealPotion();
+      if (drinkHeal && (dist >= 3.5 || this.bot.health <= 9)) {
+        this.isXpMending = false;
+        this._startDrinkingPotion(drinkHeal);
+        this._moveAwayWalk(target);
+        return true;
+      }
     }
 
-    // 2. Splash combat buffs (Strength / Swiftness / FireRes) when safe & off cooldown
-    if ((now - this.lastBuffAttemptTime) >= 4000 && this.bot.health >= 14) {
+    // 2. XP Bottle armor mending when any worn armor piece drops below 45% durability
+    if (this.tickArmorXpMend(target)) {
+      return true;
+    }
+
+    // 3. Combat buff potions (Splash OR Drinkable Strength / Swiftness / FireRes / Regen / Turtle Master)
+    if ((now - this.lastPotionTime) >= potionCooldown && (now - this.lastBuffAttemptTime) >= 4000 && this.bot.health >= 12) {
       const buff = this.findNeededBuffPotion();
-      if (buff && buff.isSplash) {
-        this.lastBuffAttemptTime = now;
-        this.pendingSplashPotion = buff.item;
-        this.pendingSplashIsBuff = true;
-        this._equipHotbarOrSafe(buff.item);
-        return this._tickSplashPotionDownward(target, true);
+      if (buff) {
+        if (buff.isSplash) {
+          this.lastBuffAttemptTime = now;
+          this.pendingSplashPotion = buff.item;
+          this.pendingSplashIsBuff = true;
+          this._equipHotbarOrSafe(buff.item);
+          return this._tickSplashPotionDownward(target, true);
+        }
+
+        const drinkMinDist = this.survCfg.drinkableBuffMinDist !== undefined ? this.survCfg.drinkableBuffMinDist : 4.2;
+        if (this.survCfg.drinkablePotionEnabled !== false && (dist >= drinkMinDist || this.bot.health >= 16)) {
+          this.lastBuffAttemptTime = now;
+          this._startDrinkingPotion(buff.item);
+          this._moveAwayWalk(target);
+          return true;
+        }
       }
     }
 
     return false;
+  }
+
+  /**
+   * Drinks a regular `potion` (Strength, Swiftness, Fire Resistance, Healing, Regen, etc.)
+   * cleanly via Mineflayer's `bot.consume()` with timeout & anti-NoSlow sprint disable.
+   */
+  async _startDrinkingPotion(potionItem) {
+    if (this.isConsuming || this.equipBusy || this.totemEquipInFlight || !potionItem) return;
+    this.isConsuming = true;
+    this.isDrinkingPotion = true;
+    this.consumeStartTime = Date.now();
+    this.bot.setControlState('sprint', false);
+
+    const timeoutMs = this.survCfg.eatTimeoutMs || 3500;
+    let timeoutHandle = null;
+
+    try {
+      this._equipHotbarOrSafe(potionItem);
+      if (!this.bot.heldItem || this.bot.heldItem.type !== potionItem.type) {
+        await this.bot.equip(potionItem, 'hand');
+      }
+
+      await Promise.race([
+        this.bot.consume(),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error('drink_timeout')), timeoutMs);
+        })
+      ]);
+      this.lastPotionTime = Date.now();
+    } catch (_) {
+      try { this.bot.deactivateItem(); } catch (_) {}
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      this.isConsuming = false;
+      this.isDrinkingPotion = false;
+    }
   }
 
   _equipHotbarOrSafe(item) {
@@ -898,9 +1170,11 @@ class SurvivalModule {
 
   stopConsumption() {
     if (this.isConsuming) {
-      this.bot.deactivateItem();
+      try { this.bot.deactivateItem(); } catch (_) {}
       this.isConsuming = false;
+      this.isDrinkingPotion = false;
     }
+    this.isXpMending = false;
     this.pendingSplashPotion = null;
     this.pendingLosBlock = null;
     this.lowerShield();
@@ -1193,23 +1467,35 @@ class SurvivalModule {
 
     if (this.isConsuming) {
       this._moveAwayWalk(target);
-      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 2200)) {
-        this.bot.deactivateItem();
+      if ((now - this.consumeStartTime) > (this.survCfg.eatTimeoutMs || 3500)) {
+        try { this.bot.deactivateItem(); } catch (_) {}
         this.isConsuming = false;
+        this.isDrinkingPotion = false;
       }
       return;
     }
 
-    const potionCooldown = this.survCfg.potionCooldownMs || 900;
+    const potionCooldown = this.survCfg.potionCooldownMs || 450;
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.healHealthThreshold || 13) &&
+      this.bot.health <= (this.survCfg.healHealthThreshold || 11) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this.pendingSplashPotion = healPotion;
-      this._equipSafe(healPotion, 'hand');
+      this._equipHotbarOrSafe(healPotion);
       this._tickSplashPotionDownward(target);
+      return;
+    }
+
+    const drinkHeal = this.findDrinkableHealPotion();
+    if (
+      drinkHeal &&
+      this.bot.health <= (this.survCfg.healHealthThreshold || 11) &&
+      (now - this.lastPotionTime) >= potionCooldown
+    ) {
+      this._startDrinkingPotion(drinkHeal);
+      this._moveAwayWalk(target);
       return;
     }
 
