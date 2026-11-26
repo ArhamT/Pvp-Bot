@@ -67,6 +67,7 @@ class LiquidDenyModule {
     this.inFlight = false;
     this.lastActionAt = 0;
     this.lastOwnBucketHeldAt = 0;
+    this.lastScanAt = 0;
 
     this._onBlockUpdate = this._handleBlockUpdate.bind(this);
     if (this.bot && typeof this.bot.on === 'function') {
@@ -132,8 +133,50 @@ class LiquidDenyModule {
       pos: newBlock.position.floored(),
       key,
       liquid: newBlock.name,
-      detectedAt: now
+      detectedAt: now,
+      scoopAttempts: 0,
+      fromScan: false
     };
+  }
+
+  /**
+   * Scans nearby voxels for an unhandled water/lava source block within reach when carrying
+   * an empty bucket (catches pre-existing sources, multiBlockChange updates, or missed pickups).
+   */
+  _findNearestLiquidSource(maxRange, now) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
+      return null;
+    }
+    const eye = this._getEyePos();
+    const pos = this.bot.entity.position;
+    const bx = Math.floor(pos.x);
+    const by = Math.floor(pos.y);
+    const bz = Math.floor(pos.z);
+    const rInt = Math.min(4, Math.ceil(maxRange));
+
+    let best = null;
+    let bestDist = Infinity;
+    for (let dx = -rInt; dx <= rInt; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dz = -rInt; dz <= rInt; dz++) {
+          const bp = new Vec3(bx + dx, by + dy, bz + dz);
+          const key = posKey(bp);
+          const expiry = this.handledSources.get(key);
+          if (expiry && now < expiry) continue;
+
+          const b = this.bot.blockAt(bp);
+          if (!isLiquidSource(b)) continue;
+
+          const center = bp.offset(0.5, 0.5, 0.5);
+          const dist = eye.distanceTo(center);
+          if (dist <= maxRange && dist < bestDist) {
+            bestDist = dist;
+            best = { pos: bp, key, liquid: b.name };
+          }
+        }
+      }
+    }
+    return best;
   }
 
   _findItem(nameOrList) {
@@ -209,6 +252,27 @@ class LiquidDenyModule {
     }
 
     if (this.inFlight) return true;
+
+    const maxRange = this.cfg.maxRange !== undefined ? this.cfg.maxRange : 4.5;
+    const preferEmptyBucket = this.cfg.preferEmptyBucket !== false;
+    const emptyBucket = preferEmptyBucket ? this._findItem(['bucket']) : null;
+
+    // Active water/lava pickup scan when carrying an empty bucket (handles missed blockUpdates / pre-existing water)
+    if (!this.activeThreat && emptyBucket && (now - this.lastOwnBucketHeldAt) >= 450 && (now - this.lastScanAt) >= 150) {
+      this.lastScanAt = now;
+      const nearbySource = this._findNearestLiquidSource(Math.min(maxRange, 4.3), now);
+      if (nearbySource) {
+        this.activeThreat = {
+          pos: nearbySource.pos,
+          key: nearbySource.key,
+          liquid: nearbySource.liquid,
+          detectedAt: now,
+          scoopAttempts: 0,
+          fromScan: true
+        };
+      }
+    }
+
     if (!this.activeThreat) return false;
 
     const ttlMs = this.cfg.threatTtlMs !== undefined ? this.cfg.threatTtlMs : 1800;
@@ -224,7 +288,6 @@ class LiquidDenyModule {
       return false;
     }
 
-    const maxRange = this.cfg.maxRange !== undefined ? this.cfg.maxRange : 4.5;
     const center = pos.offset(0.5, 0.5, 0.5);
     if (this._getEyePos().distanceTo(center) > maxRange) {
       this.activeThreat = null;
@@ -232,16 +295,15 @@ class LiquidDenyModule {
     }
 
     const cooldownMs = this.cfg.cooldownMs !== undefined ? this.cfg.cooldownMs : 300;
-    if ((now - this.lastActionAt) < cooldownMs) {
+    if (!this.activeThreat.scoopAttempts && (now - this.lastActionAt) < cooldownMs) {
       return false;
     }
 
-    // Priority 1: Empty bucket -> scoop the placed water/lava source cleanly
-    const preferEmptyBucket = this.cfg.preferEmptyBucket !== false;
-    const emptyBucket = preferEmptyBucket ? this._findItem(['bucket']) : null;
+    // Priority 1: Empty bucket -> scoop the water/lava source cleanly (with 1-tick settle + 1 retry if server didn't register)
     if (emptyBucket) {
+      const aimTarget = this.activeThreat.scoopAttempts > 0 ? pos.offset(0.5, 0.25, 0.5) : center;
       if (this.aimer) {
-        this.aimer.stepTowardsPoint(center, { force: true });
+        this.aimer.stepTowardsPoint(aimTarget, { force: true });
       }
       const eq = this._ensureItemHeld(emptyBucket);
       if (eq.swapped || !eq.held) {
@@ -250,10 +312,21 @@ class LiquidDenyModule {
       if (typeof this.bot.activateItem === 'function') {
         this.bot.activateItem(false);
       }
-      this.handledSources.set(this.activeThreat.key, now + 2500);
+      this.activeThreat.scoopAttempts = (this.activeThreat.scoopAttempts || 0) + 1;
       this.lastActionAt = now;
-      this.activeThreat = null;
+
+      // If still a liquid source on next tick, allow 1 quick retry; after 2 attempts blacklist briefly
+      if (this.activeThreat.scoopAttempts >= 2) {
+        this.handledSources.set(this.activeThreat.key, now + 2500);
+        this.activeThreat = null;
+      }
       return true;
+    }
+
+    // Proximity-scanned sources are only for empty-bucket refilling, never unsolicited block placement
+    if (this.activeThreat.fromScan) {
+      this.activeThreat = null;
+      return false;
     }
 
     // Priority 2: No empty bucket -> place a solid block directly onto the source block

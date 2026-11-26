@@ -1659,12 +1659,8 @@ class PvPBotController {
       this.prediction.tick(target);
     }
 
-    // 1b. Immediate Water Bucket cobweb escape (place water -> pick up after 1 tick)
-    if (!totemSwapActive && this.ranged && this.ranged.tickCobwebEscape()) {
-      return;
-    }
-
-    // 1b2. Lava escape, stuck-in-block digging, rail/TNT-cart sprint evasion, and stall recovery
+    // 1b. Lava escape, 3-tier cobweb escape (water -> pearl -> sword dig), water shore climb,
+    //     stuck-in-block digging, rail/TNT-cart sprint evasion, and fast edge/stall recovery
     const isStationaryAction = Boolean(
       this.survival.isConsuming ||
       this.survival.isShielding ||
@@ -1688,10 +1684,9 @@ class PvPBotController {
       return;
     }
 
-    // 1b3. Liquid Denial: scoop enemy-placed water/lava with empty bucket, or cover with solid block
+    // 1b3. Liquid Denial: scoop water/lava sources into empty buckets, or cover enemy liquid with a solid block
     const suppressOwnLiquid = Boolean(
-      (this.ranged && this.ranged.cobwebState !== 'IDLE') ||
-      (this.escape && this.escape.lavaWaterState !== 'IDLE') ||
+      (this.escape && typeof this.escape.isManagingOwnLiquid === 'function' && this.escape.isManagingOwnLiquid()) ||
       (this.aerial && this.aerial.mode === 'CLUTCH')
     );
     if (!totemSwapActive && this.liquidDeny && this.liquidDeny.tick(target, { suppressOwnLiquid })) {

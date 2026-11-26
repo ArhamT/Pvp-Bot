@@ -8,7 +8,8 @@ const {
   SWORD_PRIORITY,
   AXE_PRIORITY,
   isSpearItem,
-  getItemMetadataText
+  getItemMetadataText,
+  findOverlappingBlock
 } = require('./constants');
 const { executeAttributeSwapAttack } = require('./mace_elytra');
 
@@ -1225,6 +1226,59 @@ class CombatModule {
    * - 2.2–2.7 blocks: hold/ease spacing while circle-strafing
    * - < 2.2 blocks: backpedal slightly while strafing
    */
+  /**
+   * Samples center + left/right 0.32b shoulder rays ahead at 0.55b and 0.95b to detect
+   * jumpable 1-block ledges AND 2-high block-edge snags while moving/strafing.
+   */
+  _inspectForwardAndShoulders(yaw) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
+      return { needLedgeJump: false, leftBlocked2High: false, rightBlocked2High: false };
+    }
+    const pos = this.bot.entity.position;
+    const fx = -Math.sin(yaw);
+    const fz = -Math.cos(yaw);
+    // Right perpendicular vector in Mineflayer coordinates
+    const rx = Math.cos(yaw);
+    const rz = -Math.sin(yaw);
+
+    let needLedgeJump = false;
+    let leftBlocked2High = false;
+    let rightBlocked2High = false;
+
+    const lanes = [
+      { side: 0, lateral: 0 },
+      { side: -1, lateral: -0.32 },
+      { side: 1, lateral: 0.32 }
+    ];
+
+    for (const lane of lanes) {
+      for (const dist of [0.55, 0.95]) {
+        const sx = pos.x + fx * dist + rx * lane.lateral;
+        const sz = pos.z + fz * dist + rz * lane.lateral;
+        const feet = this.bot.blockAt(new Vec3(sx, pos.y, sz));
+        const head = this.bot.blockAt(new Vec3(sx, pos.y + 1, sz));
+        const feetSolid = Boolean(feet && feet.boundingBox === 'block');
+        const headSolid = Boolean(head && head.boundingBox === 'block');
+
+        if (feetSolid && !headSolid) {
+          needLedgeJump = true;
+        } else if (feetSolid && headSolid) {
+          if (lane.side < 0) leftBlocked2High = true;
+          if (lane.side > 0) rightBlocked2High = true;
+        }
+      }
+    }
+
+    if (!needLedgeJump && this.bot.entity.isCollidedHorizontally) {
+      const centerHead = this.bot.blockAt(pos.offset(fx * 0.7, 1, fz * 0.7));
+      if (!centerHead || centerHead.boundingBox !== 'block') {
+        needLedgeJump = true;
+      }
+    }
+
+    return { needLedgeJump, leftBlocked2High, rightBlocked2High };
+  }
+
   _updateDynamicSpacingAndStrafe(reachDist, aimStatus) {
     const chaseDist = this.combatCfg.chaseDistance || 3.2;
     const optimalMax = this.combatCfg.optimalReachMax || 2.95;
@@ -1233,45 +1287,54 @@ class CombatModule {
 
     const facingTarget = aimStatus.yawErrorDeg < 35;
     const onGround = this.bot.entity.onGround;
+    const inWater = Boolean(
+      this.bot.entity.isInWater ||
+      findOverlappingBlock(this.bot, (b) => b.name === 'water' || b.name === 'flowing_water')
+    );
     const canSprint = facingTarget && this.bot.food > 6;
 
-    // 1-block ledge auto-step check
+    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips or 2-high block corners)
     const yaw = this.bot.entity.yaw;
-    const frontPos = this.bot.entity.position.offset(-Math.sin(yaw) * 0.9, 0, -Math.cos(yaw) * 0.9);
-    const frontFeet = this.bot.blockAt(frontPos);
-    const frontHead = this.bot.blockAt(frontPos.offset(0, 1, 0));
-    const needLedgeJump = frontFeet && frontFeet.boundingBox === 'block' &&
-      (!frontHead || frontHead.boundingBox !== 'block');
+    const { needLedgeJump, leftBlocked2High, rightBlocked2High } = this._inspectForwardAndShoulders(yaw);
+
+    // Slide cleanly away from a snagged 2-high corner edge instead of grinding against it
+    if (leftBlocked2High && !rightBlocked2High) {
+      this.strafeDirection = 1;
+    } else if (rightBlocked2High && !leftBlocked2High) {
+      this.strafeDirection = -1;
+    }
+
+    const shouldClimbOrSwim = inWater || (onGround && needLedgeJump);
 
     if (reachDist > chaseDist) {
-      // > 3.2 blocks: Sprint-jump chase toward target
+      // > 3.2 blocks: Sprint-jump chase toward target (always swim up in water)
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
-      this.bot.setControlState('sprint', canSprint);
-      this.bot.setControlState('jump', onGround && facingTarget);
+      this.bot.setControlState('sprint', canSprint && !(inWater && needLedgeJump));
+      this.bot.setControlState('jump', inWater || (onGround && (facingTarget || needLedgeJump)));
     } else if (reachDist > optimalMax || this.shieldBreakActive) {
       // 2.95–3.2 blocks (or rushing in for a sprint-hit shield break)
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
-      this.bot.setControlState('sprint', canSprint);
+      this.bot.setControlState('sprint', canSprint && !(inWater && needLedgeJump));
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', onGround && needLedgeJump);
+        this.bot.setControlState('jump', shouldClimbOrSwim);
       }
     } else if (reachDist >= optimalMin) {
       // 2.65–2.95 blocks: Optimal combat reach — aggressive forward-diagonal strafe pressure
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
-      this.bot.setControlState('sprint', canSprint && !this.critInProgress);
+      this.bot.setControlState('sprint', canSprint && !this.critInProgress && !(inWater && needLedgeJump));
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', onGround && needLedgeJump);
+        this.bot.setControlState('jump', shouldClimbOrSwim);
       }
     } else if (reachDist >= tooCloseDist) {
-      // 2.0–2.65 blocks: Keep diagonal pressure instead of stalling still
-      this.bot.setControlState('forward', reachDist > 2.35);
+      // 2.0–2.65 blocks: Keep diagonal pressure and climb edges / swim in water cleanly
+      this.bot.setControlState('forward', reachDist > 2.35 || needLedgeJump);
       this.bot.setControlState('back', false);
-      this.bot.setControlState('sprint', canSprint && reachDist > 2.4 && !this.critInProgress);
+      this.bot.setControlState('sprint', canSprint && reachDist > 2.4 && !this.critInProgress && !inWater);
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', false);
+        this.bot.setControlState('jump', shouldClimbOrSwim);
       }
     } else {
       // < 2.2 blocks: Backpedal slightly while strafing; if cornered, step forward-jump instead of stalling
@@ -1283,7 +1346,7 @@ class CombatModule {
       this.bot.setControlState('back', safeBack);
       this.bot.setControlState('sprint', false);
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', cornered && onGround);
+        this.bot.setControlState('jump', inWater || ((cornered || needLedgeJump) && onGround));
       }
     }
 

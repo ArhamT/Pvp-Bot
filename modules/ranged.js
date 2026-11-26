@@ -6,7 +6,8 @@ const {
   HAZARD_BLOCKS,
   PEARL_SPEED,
   PEARL_GRAVITY,
-  PEARL_DRAG
+  PEARL_DRAG,
+  findOverlappingBlock
 } = require('./constants');
 
 const ARROW_SPEED = 3.0;
@@ -1000,129 +1001,23 @@ class RangedModule {
   }
 
   /**
-   * Returns true if the bot's feet or head are currently trapped inside a cobweb.
+   * Returns true if any corner of the bot's 0.6-wide hitbox (feet or head) overlaps a cobweb.
    */
   isInCobweb() {
     if (!this.bot || !this.bot.entity) return false;
-    const pos = this.bot.entity.position;
-    const feet = this.bot.blockAt(pos);
-    const head = this.bot.blockAt(pos.offset(0, 1, 0));
     return Boolean(
-      (feet && feet.name === 'cobweb') ||
-      (head && head.name === 'cobweb')
+      this.bot.entity.isInWeb ||
+      findOverlappingBlock(this.bot, (b) => b.name === 'cobweb')
     );
   }
 
   /**
-   * 20-TPS handler for instant Water Bucket cobweb escape:
-   * If stuck in a cobweb, smoothly looks down at feet, places a water bucket to break the web,
-   * and picks the water back up after 1 tick (50ms).
-   * Returns true while actively clearing/picking up water.
+   * Cobweb escape (water bucket -> ender pearl -> sword dig) is owned by EscapeModule.
+   * Retained as a clean no-op stub for backward compatibility.
    */
   tickCobwebEscape() {
-    if (!this.bot || !this.bot.entity) return false;
-
-    // Phase 2: Pick water back up after 1 tick (50ms)
-    if (this.cobwebEscapeState === 'WAITING_PICKUP') {
-      if (this.waterPickupTicksRemaining > 0) {
-        this.waterPickupTicksRemaining--;
-      }
-      if (this.waterPickupTicksRemaining <= 0) {
-        this._pickupCobwebWater();
-        this.cobwebEscapeState = 'IDLE';
-        this.cobwebWaterPos = null;
-      }
-      return true;
-    }
-
-    // Phase 1: Currently aiming down to place water bucket
-    if (this.cobwebEscapeState === 'AIMING_PLACE') {
-      if (!this.isInCobweb()) {
-        this.cobwebEscapeState = 'IDLE';
-        return false;
-      }
-
-      const waterBucket = this._findItem('water_bucket');
-      if (!waterBucket) {
-        this.cobwebEscapeState = 'IDLE';
-        return false;
-      }
-
-      this.bot.setControlState('sprint', false);
-      const aimStatus = this.aimer.stepTowardsAngles(this.bot.entity.yaw, -Math.PI / 2, {
-        speedMultiplier: 1.5,
-        toleranceRad: 0.18
-      });
-
-      if (aimStatus.pitchErrorDeg <= 10) {
-        this.cobwebEscapeState = 'WAITING_PICKUP';
-        this.waterPickupTicksRemaining = this.rangedCfg.cobwebWaterPickupTicks || 1;
-        this._placeCobwebWater(waterBucket);
-      }
-      return true;
-    }
-
-    // Trigger check: stuck in a cobweb with a water bucket available
-    if (this.isInCobweb()) {
-      const waterBucket = this._findItem('water_bucket');
-      if (waterBucket) {
-        this.cancel(); // Cancel bow draw if any
-        this._equipSafe(waterBucket);
-        this.cobwebEscapeState = 'AIMING_PLACE';
-        return this.tickCobwebEscape();
-      }
-    }
-
+    this.cobwebEscapeState = 'IDLE';
     return false;
-  }
-
-  _equipHotbarImmediate(item) {
-    if (!item) return false;
-    if (this.bot.heldItem && this.bot.heldItem.type === item.type) return true;
-    const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || 36;
-    if (
-      item.slot >= hotbarStart &&
-      item.slot < hotbarStart + 9 &&
-      typeof this.bot.setQuickBarSlot === 'function'
-    ) {
-      this.bot.setQuickBarSlot(item.slot - hotbarStart);
-      return true;
-    }
-    return false;
-  }
-
-  _placeCobwebWater(waterBucket) {
-    if (this._equipHotbarImmediate(waterBucket)) {
-      this.cobwebWaterPos = this.bot.entity.position.floored();
-      this.bot.activateItem(false);
-      return;
-    }
-    this._equipSafe(waterBucket)
-      .then((ok) => {
-        if (!ok || !this.bot.entity) return;
-        this.cobwebWaterPos = this.bot.entity.position.floored();
-        this.bot.activateItem(false);
-      })
-      .catch(() => {});
-  }
-
-  _pickupCobwebWater() {
-    const emptyBucket = this._findItem('bucket');
-    if (!emptyBucket || this._equipHotbarImmediate(emptyBucket)) {
-      this.bot.activateItem(false);
-      setTimeout(() => {
-        try { this.bot.deactivateItem(); } catch (_) {}
-      }, 40);
-      return;
-    }
-    this._equipSafe(emptyBucket)
-      .then(() => {
-        this.bot.activateItem(false);
-        setTimeout(() => {
-          try { this.bot.deactivateItem(); } catch (_) {}
-        }, 40);
-      })
-      .catch(() => {});
   }
 
   // =========================================================================

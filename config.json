@@ -248,7 +248,7 @@
     "railEvadeRadius": 4.2,
     "railEvadeTicks": 12,
     "lavaWaterCooldownMs": 2500,
-    "stallTicksThreshold": 16,
+    "stallTicksThreshold": 10,
     "allowBlockDig": true
   },
   "liquidDeny": {

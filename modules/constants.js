@@ -113,6 +113,37 @@ function hasItemEnchant(item, enchantName) {
   return getItemMetadataText(item).includes(String(enchantName).toLowerCase());
 }
 
+/**
+ * Checks the bot's full 0.6-wide player hitbox (center + 4 corners at ±0.29) across feet (y)
+ * and head (y+1) and returns the first block matching `predicate`, or null.
+ * Prevents missing cobwebs, water, lava, or solid blocks that clip the edge of the player hitbox.
+ */
+function findOverlappingBlock(bot, predicate) {
+  if (!bot || !bot.entity || !bot.entity.position || typeof bot.blockAt !== 'function' || typeof predicate !== 'function') {
+    return null;
+  }
+  const pos = bot.entity.position;
+  const seen = new Set();
+  const offsets = [0, -0.29, 0.29];
+  for (const dy of [0, 1]) {
+    const by = Math.floor(pos.y + dy);
+    for (const ox of offsets) {
+      for (const oz of offsets) {
+        const bx = Math.floor(pos.x + ox);
+        const bz = Math.floor(pos.z + oz);
+        const key = `${bx},${by},${bz}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const block = bot.blockAt({ x: bx, y: by, z: bz });
+        if (block && predicate(block)) {
+          return block;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 module.exports = {
   OFFHAND_SLOT,
   HOTBAR_START,
@@ -128,5 +159,6 @@ module.exports = {
   isSpearItem,
   clearMovementControls,
   getItemMetadataText,
-  hasItemEnchant
+  hasItemEnchant,
+  findOverlappingBlock
 };

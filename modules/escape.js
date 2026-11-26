@@ -1,7 +1,8 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { HOTBAR_START, SWORD_PRIORITY, clearMovementControls } = require('./constants');
+const { HOTBAR_START, SWORD_PRIORITY, clearMovementControls, findOverlappingBlock } = require('./constants');
+const { isLiquidSource } = require('./liquid_deny');
 
 const RAIL_BLOCK_NAMES = new Set(['rail', 'powered_rail', 'detector_rail', 'activator_rail']);
 const UNBREAKABLE_BLOCKS = new Set(['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'reinforced_deepslate']);
@@ -51,6 +52,16 @@ class EscapeModule {
     this.lavaWaterTicks = 0;
     this.pearlSettleTicks = 0;
 
+    this.cobwebWaterState = 'IDLE'; // 'IDLE' | 'EQUIP_PLACE' | 'WAIT_CLEAR_AND_PICKUP'
+    this.cobwebWaterPos = null;
+    this.cobwebWaterTicks = 0;
+    this.cobwebWaterFailedUntil = 0;
+    this.cobwebPearlSettleTicks = 0;
+    this.lastCobwebPearlAt = 0;
+
+    this.waterStuckTicks = 0;
+    this.lastWaterCheckPos = null;
+
     this.evadeTargetPos = null;
     this.evadedRails = new Map();
     this.railBlockThreat = null;
@@ -89,6 +100,12 @@ class EscapeModule {
     this.lavaWaterState = 'IDLE';
     this.lavaWaterTicks = 0;
     this.pearlSettleTicks = 0;
+    this.cobwebWaterState = 'IDLE';
+    this.cobwebWaterPos = null;
+    this.cobwebWaterTicks = 0;
+    this.cobwebPearlSettleTicks = 0;
+    this.waterStuckTicks = 0;
+    this.lastWaterCheckPos = null;
     this.evadeTargetPos = null;
     this.railBlockThreat = null;
     this.stallTicks = 0;
@@ -156,17 +173,20 @@ class EscapeModule {
     return { held: false, swapped: false };
   }
 
+  isManagingOwnLiquid() {
+    return Boolean(this.lavaWaterState !== 'IDLE' || this.cobwebWaterState !== 'IDLE');
+  }
+
   isInLava() {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
     if (this.bot.entity.isInLava) return true;
-    if (typeof this.bot.blockAt !== 'function') return false;
-    const pos = this.bot.entity.position;
-    const feet = this.bot.blockAt(pos);
-    const head = this.bot.blockAt(pos.offset(0, 1, 0));
-    return Boolean(
-      (feet && (feet.name === 'lava' || feet.name === 'flowing_lava')) ||
-      (head && (head.name === 'lava' || head.name === 'flowing_lava'))
-    );
+    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'lava' || b.name === 'flowing_lava'));
+  }
+
+  isInWater() {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
+    if (this.bot.entity.isInWater) return true;
+    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'water' || b.name === 'flowing_water'));
   }
 
   isEmbeddedInSolidBlock() {
@@ -179,15 +199,42 @@ class EscapeModule {
     return null;
   }
 
+  findOverlappingCobweb() {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return null;
+    return findOverlappingBlock(this.bot, (b) => b.name === 'cobweb');
+  }
+
   isInCobwebWithoutWater() {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') return null;
     if (this._findItem('water_bucket')) return null;
-    const pos = this.bot.entity.position;
-    const feet = this.bot.blockAt(pos);
-    if (feet && feet.name === 'cobweb') return feet;
-    const head = this.bot.blockAt(pos.offset(0, 1, 0));
-    if (head && head.name === 'cobweb') return head;
-    return null;
+    return this.findOverlappingCobweb();
+  }
+
+  _findNearestWaterSource(centerPos, maxRadius = 3) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
+      return null;
+    }
+    const base = (centerPos || this.bot.entity.position).floored();
+    const eye = this.aimer && typeof this.aimer.getEyePosition === 'function'
+      ? this.aimer.getEyePosition()
+      : this.bot.entity.position.offset(0, 1.62, 0);
+
+    let best = null;
+    let bestDist = Infinity;
+    for (let dx = -maxRadius; dx <= maxRadius; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dz = -maxRadius; dz <= maxRadius; dz++) {
+          const bp = new Vec3(base.x + dx, base.y + dy, base.z + dz);
+          const b = this.bot.blockAt(bp);
+          if (!isLiquidSource(b) || b.name !== 'water') continue;
+          const dist = eye.distanceTo(bp.offset(0.5, 0.5, 0.5));
+          if (dist <= 4.3 && dist < bestDist) {
+            bestDist = dist;
+            best = bp;
+          }
+        }
+      }
+    }
+    return best;
   }
 
   findNearbyRailOrCartThreat(target) {
@@ -376,7 +423,7 @@ class EscapeModule {
     if (!block || !block.name) return null;
     const name = block.name;
     if (name === 'cobweb') {
-      return this._findItem(['shears', ...SWORD_PRIORITY]);
+      return this._findItem([...SWORD_PRIORITY, 'shears']);
     }
     if (name.includes('dirt') || name.includes('sand') || name.includes('gravel') || name.includes('soul_')) {
       return this._findItem(SHOVEL_PRIORITY);
@@ -420,17 +467,20 @@ class EscapeModule {
 
     if (this.lavaWaterState === 'PICKUP_WAIT') {
       this.lavaWaterTicks--;
-      if (this.lavaWaterTicks <= 0) {
-        const emptyBucket = this._findItem('bucket');
-        if (emptyBucket) {
-          const eq = this._ensureItemHeld(emptyBucket);
-          if (!eq.swapped) {
-            this.aimer.stepTowardsAngles(this.bot.entity.yaw, -Math.PI / 2, { speedMultiplier: 1.6, force: true });
-            if (typeof this.bot.activateItem === 'function') this.bot.activateItem(false);
+      const emptyBucket = this._findItem('bucket');
+      const waterSrc = this._findNearestWaterSource(this.bot.entity.position, 3);
+      if (emptyBucket && waterSrc) {
+        const eq = this._ensureItemHeld(emptyBucket);
+        this.aimer.stepTowardsPoint(waterSrc.offset(0.5, 0.35, 0.5), { speedMultiplier: 1.8, force: true });
+        if (!eq.swapped) {
+          if (typeof this.bot.activateItem === 'function') this.bot.activateItem(false);
+          if (this.lavaWaterTicks <= 0) {
             this.lavaWaterState = 'IDLE';
           }
-          return true;
         }
+        return true;
+      }
+      if (this.lavaWaterTicks <= 0) {
         this.lavaWaterState = 'IDLE';
       }
       return true;
@@ -534,6 +584,182 @@ class EscapeModule {
       Promise.resolve(this.bot.placeBlock(refBlock, new Vec3(0, 1, 0))).catch(() => {});
     }
     this.pillarActive = false;
+    return true;
+  }
+
+  /**
+   * Unified 3-tier Cobweb Escape (checks full 0.6-wide hitbox):
+   * 1. Water Bucket: equip (1-tick settle) -> place water on cobweb -> scoop water back into bucket.
+   * 2. Ender Pearl (when no water bucket or water failed): equip (1-tick settle) -> pearl out safely.
+   * 3. Sword / Shears break (when no water bucket and no ender pearl): equip sword & dig the cobweb.
+   */
+  _tickCobwebEscape(cobwebBlock, target) {
+    const now = Date.now();
+    this.activeMode = 'COBWEB_ESCAPE';
+    this.modeTicks++;
+
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('sneak', false);
+    }
+
+    // Active water placement / pickup sub-states
+    if (this.cobwebWaterState === 'EQUIP_PLACE') {
+      const wb = this._findItem('water_bucket');
+      const webPos = (cobwebBlock && cobwebBlock.position) || this.cobwebWaterPos;
+      if (!wb || !webPos) {
+        this.cobwebWaterState = 'IDLE';
+        this.cobwebWaterPos = null;
+        return false;
+      }
+      this.aimer.stepTowardsPoint(webPos.offset(0.5, 0.1, 0.5), { speedMultiplier: 1.8, force: true });
+      const eq = this._ensureItemHeld(wb);
+      if (eq.swapped || !eq.held) return true;
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
+      }
+      this.cobwebWaterState = 'WAIT_CLEAR_AND_PICKUP';
+      this.cobwebWaterTicks = 6;
+      return true;
+    }
+
+    if (this.cobwebWaterState === 'WAIT_CLEAR_AND_PICKUP') {
+      this.cobwebWaterTicks--;
+      const stillInWeb = Boolean(this.findOverlappingCobweb());
+      const emptyBucket = this._findItem('bucket');
+      const waterSrc = this._findNearestWaterSource(this.cobwebWaterPos || this.bot.entity.position, 3);
+
+      // Give server at least 1 tick to clear cobweb & update bucket before scooping back
+      if (this.cobwebWaterTicks <= 5 && emptyBucket && waterSrc && (!stillInWeb || this.cobwebWaterTicks <= 3)) {
+        this.aimer.stepTowardsPoint(waterSrc.offset(0.5, 0.35, 0.5), { speedMultiplier: 1.8, force: true });
+        const eq = this._ensureItemHeld(emptyBucket);
+        if (!eq.swapped && eq.held) {
+          if (typeof this.bot.activateItem === 'function') {
+            this.bot.activateItem(false);
+          }
+          this.cobwebWaterState = 'IDLE';
+          this.cobwebWaterPos = null;
+          this.activeMode = 'IDLE';
+        }
+        return true;
+      }
+
+      if (this.cobwebWaterTicks <= 0 || (!stillInWeb && !emptyBucket)) {
+        if (stillInWeb) {
+          this.cobwebWaterFailedUntil = now + 3000;
+        }
+        this.cobwebWaterState = 'IDLE';
+        this.cobwebWaterPos = null;
+        this.activeMode = 'IDLE';
+        return false;
+      }
+      return true;
+    }
+
+    if (!cobwebBlock) {
+      this.activeMode = 'IDLE';
+      return false;
+    }
+
+    // Tier 1: Water Bucket
+    const waterBucket = now >= this.cobwebWaterFailedUntil ? this._findItem('water_bucket') : null;
+    if (waterBucket) {
+      this.cobwebWaterPos = cobwebBlock.position.floored();
+      this.aimer.stepTowardsPoint(this.cobwebWaterPos.offset(0.5, 0.1, 0.5), { speedMultiplier: 1.8, force: true });
+      const eq = this._ensureItemHeld(waterBucket);
+      if (eq.swapped || !eq.held) {
+        this.cobwebWaterState = 'EQUIP_PLACE';
+        return true;
+      }
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
+      }
+      this.cobwebWaterState = 'WAIT_CLEAR_AND_PICKUP';
+      this.cobwebWaterTicks = 6;
+      return true;
+    }
+
+    // Tier 2: Ender Pearl (when no water bucket is available or water failed)
+    const pearl = (now - this.lastCobwebPearlAt) >= 2000 ? this._findItem('ender_pearl') : null;
+    if (pearl) {
+      const openExit = this._findBestEscapeYaw(null, true);
+      const escapeYaw = openExit
+        ? openExit.yaw
+        : (target && target.position
+            ? Math.atan2(-(target.position.x - this.bot.entity.position.x), -(target.position.z - this.bot.entity.position.z))
+            : this.bot.entity.yaw);
+      this.aimer.stepTowardsAngles(escapeYaw, 28 * (Math.PI / 180), { speedMultiplier: 1.6, force: true });
+      const eq = this._ensureItemHeld(pearl);
+      if (eq.swapped || !eq.held) {
+        this.cobwebPearlSettleTicks = 1;
+        return true;
+      }
+      if (this.cobwebPearlSettleTicks > 0) {
+        this.cobwebPearlSettleTicks--;
+        return true;
+      }
+      if (typeof this.bot.activateItem === 'function') {
+        this.bot.activateItem(false);
+      }
+      this.lastCobwebPearlAt = now;
+      this.activeMode = 'IDLE';
+      return true;
+    }
+
+    // Tier 3: Break cobweb with Sword (or shears fallback) when no water bucket & no ender pearl
+    return this._tickBlockStuckEscape(cobwebBlock, true);
+  }
+
+  /**
+   * Prevents the bot from sinking or stalling against 1-block banks while in water.
+   */
+  _tickWaterEscape(target) {
+    if (!this.isInWater()) {
+      this.waterStuckTicks = 0;
+      this.lastWaterCheckPos = null;
+      return false;
+    }
+
+    const pos = this.bot.entity.position;
+    const headBlock = typeof this.bot.blockAt === 'function' ? this.bot.blockAt(pos.offset(0, 1, 0)) : null;
+    const headSubmerged = Boolean(headBlock && (headBlock.name === 'water' || headBlock.name === 'flowing_water'));
+
+    if (this.lastWaterCheckPos) {
+      const dx = pos.x - this.lastWaterCheckPos.x;
+      const dz = pos.z - this.lastWaterCheckPos.z;
+      const moved = Math.sqrt(dx * dx + dz * dz);
+      if (moved < 0.06 || this.bot.entity.isCollidedHorizontally || headSubmerged) {
+        this.waterStuckTicks++;
+      } else {
+        this.waterStuckTicks = 0;
+      }
+    }
+    this.lastWaterCheckPos = pos.clone();
+
+    if (!headSubmerged && this.waterStuckTicks < 4) {
+      return false;
+    }
+
+    this.activeMode = 'WATER_ESCAPE';
+    const dryShore = this._findBestEscapeYaw(null, true);
+    const desiredYaw = dryShore
+      ? dryShore.yaw
+      : (target && target.position
+          ? Math.atan2(-(target.position.x - pos.x), -(target.position.z - pos.z))
+          : this.bot.entity.yaw);
+
+    if (this.aimer) {
+      this.aimer.stepTowardsAngles(desiredYaw, 0.12, { speedMultiplier: 1.5 });
+    }
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('sneak', false);
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('forward', true);
+      this.bot.setControlState('back', false);
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
+      this.bot.setControlState('jump', true);
+    }
     return true;
   }
 
@@ -676,8 +902,8 @@ class EscapeModule {
         this.bot.setControlState('back', false);
         this.bot.setControlState('left', false);
         this.bot.setControlState('right', false);
-        this.bot.setControlState('sprint', this.bot.food > 6);
-        this.bot.setControlState('jump', Boolean(this.bot.entity.onGround));
+        this.bot.setControlState('sprint', this.bot.food > 6 && !this.isInWater());
+        this.bot.setControlState('jump', Boolean(this.bot.entity.onGround || this.isInWater()));
       }
       return true;
     }
@@ -700,15 +926,15 @@ class EscapeModule {
     if (this.lastCheckPos) {
       const dx = pos.x - this.lastCheckPos.x;
       const dz = pos.z - this.lastCheckPos.z;
-      if (Math.sqrt(dx * dx + dz * dz) < 0.035) {
-        this.stallTicks++;
+      if (Math.sqrt(dx * dx + dz * dz) < 0.04) {
+        this.stallTicks += this.bot.entity.isCollidedHorizontally ? 2 : 1;
       } else {
         this.stallTicks = 0;
       }
     }
     this.lastCheckPos = pos.clone();
 
-    const threshold = this.escapeCfg.stallTicksThreshold || 16;
+    const threshold = this.escapeCfg.stallTicksThreshold || 10;
     if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 1200) {
       return false;
     }
@@ -762,15 +988,23 @@ class EscapeModule {
       return this._tickLavaEscape(target);
     }
 
+    const overlappingCobweb = this.findOverlappingCobweb();
+    if (overlappingCobweb || this.cobwebWaterState !== 'IDLE') {
+      return this._tickCobwebEscape(overlappingCobweb, target);
+    }
+
     const embedded = this.isEmbeddedInSolidBlock();
-    const cobwebNoWater = this.isInCobwebWithoutWater();
-    if (embedded || cobwebNoWater || this.diggingInProgress) {
-      return this._tickBlockStuckEscape(embedded || cobwebNoWater, Boolean(cobwebNoWater));
+    if (embedded || this.diggingInProgress) {
+      return this._tickBlockStuckEscape(embedded, false);
     }
 
     const railThreat = this.findNearbyRailOrCartThreat(target);
     if (this.activeMode === 'RAIL_EVADE' || railThreat) {
       return this._tickRailCartEvade(railThreat);
+    }
+
+    if (this._tickWaterEscape(target)) {
+      return true;
     }
 
     if (this._tickStallUnstick(target, context)) {
