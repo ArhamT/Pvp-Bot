@@ -1,6 +1,6 @@
 'use strict';
 
-const { posKey, findOverlappingBlock } = require('./constants');
+const { posKey, findOverlappingBlock, isPlayerEmbeddedInBlock } = require('./constants');
 const { findInventoryItem, ensureItemHeld } = require('./inventory_utils');
 const { cobwebEscapeMethods } = require('./escape/cobweb_escape');
 const { liquidEscapeMethods } = require('./escape/liquid_escape');
@@ -149,9 +149,11 @@ class EscapeModule {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') return null;
     const pos = this.bot.entity.position;
     const head = this.bot.blockAt(pos.offset(0, 1, 0));
-    if (head && head.boundingBox === 'block') return head;
+    if (isPlayerEmbeddedInBlock(pos, head)) return head;
+    const headTop = this.bot.blockAt(pos.offset(0, 1.6, 0));
+    if (headTop && headTop !== head && isPlayerEmbeddedInBlock(pos, headTop)) return headTop;
     const feet = this.bot.blockAt(pos);
-    if (feet && feet.boundingBox === 'block') return feet;
+    if (isPlayerEmbeddedInBlock(pos, feet)) return feet;
     return null;
   }
 

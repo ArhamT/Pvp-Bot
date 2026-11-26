@@ -177,6 +177,187 @@ function isLiquidSource(block) {
   return true;
 }
 
+const PARTIAL_NON_SUFFOCATING_PATTERN = /slab|stairs|trapdoor|carpet|snow|farmland|dirt_path|grass_path|soul_sand|chest|bed|daylight_detector|enchanting_table|pressure_plate|fence|_wall|cake|hopper|cauldron|lantern|anvil|brewing_stand|composter|lectern|stonecutter|scaffolding|lily_pad|end_rod|chain|iron_bars|glass_pane/;
+
+/**
+ * Returns the world-space vertical collision bounds `{ minY, maxY }` of a solid block,
+ * or `null` if non-solid/passable. Uses `block.shapes` (exact prismarine-block AABBs)
+ * when available, with accurate fallbacks for slabs, trapdoors, stairs, carpets, paths, etc.
+ */
+function getBlockCollisionBounds(block) {
+  if (!block || block.boundingBox !== 'block') return null;
+  const by = block.position ? Math.floor(block.position.y) : 0;
+
+  if (Array.isArray(block.shapes)) {
+    if (block.shapes.length === 0) return null;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const s of block.shapes) {
+      if (!Array.isArray(s) || s.length < 6) continue;
+      if (s[1] < minY) minY = s[1];
+      if (s[4] > maxY) maxY = s[4];
+    }
+    if (minY === Infinity || maxY === -Infinity) return null;
+    return { minY: by + minY, maxY: by + maxY };
+  }
+
+  const name = String(block.name || '');
+  let props = null;
+  if (typeof block.getProperties === 'function') {
+    try {
+      props = block.getProperties();
+    } catch (_) {
+      props = null;
+    }
+  }
+
+  if (name.includes('carpet')) return { minY: by, maxY: by + 0.0625 };
+  if (name.includes('trapdoor')) {
+    if (props && (props.open === true || props.open === 'true')) {
+      return { minY: by, maxY: by + 1.0 };
+    }
+    if (props && props.half === 'top') {
+      return { minY: by + 0.8125, maxY: by + 1.0 };
+    }
+    return { minY: by, maxY: by + 0.1875 };
+  }
+  if (name.includes('slab')) {
+    if (props && props.type === 'double') return { minY: by, maxY: by + 1.0 };
+    if (props && props.type === 'top') return { minY: by + 0.5, maxY: by + 1.0 };
+    return { minY: by, maxY: by + 0.5 };
+  }
+  if (name === 'snow') {
+    const layers = props && props.layers !== undefined ? Number(props.layers) : 1;
+    if (layers <= 1) return null;
+    return { minY: by, maxY: by + Math.min(1.0, (layers - 1) * 0.125) };
+  }
+  if (name.includes('daylight_detector')) return { minY: by, maxY: by + 0.375 };
+  if (name.includes('bed')) return { minY: by, maxY: by + 0.5625 };
+  if (name === 'enchanting_table') return { minY: by, maxY: by + 0.75 };
+  if (name === 'soul_sand' || name.includes('chest')) return { minY: by, maxY: by + 0.875 };
+  if (name === 'farmland' || name === 'dirt_path' || name === 'grass_path') return { minY: by, maxY: by + 0.9375 };
+  if (name.includes('fence') || name.endsWith('_wall')) return { minY: by, maxY: by + 1.5 };
+
+  return { minY: by, maxY: by + 1.0 };
+}
+
+/**
+ * Returns true only if the player's inner body hitbox at `pos` is genuinely embedded inside
+ * `block`'s collision geometry. Standing ON a slab, trapdoor, stair, carpet, path, etc. returns false.
+ */
+function isPlayerEmbeddedInBlock(pos, block) {
+  if (!pos || !block || block.boundingBox !== 'block') return false;
+  const bx = block.position ? Math.floor(block.position.x) : Math.floor(pos.x);
+  const by = block.position ? Math.floor(block.position.y) : Math.floor(pos.y);
+  const bz = block.position ? Math.floor(block.position.z) : Math.floor(pos.z);
+
+  const pMinX = pos.x - 0.18;
+  const pMaxX = pos.x + 0.18;
+  const pMinY = pos.y + 0.12;
+  const pMaxY = pos.y + 1.72;
+  const pMinZ = pos.z - 0.18;
+  const pMaxZ = pos.z + 0.18;
+
+  if (Array.isArray(block.shapes)) {
+    if (block.shapes.length === 0) return false;
+    for (const s of block.shapes) {
+      if (!Array.isArray(s) || s.length < 6) continue;
+      if (
+        (bx + s[3]) > pMinX && (bx + s[0]) < pMaxX &&
+        (by + s[4]) > pMinY && (by + s[1]) < pMaxY &&
+        (bz + s[5]) > pMinZ && (bz + s[2]) < pMaxZ
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const name = String(block.name || '');
+  const bounds = getBlockCollisionBounds(block);
+  if (!bounds) return false;
+
+  if (PARTIAL_NON_SUFFOCATING_PATTERN.test(name) && (pos.y - by) > 0.02) {
+    return false;
+  }
+
+  return bounds.maxY > pMinY && bounds.minY < pMaxY;
+}
+
+/**
+ * Evaluates walkability, auto-step (<= 0.6b), jumpable ledge (0.6..1.25b), headroom,
+ * and immediate floor support at column `(x, z)` from feet height `y`.
+ * Handles slabs, trapdoors, stairs, carpets, snow layers, paths, and floating slab bridges.
+ */
+function inspectColumnStep(bot, x, y, z) {
+  const result = {
+    walkable: true,
+    needsJump: false,
+    blocked: false,
+    hasFloor: false,
+    stepHeight: 0,
+    targetFeetY: y
+  };
+  if (!bot || typeof bot.blockAt !== 'function') return result;
+
+  const bx = Math.floor(x);
+  const by = Math.floor(y);
+  const bz = Math.floor(z);
+
+  const solids = [];
+  let bestStepTop = null;
+  let supportTop = null;
+
+  for (let dy = -1; dy <= 2; dy++) {
+    const b = bot.blockAt(new Vec3(bx, by + dy, bz));
+    if (!b) continue;
+    const bounds = getBlockCollisionBounds(b);
+    if (!bounds) continue;
+    solids.push(bounds);
+
+    if (dy <= 1) {
+      if (bounds.maxY > y + 0.02 && bounds.maxY <= y + 1.25) {
+        if (bestStepTop === null || bounds.maxY > bestStepTop) {
+          bestStepTop = bounds.maxY;
+        }
+      } else if (dy <= 0 && bounds.maxY <= y + 0.05) {
+        if (supportTop === null || bounds.maxY > supportTop) {
+          supportTop = bounds.maxY;
+        }
+      }
+    }
+  }
+
+  if (bestStepTop !== null) {
+    result.targetFeetY = bestStepTop;
+    result.stepHeight = bestStepTop - y;
+    result.hasFloor = true;
+  } else if (supportTop !== null) {
+    result.targetFeetY = supportTop;
+    result.stepHeight = 0;
+    result.hasFloor = true;
+  }
+
+  for (const bounds of solids) {
+    if (bounds.maxY > result.targetFeetY + 0.05 && bounds.minY < result.targetFeetY + 1.75) {
+      result.blocked = true;
+      result.walkable = false;
+      result.needsJump = false;
+      return result;
+    }
+  }
+
+  if (result.stepHeight > 0.6) {
+    result.walkable = false;
+    result.needsJump = true;
+  } else {
+    result.walkable = true;
+    result.needsJump = false;
+  }
+
+  return result;
+}
+
 module.exports = {
   OFFHAND_SLOT,
   HOTBAR_START,
@@ -196,5 +377,8 @@ module.exports = {
   findOverlappingBlock,
   posKey,
   isAirLike,
-  isLiquidSource
+  isLiquidSource,
+  getBlockCollisionBounds,
+  isPlayerEmbeddedInBlock,
+  inspectColumnStep
 };

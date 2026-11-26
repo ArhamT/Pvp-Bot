@@ -7,7 +7,8 @@ const {
   PEARL_SPEED,
   PEARL_GRAVITY,
   PEARL_DRAG,
-  findOverlappingBlock
+  findOverlappingBlock,
+  inspectColumnStep
 } = require('./constants');
 
 const ARROW_SPEED = 3.0;
@@ -941,17 +942,24 @@ class RangedModule {
     const feetBlock = this.bot.blockAt(pos);
     const headBlock = this.bot.blockAt(pos.offset(0, 1, 0));
 
-    // Check immediate body collisions & hazardous blocks
-    if (feetBlock && (feetBlock.boundingBox === 'block' || this.isHazardBlock(feetBlock))) {
+    // Check immediate hazardous blocks (lava, fire, cobweb)
+    if (feetBlock && this.isHazardBlock(feetBlock)) {
       return false;
     }
-    if (headBlock && (headBlock.boundingBox === 'block' || this.isHazardBlock(headBlock))) {
+    if (headBlock && this.isHazardBlock(headBlock)) {
+      return false;
+    }
+
+    // Use true collision height so walking across slabs, trapdoors, stairs, carpets, and paths
+    // (auto-step <= 0.6b) is walkable and floating slab bridges count as solid floor support.
+    const col = inspectColumnStep(this.bot, pos.x, pos.y, pos.z);
+    if (col.blocked || col.needsJump) {
       return false;
     }
 
     // Column check below feet for lava/fire/cobweb floor and void edges / dangerous cliffs
     const maxDrop = this.rangedCfg.maxSafeDropBlocks || 3;
-    let foundSolidFloor = false;
+    let foundSolidFloor = col.hasFloor;
 
     for (let depth = 1; depth <= maxDrop + 1; depth++) {
       const below = this.bot.blockAt(pos.offset(0, -depth, 0));

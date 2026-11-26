@@ -9,7 +9,8 @@ const {
   AXE_PRIORITY,
   isSpearItem,
   getItemMetadataText,
-  findOverlappingBlock
+  findOverlappingBlock,
+  inspectColumnStep
 } = require('./constants');
 const { executeAttributeSwapAttack } = require('./mace_elytra');
 
@@ -901,14 +902,18 @@ class CombatModule {
     const stepZ = -Math.cos(sideYaw) * 1.1;
 
     const pos = this.bot.entity.position;
-    const feetBlock = this.bot.blockAt(pos.offset(stepX, 0, stepZ));
-    const headBlock = this.bot.blockAt(pos.offset(stepX, 1, stepZ));
-    const below1 = this.bot.blockAt(pos.offset(stepX, -1, stepZ));
-    const below2 = this.bot.blockAt(pos.offset(stepX, -2, stepZ));
+    const targetPos = pos.offset(stepX, 0, stepZ);
+    const feetBlock = this.bot.blockAt(targetPos);
+    const headBlock = this.bot.blockAt(targetPos.offset(0, 1, 0));
+    const below1 = this.bot.blockAt(targetPos.offset(0, -1, 0));
+    const below2 = this.bot.blockAt(targetPos.offset(0, -2, 0));
 
-    const blocked = (feetBlock && (feetBlock.boundingBox === 'block' || feetBlock.name === 'cobweb')) ||
-      (headBlock && (headBlock.boundingBox === 'block' || headBlock.name === 'cobweb'));
-    const dangerousDrop = (!below1 || below1.boundingBox !== 'block') &&
+    const col = inspectColumnStep(this.bot, targetPos.x, pos.y, targetPos.z);
+    const blocked = col.blocked || col.needsJump ||
+      (feetBlock && feetBlock.name === 'cobweb') ||
+      (headBlock && headBlock.name === 'cobweb');
+    const dangerousDrop = !col.hasFloor &&
+      (!below1 || below1.boundingBox !== 'block') &&
       (!below2 || below2.boundingBox !== 'block');
     const hazard = (feetBlock && (feetBlock.name.includes('lava') || feetBlock.name.includes('fire'))) ||
       (below1 && (below1.name.includes('lava') || below1.name.includes('fire')));
@@ -931,12 +936,15 @@ class CombatModule {
     const backZ = Math.cos(yaw) * 1.0;
 
     const pos = this.bot.entity.position;
-    const feetBlock = this.bot.blockAt(pos.offset(backX, 0, backZ));
-    const below1 = this.bot.blockAt(pos.offset(backX, -1, backZ));
-    const below2 = this.bot.blockAt(pos.offset(backX, -2, backZ));
+    const targetPos = pos.offset(backX, 0, backZ);
+    const feetBlock = this.bot.blockAt(targetPos);
+    const below1 = this.bot.blockAt(targetPos.offset(0, -1, 0));
+    const below2 = this.bot.blockAt(targetPos.offset(0, -2, 0));
 
-    const blocked = feetBlock && (feetBlock.boundingBox === 'block' || feetBlock.name === 'cobweb');
-    const dangerousDrop = (!below1 || below1.boundingBox !== 'block') &&
+    const col = inspectColumnStep(this.bot, targetPos.x, pos.y, targetPos.z);
+    const blocked = col.blocked || col.needsJump || (feetBlock && feetBlock.name === 'cobweb');
+    const dangerousDrop = !col.hasFloor &&
+      (!below1 || below1.boundingBox !== 'block') &&
       (!below2 || below2.boundingBox !== 'block');
     const hazard = (feetBlock && (feetBlock.name.includes('lava') || feetBlock.name.includes('fire'))) ||
       (below1 && (below1.name.includes('lava') || below1.name.includes('fire')));
@@ -961,10 +969,8 @@ class CombatModule {
     const nx = dx / len;
     const nz = dz / len;
     for (const step of [1.2, 2.2, 3.2]) {
-      const sample = pos.offset(nx * step, 0, nz * step);
-      const b0 = this.bot.blockAt(sample);
-      const b1 = this.bot.blockAt(sample.offset(0, 1, 0));
-      if (b0 && b0.boundingBox === 'block' && b1 && b1.boundingBox === 'block') {
+      const col = inspectColumnStep(this.bot, pos.x + nx * step, pos.y, pos.z + nz * step);
+      if (col.blocked) {
         return true;
       }
     }
@@ -1255,14 +1261,11 @@ class CombatModule {
       for (const dist of [0.55, 0.95]) {
         const sx = pos.x + fx * dist + rx * lane.lateral;
         const sz = pos.z + fz * dist + rz * lane.lateral;
-        const feet = this.bot.blockAt(new Vec3(sx, pos.y, sz));
-        const head = this.bot.blockAt(new Vec3(sx, pos.y + 1, sz));
-        const feetSolid = Boolean(feet && feet.boundingBox === 'block');
-        const headSolid = Boolean(head && head.boundingBox === 'block');
+        const col = inspectColumnStep(this.bot, sx, pos.y, sz);
 
-        if (feetSolid && !headSolid) {
+        if (col.needsJump) {
           needLedgeJump = true;
-        } else if (feetSolid && headSolid) {
+        } else if (col.blocked) {
           if (lane.side < 0) leftBlocked2High = true;
           if (lane.side > 0) rightBlocked2High = true;
         }
@@ -1270,8 +1273,8 @@ class CombatModule {
     }
 
     if (!needLedgeJump && this.bot.entity.isCollidedHorizontally) {
-      const centerHead = this.bot.blockAt(pos.offset(fx * 0.7, 1, fz * 0.7));
-      if (!centerHead || centerHead.boundingBox !== 'block') {
+      const centerCol = inspectColumnStep(this.bot, pos.x + fx * 0.7, pos.y, pos.z + fz * 0.7);
+      if (!centerCol.blocked) {
         needLedgeJump = true;
       }
     }

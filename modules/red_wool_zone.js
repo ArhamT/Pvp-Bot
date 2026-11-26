@@ -1,7 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { ROAM_HAZARD_BLOCKS, clearMovementControls } = require('./constants');
+const { ROAM_HAZARD_BLOCKS, clearMovementControls, inspectColumnStep } = require('./constants');
 const { normalizeAngle } = require('./aim');
 
 const DEFAULT_RED_WOOL_NAMES = ['red_wool'];
@@ -350,13 +350,13 @@ class RedWoolZoneModule {
       yawErrorDeg = aimStatus.yawErrorDeg;
     }
 
-    // Check 1 block ahead for a step-up block
+    // Check 1 block ahead for a jumpable step-up (> 0.6b; ignores flat slabs/trapdoors/carpets)
     let stepUp = false;
     if (typeof this.bot.blockAt === 'function' && horizDist > 0.2) {
       const nx = dx / horizDist;
       const nz = dz / horizDist;
-      const aheadFeet = this.bot.blockAt(new Vec3(Math.floor(pos.x + nx * 0.9), Math.floor(pos.y), Math.floor(pos.z + nz * 0.9)));
-      if (aheadFeet && aheadFeet.boundingBox === 'block') {
+      const col = inspectColumnStep(this.bot, pos.x + nx * 0.9, pos.y, pos.z + nz * 0.9);
+      if (col.needsJump) {
         stepUp = true;
       }
     }

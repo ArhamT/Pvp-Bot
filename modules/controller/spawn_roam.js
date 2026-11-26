@@ -1,7 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { ROAM_HAZARD_BLOCKS, clearMovementControls } = require('../constants');
+const { ROAM_HAZARD_BLOCKS, clearMovementControls, inspectColumnStep } = require('../constants');
 const { normalizeAngle } = require('../aim');
 
 /**
@@ -108,7 +108,6 @@ const spawnRoamMethods = {
 
     const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
     const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
-    const aheadAbove = this.bot.blockAt(new Vec3(stepX, baseY + 2, stepZ));
     const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
     const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
 
@@ -120,16 +119,13 @@ const spawnRoamMethods = {
       return { safe: false, shouldStepUp: false };
     }
 
-    const solidFeet = Boolean(aheadFeet && aheadFeet.boundingBox === 'block');
-    const solidHead = Boolean(aheadHead && aheadHead.boundingBox === 'block');
-    const solidAbove = Boolean(aheadAbove && aheadAbove.boundingBox === 'block');
-
-    if (solidHead || (solidFeet && solidAbove)) {
+    const col = inspectColumnStep(this.bot, stepX, pos.y, stepZ);
+    if (col.blocked) {
       return { safe: false, shouldStepUp: false };
     }
 
     const hasSupport =
-      solidFeet ||
+      col.hasFloor ||
       Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
       Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
     if (!hasSupport) {
@@ -138,7 +134,7 @@ const spawnRoamMethods = {
 
     return {
       safe: true,
-      shouldStepUp: solidFeet && !solidHead && !solidAbove && Boolean(this.bot.entity.onGround)
+      shouldStepUp: col.needsJump && Boolean(this.bot.entity.onGround)
     };
   },
 

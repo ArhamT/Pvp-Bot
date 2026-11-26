@@ -1,7 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { SWORD_PRIORITY, AXE_PRIORITY, clearMovementControls, posKey } = require('../constants');
+const { SWORD_PRIORITY, AXE_PRIORITY, clearMovementControls, posKey, inspectColumnStep } = require('../constants');
 
 const RAIL_BLOCK_NAMES = new Set(['rail', 'powered_rail', 'detector_rail', 'activator_rail']);
 const UNBREAKABLE_BLOCKS = new Set(['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'reinforced_deepslate']);
@@ -130,12 +130,9 @@ const hazardUnstickMethods = {
       let hasFloor = false;
 
       if (Math.abs(dx) > 0.25 && Math.abs(dz) > 0.25) {
-        const cx = this.bot.blockAt(base.offset(Math.sign(dx) * 0.9, 0, 0));
-        const cz = this.bot.blockAt(base.offset(0, 0, Math.sign(dz) * 0.9));
-        const cxH = this.bot.blockAt(base.offset(Math.sign(dx) * 0.9, 1, 0));
-        const czH = this.bot.blockAt(base.offset(0, 0, Math.sign(dz) * 0.9));
-        if (((cx && cx.boundingBox === 'block') || (cxH && cxH.boundingBox === 'block')) &&
-            ((cz && cz.boundingBox === 'block') || (czH && czH.boundingBox === 'block'))) {
+        const cxCol = inspectColumnStep(this.bot, base.x + Math.sign(dx) * 0.9, base.y, base.z);
+        const czCol = inspectColumnStep(this.bot, base.x, base.y, base.z + Math.sign(dz) * 0.9);
+        if ((cxCol.blocked || cxCol.needsJump) && (czCol.blocked || czCol.needsJump)) {
           continue;
         }
       }
@@ -144,31 +141,26 @@ const hazardUnstickMethods = {
         const sample = base.offset(dx * dist, 0, dz * dist);
         const f = this.bot.blockAt(sample);
         const h = this.bot.blockAt(sample.offset(0, 1, 0));
-        const a = this.bot.blockAt(sample.offset(0, 2, 0));
 
         const fLava = f && (f.name.includes('lava') || f.name.includes('fire'));
         const hLava = h && (h.name.includes('lava') || h.name.includes('fire'));
         if (fLava || hLava) hasLava = true;
 
-        if (h && h.boundingBox === 'block') {
-          if (allowStepUp && (!a || a.boundingBox !== 'block') && (!f || f.boundingBox !== 'block')) {
-            needsJump = true;
-          } else {
-            blocked = true;
-            break;
-          }
-        }
-        if (f && f.boundingBox === 'block') {
-          if (allowStepUp && (!h || h.boundingBox !== 'block') && (!a || a.boundingBox !== 'block')) {
-            needsJump = true;
-          } else {
-            blocked = true;
-            break;
-          }
-        }
         if (f && f.name === 'cobweb') {
           blocked = true;
           break;
+        }
+
+        const col = inspectColumnStep(this.bot, sample.x, base.y, sample.z);
+        if (col.blocked || (col.needsJump && !allowStepUp)) {
+          blocked = true;
+          break;
+        }
+        if (col.needsJump) {
+          needsJump = true;
+        }
+        if (col.hasFloor) {
+          hasFloor = true;
         }
 
         for (let down = 1; down <= 3; down++) {
