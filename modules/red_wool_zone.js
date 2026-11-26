@@ -50,7 +50,29 @@ class RedWoolZoneModule {
     this.activeExitGoal = null;
     this.exitTicks = 0;
     this.lastExitCompletedAt = 0;
+    this.lastSeenZoneAt = 0;
     this.lastCheckedAt = 0;
+  }
+
+  /**
+   * Returns true if `pos` (bot or enemy player) lies on `red_wool` or inside a `red_wool` perimeter ring.
+   */
+  isPositionInSafeZone(pos) {
+    if (!pos) return false;
+    return Boolean(this.inspectPosition(pos).inZone);
+  }
+
+  /**
+   * Returns true if the bot recently stood inside or exited a `red_wool` zone within `windowMs`.
+   */
+  wasRecentlyInZone(windowMs = 120000) {
+    const ref = Math.max(this.lastExitCompletedAt || 0, this.lastSeenZoneAt || 0);
+    return ref > 0 && (Date.now() - ref) <= windowMs;
+  }
+
+  resetHistory() {
+    this.lastExitCompletedAt = 0;
+    this.lastSeenZoneAt = 0;
   }
 
   isBusy() {
@@ -292,6 +314,7 @@ class RedWoolZoneModule {
       if (!info.inZone) {
         return false;
       }
+      this.lastSeenZoneAt = now;
 
       const goal = this._pickExitGoal(pos, info, target);
       if (!goal) {

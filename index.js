@@ -122,6 +122,7 @@ class PvPBotController {
     this.autoStartDuelUntil = 0;
     this.duelEndedAt = 0;
     this.inDuelArena = false;
+    this.inFfaArena = false;
     this.autoFight = false;
     this.lastKnownHealth = 20;
     this.lootStartedAt = 0;
@@ -362,26 +363,42 @@ class PvPBotController {
         this._clearDuelsLoginJoinTimer('server/world switch');
         this.log(`Switched world/server — spawned at ${bot.entity.position.floored()}.`);
         this._clearTargetState();
+        this.inFfaArena = false;
         this.spawnAnchorPos = bot.entity.position.clone();
         this._resetSpawnRoam();
 
         const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
         const nearbyCount = this._listNearbyPlayers().length;
-        const wearingArmor = this._isWearingCombatArmor();
+        const hasCombatKit = this._hasCombatKit();
+        const inRedWoolSafeZone = Boolean(
+          this.redWoolZone &&
+          this.redWoolZone.isPositionInSafeZone(bot.entity.position)
+        );
 
-        if (recentlyEndedDuel || nearbyCount >= 4) {
+        if (recentlyEndedDuel) {
+          this.pendingDuelTarget = null;
+          this.pendingDuelReady = false;
+          this.autoStartDuelUntil = 0;
+          this.inDuelArena = false;
+        } else if (hasCombatKit && (inRedWoolSafeZone || nearbyCount >= 3)) {
+          this.pendingDuelTarget = null;
+          this.pendingDuelReady = false;
+          this.autoStartDuelUntil = 0;
+          this.inDuelArena = false;
+          this.inFfaArena = true;
+        } else if (nearbyCount >= 4) {
           this.pendingDuelTarget = null;
           this.pendingDuelReady = false;
           this.autoStartDuelUntil = 0;
           this.inDuelArena = false;
         } else {
-          if (this.pendingDuelTarget && (wearingArmor || (nearbyCount >= 1 && nearbyCount <= 2))) {
+          if (this.pendingDuelTarget && (hasCombatKit || (nearbyCount >= 1 && nearbyCount <= 2))) {
             this.pendingDuelReady = true;
             this.inDuelArena = true;
           } else {
             this.pendingDuelReady = false;
           }
-          if (this.config.bot.autoStartDuel !== false && wearingArmor && nearbyCount <= 3) {
+          if (this.config.bot.autoStartDuel !== false && hasCombatKit && nearbyCount <= 3) {
             this.autoStartDuelUntil = Date.now() + 15000;
             this.inDuelArena = true;
           }
@@ -611,6 +628,83 @@ class PvPBotController {
     return false;
   }
 
+  _hasCombatKit() {
+    if (this._isWearingCombatArmor()) return true;
+    if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return false;
+
+    let hasCombatWeapon = false;
+    let hasLobbySelector = false;
+    for (const item of this.bot.inventory.slots) {
+      if (!item || !item.name) continue;
+      const n = item.name;
+      if (n === 'compass' || n === 'clock' || n === 'nether_star') {
+        hasLobbySelector = true;
+      }
+      if (
+        n === 'netherite_sword' || n === 'diamond_sword' || n === 'iron_sword' ||
+        n === 'mace' || n === 'end_crystal' || n === 'respawn_anchor' ||
+        n === 'totem_of_undying' || n === 'wind_charge' || n === 'crossbow' ||
+        n === 'bow' || n === 'trident' || n.endsWith('_spear')
+      ) {
+        hasCombatWeapon = true;
+      }
+    }
+    if (hasLobbySelector && !this.inFfaArena && !this.inDuelArena) {
+      return false;
+    }
+    return hasCombatWeapon;
+  }
+
+  /**
+   * Classifies the current environment as 'DUELS', 'FFA', or 'LOBBY'.
+   */
+  _detectArenaMode() {
+    if (!this.bot || !this.bot.entity) return 'LOBBY';
+    if (this.inDuelArena || this.pendingDuelReady) return 'DUELS';
+
+    const hasKit = this._hasCombatKit();
+    const pos = this.bot.entity.position;
+    const botInRedWool = Boolean(this.redWoolZone && pos && this.redWoolZone.isPositionInSafeZone(pos));
+    const recentRedWool = Boolean(this.redWoolZone && this.redWoolZone.wasRecentlyInZone(180000));
+
+    if (this.inFfaArena || (hasKit && (botInRedWool || recentRedWool))) {
+      return 'FFA';
+    }
+
+    const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
+    if (hasKit && !recentlyEndedDuel) {
+      const nearbyCount = this._listNearbyPlayers().length;
+      if (nearbyCount >= 3) return 'FFA';
+      if (nearbyCount >= 1) return 'DUELS';
+    }
+
+    return 'LOBBY';
+  }
+
+  /**
+   * Picks the nearest eligible opponent within `maxRange`, strictly skipping players inside
+   * the FFA `red_wool` safe zone so the bot never targets or attacks safezoned players.
+   */
+  _pickEngageableTarget(arenaMode, maxRange) {
+    const respectRedWool = Boolean(
+      this.redWoolZone &&
+      (
+        arenaMode === 'FFA' ||
+        this.inFfaArena ||
+        (this.autoFight && arenaMode !== 'DUELS' && this.redWoolZone.wasRecentlyInZone(180000))
+      )
+    );
+    const nearby = this._listNearbyPlayers();
+    for (const candidate of nearby) {
+      if (candidate.dist > maxRange) break;
+      if (respectRedWool && this.redWoolZone.isPositionInSafeZone(candidate.entity.position)) {
+        continue;
+      }
+      return candidate;
+    }
+    return null;
+  }
+
   /**
    * Detects proxy/network kicks from the duels backend server (e.g. LEGOCRAFT packet-rate kicks)
    * and schedules a single debounced /server <duelsServerName> rejoin after proxy settlement delay.
@@ -764,8 +858,36 @@ class PvPBotController {
    */
   _handleDuelChatTriggers(rawText) {
     const text = stripColorCodes(rawText);
-    if (!text || this.config.bot.autoStartDuel === false) return;
+    if (!text) return;
     const lower = text.toLowerCase();
+
+    // Detect FFA arena entry / hub return chat triggers
+    if (
+      lower.includes('joined ffa') ||
+      lower.includes('entered ffa') ||
+      lower.includes('warped to ffa') ||
+      lower.includes('teleporting to ffa') ||
+      lower.includes('welcome to ffa') ||
+      lower.includes('ffa arena')
+    ) {
+      this.inFfaArena = true;
+      this.inDuelArena = false;
+      this.duelEndedAt = 0;
+      return;
+    }
+    if (
+      lower.includes('sent to lobby') ||
+      lower.includes('connected to hub') ||
+      lower.includes('returned to spawn') ||
+      lower.includes('returning to lobby')
+    ) {
+      this.inFfaArena = false;
+      this.inDuelArena = false;
+      if (this.redWoolZone) this.redWoolZone.resetHistory();
+      return;
+    }
+
+    if (this.config.bot.autoStartDuel === false) return;
 
     // Match end -> stop fighting cleanly and clear pending duel flags so we don't fight in spawn!
     if (
@@ -1084,6 +1206,16 @@ class PvPBotController {
         this.pendingDuelReady = false; // Activates automatically once teleported into arena (or on damage)
         this.log(`Armed auto-engage for duel opponent "${candidate}" once match starts.`);
       }
+    }
+
+    if (/^\/(?:ffa|kitpvp|warp\s+ffa|arena)\b/i.test(line)) {
+      this.inFfaArena = true;
+      this.inDuelArena = false;
+      this.duelEndedAt = 0;
+    } else if (/^\/(?:lobby|hub|spawn)\b/i.test(line)) {
+      this.inFfaArena = false;
+      this.inDuelArena = false;
+      if (this.redWoolZone) this.redWoolZone.resetHistory();
     }
 
     this.bot.chat(line);
@@ -1568,10 +1700,10 @@ class PvPBotController {
   }
 
   _tickIdle() {
-    // Stay calm and zero-spam in IDLE lobbies while optionally roaming gently around spawn.
+    // Stay calm in safe LOBBY hubs, but always engage in DUELS/FFA arenas (respecting red_wool safe zone in FFA).
     const engageRange = this.config.combat.engageRange || 36.0;
-    const nearby = this._listNearbyPlayers();
-    const canEngagePending = this.inDuelArena || this._isWearingCombatArmor() || nearby.length <= 3;
+    const arenaMode = this._detectArenaMode();
+    const canEngagePending = arenaMode === 'DUELS' || this._hasCombatKit();
 
     if (this.pendingDuelTarget && this.pendingDuelReady && canEngagePending) {
       const pending = this._findPlayerEntity(this.pendingDuelTarget);
@@ -1582,17 +1714,28 @@ class PvPBotController {
     }
 
     const now = Date.now();
-    if (this.autoFight || now < this.autoStartDuelUntil) {
-      // For arena autoStartDuel (not explicit !auto), only auto-engage when 1–2 opponents exist (prevents attacking crowded hubs!)
-      const looksLikeArena = this.autoFight || (nearby.length >= 1 && nearby.length <= 2);
-      if (looksLikeArena && nearby.length > 0 && nearby[0].dist <= engageRange) {
-        this._engageTarget(nearby[0].entity, this.autoFight ? '!auto nearest target' : 'arena auto-start');
+    if (arenaMode === 'FFA') {
+      if (this.redWoolZone && this.redWoolZone.tick(null, { allowSprint: this._hasCombatKit(), forceLook: false })) {
         return;
       }
-    }
-
-    if (this.autoFight || this.inDuelArena || now < this.autoStartDuelUntil) {
+      const ffaTarget = this._pickEngageableTarget('FFA', engageRange);
+      if (ffaTarget) {
+        this._engageTarget(ffaTarget.entity, 'FFA arena auto-engage');
+        return;
+      }
+    } else if (arenaMode === 'DUELS') {
+      const duelTarget = this._pickEngageableTarget('DUELS', engageRange);
+      if (duelTarget) {
+        this._engageTarget(duelTarget.entity, 'Duels arena auto-engage');
+        return;
+      }
+    } else if (this.autoFight || now < this.autoStartDuelUntil) {
       if (this.redWoolZone && this.redWoolZone.tick(null, { allowSprint: false, forceLook: false })) {
+        return;
+      }
+      const autoTarget = this._pickEngageableTarget(arenaMode, engageRange);
+      if (autoTarget && (this.autoFight || this._listNearbyPlayers().length <= 2)) {
+        this._engageTarget(autoTarget.entity, this.autoFight ? '!auto nearest target' : 'arena auto-start');
         return;
       }
     }
@@ -1862,11 +2005,12 @@ class PvPBotController {
         }
       }
 
-      // Hunt timed out — if !auto is ON, switch to next visible opponent instead of idling
-      if (this.autoFight) {
-        const nearby = this._listNearbyPlayers();
-        if (nearby.length > 0 && nearby[0].dist <= (this.config.combat.disengageRange || 96.0)) {
-          this._engageTarget(nearby[0].entity, '!auto re-acquire');
+      // Hunt timed out — if in FFA/Duels or !auto is ON, switch to next eligible opponent outside red_wool
+      const arenaMode = this._detectArenaMode();
+      if (this.autoFight || arenaMode === 'FFA' || arenaMode === 'DUELS') {
+        const nextTarget = this._pickEngageableTarget(arenaMode, this.config.combat.disengageRange || 96.0);
+        if (nextTarget) {
+          this._engageTarget(nextTarget.entity, `${arenaMode.toLowerCase()} re-acquire`);
           return;
         }
       }
@@ -1880,12 +2024,36 @@ class PvPBotController {
       return;
     }
 
+    const arenaMode = this._detectArenaMode();
+    if (
+      (arenaMode === 'FFA' || this.inFfaArena) &&
+      this.redWoolZone &&
+      this.redWoolZone.isPositionInSafeZone(target.position)
+    ) {
+      // Opponent retreated inside the FFA red_wool safe zone -> switch to an outside target or disengage
+      const alt = this._pickEngageableTarget('FFA', this.config.combat.engageRange || 36.0);
+      if (alt && alt.entity.id !== target.id) {
+        this._engageTarget(alt.entity, 'target entered red_wool safe zone, switching');
+        return;
+      }
+      this._clearTargetState();
+      this.transitionState(STATES.IDLE, 'target entered FFA red_wool safe zone');
+      return;
+    }
+
     // Target is visible -> update hunt tracking position
     this.targetLastSeenPos = target.position.clone();
     this.targetLostAt = 0;
 
     const dist = this.bot.entity.position.distanceTo(target.position);
     if (dist > (this.config.combat.disengageRange || 96.0)) {
+      if (this.autoFight || arenaMode === 'FFA' || arenaMode === 'DUELS') {
+        const alt = this._pickEngageableTarget(arenaMode, this.config.combat.disengageRange || 96.0);
+        if (alt && alt.entity.id !== target.id) {
+          this._engageTarget(alt.entity, `${arenaMode.toLowerCase()} closer target`);
+          return;
+        }
+      }
       this._clearTargetState();
       this.transitionState(STATES.IDLE, 'target out of disengage range');
       return;
