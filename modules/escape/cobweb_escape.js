@@ -15,6 +15,11 @@ const cobwebEscapeMethods = {
     if (typeof this.bot.setControlState === 'function') {
       this.bot.setControlState('sprint', false);
       this.bot.setControlState('sneak', false);
+      // If caught in a 3-block-high overhead cobweb, release jump so gravity pulls us out
+      if (cobwebBlock && cobwebBlock.position && this.bot.entity && this.bot.entity.position &&
+          cobwebBlock.position.y >= Math.floor(this.bot.entity.position.y) + 2) {
+        this.bot.setControlState('jump', false);
+      }
     }
 
     // Phase A: Active water placement / pickup sub-states

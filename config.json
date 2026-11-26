@@ -175,9 +175,9 @@
     "clutchMinFallDistance": 4.0
   },
   "survival": {
-    "retreatHealthThreshold": 9,
-    "inlinePotHealthThreshold": 13,
-    "healHealthThreshold": 10,
+    "retreatHealthThreshold": 5,
+    "inlinePotHealthThreshold": 5,
+    "healHealthThreshold": 5,
     "safeHealthThreshold": 15,
     "criticalHealthThreshold": 5,
     "hungerThreshold": 16,
@@ -222,7 +222,7 @@
     "enderPearlAgroCancelHp": 11,
     "enderPearlChaseMaxTargetHp": 20,
     "enderPearlChaseLeadBlocks": 2.5,
-    "enderPearlEscapeHealth": 9,
+    "enderPearlEscapeHealth": 5,
     "enderPearlEscapePitchMinDeg": 32,
     "enderPearlEscapePitchMaxDeg": 44,
     "enderPearlCooldownMs": 3200,

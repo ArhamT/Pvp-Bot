@@ -211,12 +211,13 @@ class SurvivalModule {
   }
 
   /**
-   * Critical HP Reset trigger (Priority 2): returns true at <= 9 HP so the bot steps back
-   * behind Obsidian cover and consumes an Enchanted Golden Apple / Golden Apple or Pearls out.
+   * Critical HP Reset trigger (Priority 2): returns true at <= retreatHealthThreshold (default 5 HP)
+   * ONLY when the bot still has healing supplies left; if out of healing, stay in ENGAGING and fight to the death.
    */
   needsRetreat() {
     if (!this.bot.entity) return false;
-    const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 9;
+    if (!this.hasHealingSupplies()) return false;
+    const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 5;
     return this.bot.health <= retreatHp;
   }
 
@@ -227,7 +228,7 @@ class SurvivalModule {
   needsHealing() {
     if (!this.bot.entity) return false;
     // Don't re-enter HEALING right after finishing a gapple (let absorption/regen work while fighting!)
-    if ((Date.now() - this.justAteGappleAt) < 2500 && this.bot.health > 7) return false;
+    if ((Date.now() - this.justAteGappleAt) < 2500 && this.bot.health > 5) return false;
 
     // Intelligent Golden Apple healing: wait until active Regeneration runs out unless HP is critical
     const criticalHp = this.survCfg.criticalHealthThreshold !== undefined ? this.survCfg.criticalHealthThreshold : 5;
@@ -236,11 +237,13 @@ class SurvivalModule {
     }
 
     // If we have a splash healing potion ready, stay in ENGAGING and quick-pot inline!
-    if (this.findHealingPotion() && this.bot.health > (this.survCfg.retreatHealthThreshold || 6)) {
+    const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 5;
+    if (this.findHealingPotion() && this.bot.health > retreatHp) {
       return false;
     }
 
-    const lowHealth = this.bot.health <= (this.survCfg.healHealthThreshold || 11);
+    const healHp = this.survCfg.healHealthThreshold !== undefined ? this.survCfg.healHealthThreshold : 5;
+    const lowHealth = this.bot.health <= healHp;
     const lowFood = this.bot.food <= Math.min(10, this.survCfg.hungerThreshold || 16);
     return (lowHealth || lowFood) && Boolean(this.findBestHealFood());
   }

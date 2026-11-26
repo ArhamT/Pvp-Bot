@@ -197,13 +197,205 @@ const hazardUnstickMethods = {
     if (name === 'cobweb') {
       return this._findItem([...SWORD_PRIORITY, 'shears']);
     }
-    if (name.includes('dirt') || name.includes('sand') || name.includes('gravel') || name.includes('soul_')) {
+    if (name.includes('wool') || name.includes('leaves') || name === 'vine' || name === 'glow_lichen') {
+      return this._findItem(['shears', ...SWORD_PRIORITY]);
+    }
+    if (
+      name.includes('dirt') || name.includes('sand') || name.includes('gravel') ||
+      name.includes('soul_') || name.includes('snow') || name.includes('clay') ||
+      name.includes('mud') || name.includes('grass_block') || name.includes('mycelium') ||
+      name.includes('podzol') || name.includes('concrete_powder') || name === 'farmland'
+    ) {
       return this._findItem(SHOVEL_PRIORITY);
     }
-    if (name.includes('planks') || name.includes('log') || name.includes('wood')) {
+    if (
+      name.includes('planks') || name.includes('log') || name.includes('wood') ||
+      name.includes('stem') || name.includes('hyphae') || name.includes('bamboo') ||
+      name.includes('fence') || name.includes('gate') || name.includes('door') ||
+      name.includes('chest') || name.includes('barrel') || name.includes('bookshelf') ||
+      name.includes('sign') || name === 'crafting_table' || name === 'melon' ||
+      name === 'pumpkin' || name === 'scaffolding' || name === 'ladder'
+    ) {
       return this._findItem(AXE_PRIORITY);
     }
     return this._findItem(PICKAXE_PRIORITY);
+  },
+
+  _estimateBlockBreakCost(block) {
+    if (!block || block.boundingBox !== 'block') return 0;
+    if (!this._canDigBlock(block)) return Infinity;
+    const name = block.name || '';
+    if (name === 'obsidian' || name === 'crying_obsidian' || name === 'respawn_anchor') return 25;
+    if (name.includes('deepslate') || name.includes('ancient_debris') || name.includes('iron_block')) return 10;
+    if (name.includes('wool') || name.includes('dirt') || name.includes('sand') || name.includes('gravel') || name.includes('leaves')) return 1.5;
+    if (name.includes('planks') || name.includes('log') || name.includes('wood') || name.includes('glass')) return 2.5;
+    return 4.0;
+  },
+
+  /**
+   * Detects when the bot is trapped inside an opponent-built box (all 4 cardinal exits blocked
+   * or unjumpable due to ceiling) and plans a 2-block-tall doorway breakout using the fastest
+   * breakable wall and exact appropriate tool (pickaxe / axe / shovel / shears / sword).
+   */
+  _planBoxBreakout(target) {
+    if (
+      this.escapeCfg.allowBlockDig === false ||
+      !this.bot || !this.bot.entity || !this.bot.entity.position ||
+      typeof this.bot.blockAt !== 'function' || typeof this.bot.dig !== 'function'
+    ) {
+      return null;
+    }
+
+    const pos = this.bot.entity.position;
+    const feet = pos.floored();
+    const ceiling = this.bot.blockAt(feet.offset(0, 2, 0));
+    const hasCeiling = Boolean(ceiling && ceiling.boundingBox === 'block');
+
+    const cardinals = [
+      { dx: 1, dz: 0 },
+      { dx: -1, dz: 0 },
+      { dx: 0, dz: 1 },
+      { dx: 0, dz: -1 }
+    ];
+
+    let blockedDirs = 0;
+    let bestPlan = null;
+
+    for (const dir of cardinals) {
+      const col = inspectColumnStep(this.bot, pos.x + dir.dx * 0.95, pos.y, pos.z + dir.dz * 0.95);
+      const exitBlocked = col.blocked || (col.needsJump && hasCeiling);
+      if (!exitBlocked) {
+        return null; // At least one open / jumpable cardinal exit exists -> not boxed in
+      }
+      blockedDirs++;
+
+      const bFeet = this.bot.blockAt(feet.offset(dir.dx, 0, dir.dz));
+      const bHead = this.bot.blockAt(feet.offset(dir.dx, 1, dir.dz));
+      const costFeet = this._estimateBlockBreakCost(bFeet);
+      const costHead = this._estimateBlockBreakCost(bHead);
+      const totalCost = costFeet + costHead;
+      if (!Number.isFinite(totalCost) || totalCost <= 0) continue;
+
+      // Avoid mining directly into lava behind the wall
+      const behind = this.bot.blockAt(feet.offset(dir.dx * 2, 0, dir.dz * 2));
+      if (behind && (behind.name.includes('lava') || behind.name.includes('fire'))) continue;
+
+      let score = -totalCost * 4;
+      if (target && target.position) {
+        const toTargetX = target.position.x - pos.x;
+        const toTargetZ = target.position.z - pos.z;
+        const len = Math.sqrt(toTargetX * toTargetX + toTargetZ * toTargetZ) || 1;
+        score += ((toTargetX * dir.dx + toTargetZ * dir.dz) / len) * 3.0;
+      }
+
+      if (!bestPlan || score > bestPlan.score) {
+        bestPlan = {
+          dir,
+          originFeet: feet.clone(),
+          score,
+          ticks: 0
+        };
+      }
+    }
+
+    return blockedDirs === 4 ? bestPlan : null;
+  },
+
+  _tickBoxBreakout(target, context) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
+    const now = Date.now();
+
+    // Continue active 2-block-tall doorway mining until both head & feet blocks are cleared
+    if (this.activeMode === 'BOX_MINE' && this.boxMinePlan) {
+      this.boxMinePlan.ticks++;
+      if (this.boxMinePlan.ticks > 140) {
+        this.boxMinePlan = null;
+        this.activeMode = 'IDLE';
+        return false;
+      }
+
+      if (this.diggingInProgress) {
+        if ((now - this.digStartedAt) > 6000) {
+          this.diggingInProgress = false;
+        }
+        return true;
+      }
+
+      const { dir, originFeet } = this.boxMinePlan;
+      const headBlock = this.bot.blockAt(originFeet.offset(dir.dx, 1, dir.dz));
+      const feetBlock = this.bot.blockAt(originFeet.offset(dir.dx, 0, dir.dz));
+      const nextToDig = (headBlock && headBlock.boundingBox === 'block' && this._canDigBlock(headBlock))
+        ? headBlock
+        : ((feetBlock && feetBlock.boundingBox === 'block' && this._canDigBlock(feetBlock)) ? feetBlock : null);
+
+      if (!nextToDig) {
+        // Doorway is open! Walk cleanly out through the mined exit
+        const exitYaw = Math.atan2(-dir.dx, -dir.dz);
+        this.aimer.stepTowardsAngles(exitYaw, 0.0, { speedMultiplier: 1.6, force: true });
+        if (typeof this.bot.setControlState === 'function') {
+          this.bot.setControlState('sneak', false);
+          this.bot.setControlState('forward', true);
+          this.bot.setControlState('back', false);
+          this.bot.setControlState('left', false);
+          this.bot.setControlState('right', false);
+          this.bot.setControlState('sprint', this.bot.food > 6);
+          this.bot.setControlState('jump', false);
+        }
+        this.activeMode = 'STALL_UNSTICK';
+        this.detourYaw = exitYaw;
+        this.detourTicks = 6;
+        this.boxMinePlan = null;
+        return true;
+      }
+
+      clearMovementControls(this.bot);
+      const tool = this._pickToolForBlock(nextToDig);
+      if (tool) {
+        const eq = this._ensureItemHeld(tool);
+        if (eq.swapped) {
+          this.digSettleTicks = 1;
+          return true;
+        }
+      }
+      if (this.digSettleTicks > 0) {
+        this.digSettleTicks--;
+        return true;
+      }
+      this.aimer.stepTowardsPoint(nextToDig.position.offset(0.5, 0.5, 0.5), {
+        speedMultiplier: 1.6,
+        force: true
+      });
+      this.diggingInProgress = true;
+      this.digStartedAt = now;
+      Promise.resolve(this.bot.dig(nextToDig, true))
+        .catch(() => {})
+        .finally(() => {
+          this.diggingInProgress = false;
+        });
+      return true;
+    }
+
+    if (!context || !context.canTrackStall) {
+      this.boxedTicks = 0;
+      return false;
+    }
+
+    const plan = this._planBoxBreakout(target);
+    if (!plan) {
+      this.boxedTicks = 0;
+      return false;
+    }
+
+    this.boxedTicks++;
+    // Wait 3 ticks (~150ms) to confirm we're genuinely boxed in (not passing a doorway)
+    if (this.boxedTicks < 3) {
+      return false;
+    }
+
+    this.boxedTicks = 0;
+    this.boxMinePlan = plan;
+    this.activeMode = 'BOX_MINE';
+    return this._tickBoxBreakout(target, context);
   },
 
   _canDigBlock(block) {

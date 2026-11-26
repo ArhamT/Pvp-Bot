@@ -127,7 +127,9 @@ function findOverlappingBlock(bot, predicate) {
   const pos = bot.entity.position;
   const seen = new Set();
   const offsets = [0, -0.29, 0.29];
-  for (const dy of [0, 1]) {
+  // Check feet (0.05), torso (0.9), and top of 1.8b player head (1.78) so jumping into
+  // a 3-block-high cobweb or overhead hazard is immediately detected.
+  for (const dy of [0.05, 0.9, 1.78]) {
     const by = Math.floor(pos.y + dy);
     for (const ox of offsets) {
       for (const oz of offsets) {

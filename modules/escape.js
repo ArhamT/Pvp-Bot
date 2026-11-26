@@ -34,6 +34,10 @@ class EscapeModule {
     this.lavaWaterState = 'IDLE';
     this.lastLavaWaterAt = 0;
     this.lavaWaterTicks = 0;
+    this.fireWaterState = 'IDLE';
+    this.lastFireWaterAt = 0;
+    this.fireWaterTicks = 0;
+    this.fireWaterPos = null;
     this.pearlSettleTicks = 0;
 
     this.cobwebWaterState = 'IDLE';
@@ -58,6 +62,8 @@ class EscapeModule {
 
     this.pillarSettleTicks = 0;
     this.pillarActive = false;
+    this.boxMinePlan = null;
+    this.boxedTicks = 0;
 
     this._onBlockUpdate = this._handleBlockUpdate.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
@@ -83,6 +89,9 @@ class EscapeModule {
     this.digSettleTicks = 0;
     this.lavaWaterState = 'IDLE';
     this.lavaWaterTicks = 0;
+    this.fireWaterState = 'IDLE';
+    this.fireWaterTicks = 0;
+    this.fireWaterPos = null;
     this.pearlSettleTicks = 0;
     this.cobwebWaterState = 'IDLE';
     this.cobwebWaterPos = null;
@@ -97,6 +106,8 @@ class EscapeModule {
     this.detourTicks = 0;
     this.pillarActive = false;
     this.pillarSettleTicks = 0;
+    this.boxMinePlan = null;
+    this.boxedTicks = 0;
   }
 
   _handleBlockUpdate(oldBlock, newBlock) {
@@ -130,7 +141,26 @@ class EscapeModule {
   }
 
   isManagingOwnLiquid() {
-    return Boolean(this.lavaWaterState !== 'IDLE' || this.cobwebWaterState !== 'IDLE');
+    return Boolean(this.lavaWaterState !== 'IDLE' || this.cobwebWaterState !== 'IDLE' || this.fireWaterState !== 'IDLE');
+  }
+
+  hasFireResistance() {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.effects) return false;
+    const effects = this.bot.entity.effects;
+    if (effects[12] || effects['12']) return true;
+    for (const eff of Object.values(effects)) {
+      if (eff && (eff.id === 12 || String(eff.name || '').toLowerCase().includes('fire_resistance'))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  isOnFire() {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
+    if (this.bot.entity.onFire || this.bot.entity.isOnFire) return true;
+    if (this.bot.entity.metadata && (Number(this.bot.entity.metadata[0]) & 0x01)) return true;
+    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'fire' || b.name === 'soul_fire'));
   }
 
   isInLava() {
@@ -176,6 +206,12 @@ class EscapeModule {
       return this._tickLavaEscape(target);
     }
 
+    if (this.fireWaterState !== 'IDLE' || (this.isOnFire() && !this.hasFireResistance())) {
+      if (this._tickFireExtinguish()) {
+        return true;
+      }
+    }
+
     const overlappingCobweb = this.findOverlappingCobweb();
     if (overlappingCobweb || this.cobwebWaterState !== 'IDLE') {
       return this._tickCobwebEscape(overlappingCobweb, target);
@@ -192,6 +228,10 @@ class EscapeModule {
     }
 
     if (this._tickWaterEscape(target)) {
+      return true;
+    }
+
+    if (this._tickBoxBreakout(target, context)) {
       return true;
     }
 

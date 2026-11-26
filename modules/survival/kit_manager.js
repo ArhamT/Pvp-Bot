@@ -266,7 +266,7 @@ const kitManagerMethods = {
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.retreatHealthThreshold || 9) &&
+      this.bot.health <= (this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 5) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this._queueSplashPotion(healPotion, false, null);
@@ -336,7 +336,7 @@ const kitManagerMethods = {
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.healHealthThreshold || 11) &&
+      this.bot.health <= (this.survCfg.healHealthThreshold !== undefined ? this.survCfg.healHealthThreshold : 5) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this._queueSplashPotion(healPotion, false, null);
@@ -347,7 +347,7 @@ const kitManagerMethods = {
     const drinkHeal = this.findDrinkableHealPotion();
     if (
       drinkHeal &&
-      this.bot.health <= (this.survCfg.healHealthThreshold || 11) &&
+      this.bot.health <= (this.survCfg.healHealthThreshold !== undefined ? this.survCfg.healHealthThreshold : 5) &&
       (now - this.lastPotionTime) >= potionCooldown
     ) {
       this._startDrinkingPotion(drinkHeal);

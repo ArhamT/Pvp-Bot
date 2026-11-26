@@ -1713,9 +1713,13 @@ class PvPBotController {
     const dist = this.bot.entity.position.distanceTo(target.position);
     const retreatDist = this.config.survival.retreatDistance || 12.0;
 
-    // Re-engage immediately once health & hunger are safely restored
+    // Re-engage immediately once health & hunger are safely restored OR if out of healing (fight to the death!)
     if (this.survival.isRecovered()) {
       this.transitionState(STATES.ENGAGING, 'recovered during retreat');
+      return;
+    }
+    if (!this.survival.isConsuming && !this.survival.hasHealingSupplies()) {
+      this.transitionState(STATES.ENGAGING, 'no healing supplies left — fighting to the death');
       return;
     }
 

@@ -645,8 +645,8 @@ const potionsFoodMethods = {
     const potionCooldown = this.survCfg.potionCooldownMs || 450;
     const isGlidingAirborne = Boolean(this.bot.entity.elytraFlying && !this.bot.entity.onGround);
 
-    // 1. Inline Instant Health splash (or drinkable heal potion fallback) when HP <= 13
-    const inlineThreshold = this.survCfg.inlinePotHealthThreshold || 13;
+    // 1. Inline Instant Health splash (or drinkable heal potion fallback) when HP <= inlinePotHealthThreshold (default 5)
+    const inlineThreshold = this.survCfg.inlinePotHealthThreshold !== undefined ? this.survCfg.inlinePotHealthThreshold : 5;
     if (this.bot.health <= inlineThreshold && (now - this.lastPotionTime) >= potionCooldown) {
       const healPot = !isGlidingAirborne ? this.findHealingPotion() : null;
       if (healPot) {

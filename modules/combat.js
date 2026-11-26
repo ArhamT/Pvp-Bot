@@ -1238,7 +1238,7 @@ class CombatModule {
    */
   _inspectForwardAndShoulders(yaw) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
-      return { needLedgeJump: false, leftBlocked2High: false, rightBlocked2High: false };
+      return { needLedgeJump: false, leftBlocked2High: false, rightBlocked2High: false, overheadCobweb: false };
     }
     const pos = this.bot.entity.position;
     const fx = -Math.sin(yaw);
@@ -1250,15 +1250,16 @@ class CombatModule {
     let needLedgeJump = false;
     let leftBlocked2High = false;
     let rightBlocked2High = false;
+    let overheadCobweb = false;
 
     const lanes = [
       { side: 0, lateral: 0 },
-      { side: -1, lateral: -0.32 },
-      { side: 1, lateral: 0.32 }
+      { side: -1, lateral: -0.35 },
+      { side: 1, lateral: 0.35 }
     ];
 
     for (const lane of lanes) {
-      for (const dist of [0.55, 0.95]) {
+      for (const dist of [0.42, 0.85]) {
         const sx = pos.x + fx * dist + rx * lane.lateral;
         const sz = pos.z + fz * dist + rz * lane.lateral;
         const col = inspectColumnStep(this.bot, sx, pos.y, sz);
@@ -1272,6 +1273,19 @@ class CombatModule {
       }
     }
 
+    // Detect 3-block-high cobweb directly above the bot's footprint so we don't jump into it repeatedly
+    const aboveY = Math.floor(pos.y) + 2;
+    for (const ox of [0, -0.29, 0.29]) {
+      for (const oz of [0, -0.29, 0.29]) {
+        const above = this.bot.blockAt(new Vec3(Math.floor(pos.x + ox), aboveY, Math.floor(pos.z + oz)));
+        if (above && above.name === 'cobweb') {
+          overheadCobweb = true;
+          break;
+        }
+      }
+      if (overheadCobweb) break;
+    }
+
     if (!needLedgeJump && this.bot.entity.isCollidedHorizontally) {
       const centerCol = inspectColumnStep(this.bot, pos.x + fx * 0.7, pos.y, pos.z + fz * 0.7);
       if (!centerCol.blocked) {
@@ -1279,7 +1293,7 @@ class CombatModule {
       }
     }
 
-    return { needLedgeJump, leftBlocked2High, rightBlocked2High };
+    return { needLedgeJump, leftBlocked2High, rightBlocked2High, overheadCobweb };
   }
 
   _updateDynamicSpacingAndStrafe(reachDist, aimStatus) {
@@ -1296,25 +1310,29 @@ class CombatModule {
     );
     const canSprint = facingTarget && this.bot.food > 6;
 
-    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips or 2-high block corners)
+    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips, 2-high block corners, or 3-high cobwebs)
     const yaw = this.bot.entity.yaw;
-    const { needLedgeJump, leftBlocked2High, rightBlocked2High } = this._inspectForwardAndShoulders(yaw);
+    const { needLedgeJump, leftBlocked2High, rightBlocked2High, overheadCobweb } = this._inspectForwardAndShoulders(yaw);
 
-    // Slide cleanly away from a snagged 2-high corner edge instead of grinding against it
+    // Slide cleanly away from a snagged 2-high corner edge (even when chasing from >4.5b away)
+    let edgeSlideDir = 0;
     if (leftBlocked2High && !rightBlocked2High) {
       this.strafeDirection = 1;
+      edgeSlideDir = 1;
     } else if (rightBlocked2High && !leftBlocked2High) {
       this.strafeDirection = -1;
+      edgeSlideDir = -1;
     }
 
-    const shouldClimbOrSwim = inWater || (onGround && needLedgeJump);
+    const allowJump = !overheadCobweb || inWater;
+    const shouldClimbOrSwim = inWater || (allowJump && onGround && needLedgeJump);
 
     if (reachDist > chaseDist) {
-      // > 3.2 blocks: Sprint-jump chase toward target (always swim up in water)
+      // > 3.2 blocks: Sprint-jump chase toward target (always swim up in water; suppress jump under 3-high cobweb)
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
       this.bot.setControlState('sprint', canSprint && !(inWater && needLedgeJump));
-      this.bot.setControlState('jump', inWater || (onGround && (facingTarget || needLedgeJump)));
+      this.bot.setControlState('jump', inWater || (allowJump && onGround && (facingTarget || needLedgeJump)));
     } else if (reachDist > optimalMax || this.shieldBreakActive) {
       // 2.95–3.2 blocks (or rushing in for a sprint-hit shield break)
       this.bot.setControlState('forward', true);
@@ -1349,12 +1367,17 @@ class CombatModule {
       this.bot.setControlState('back', safeBack);
       this.bot.setControlState('sprint', false);
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', inWater || ((cornered || needLedgeJump) && onGround));
+        this.bot.setControlState('jump', inWater || (allowJump && (cornered || needLedgeJump) && onGround));
       }
     }
 
-    // Randomized A/D circle-strafing
-    this._updateCircleStrafe(reachDist);
+    // Randomized A/D circle-strafing (or forced edge-slide when shoulder clips a block edge)
+    if (edgeSlideDir !== 0) {
+      this.bot.setControlState('left', edgeSlideDir < 0);
+      this.bot.setControlState('right', edgeSlideDir > 0);
+    } else {
+      this._updateCircleStrafe(reachDist);
+    }
   }
 
   /**
