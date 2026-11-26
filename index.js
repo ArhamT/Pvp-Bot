@@ -19,6 +19,9 @@ const { AerialModule } = require('./modules/aerial');
 const { EscapeModule } = require('./modules/escape');
 const { LiquidDenyModule } = require('./modules/liquid_deny');
 const { RedWoolZoneModule } = require('./modules/red_wool_zone');
+const { packetSanitizerMethods } = require('./modules/controller/packet_sanitizer');
+const { arenaDetectorMethods, stripColorCodes } = require('./modules/controller/arena_detector');
+const { spawnRoamMethods } = require('./modules/controller/spawn_roam');
 
 const STATES = Object.freeze({
   IDLE: 'IDLE',
@@ -30,28 +33,6 @@ const STATES = Object.freeze({
 
 const DUEL_REQUEST_REGEX = /(?:^|[\s•|:\]>»-])([A-Za-z0-9_]{3,16})\s+(?:has\s+sent(?:\s+you)?\s+a\s+duel\s+request|sent(?:\s+you)?\s+a\s+duel\s+request|challenged\s+you\s+to\s+a\s+duel)/i;
 const DUEL_START_CUE_REGEX = /(?:^|[\s•|:\]>»-])(?:go!+|fight!+)(?:$|[\s!.,])/i;
-
-const LOBBY_MENU_KEYWORDS = [
-  'kit editor', 'kiteditor', 'edit kit', 'settings', 'preferences',
-  'unranked', 'ranked', 'join queue', 'queue', 'spectate', 'party',
-  'cosmetics', 'leaderboard', 'statistics', 'stats', 'profile',
-  'server selector', 'game menu', 'main menu', 'return to lobby',
-  'leave queue', 'play duels', 'duel menu', 'ffa menu'
-];
-
-const LOBBY_MENU_ITEM_NAMES = new Set([
-  'compass', 'clock', 'nether_star', 'comparator', 'repeater',
-  'writable_book', 'knowledge_book', 'book', 'paper',
-  'name_tag', 'player_head', 'anvil'
-]);
-
-/**
- * Strips legacy Minecraft color/formatting codes (§x / &x) and trims whitespace.
- */
-function stripColorCodes(text) {
-  if (!text) return '';
-  return String(text).replace(/§.|&[0-9a-fk-orx]/gi, '').trim();
-}
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const baseConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -218,92 +199,6 @@ class PvPBotController {
     this.bot.loadPlugin(autoEatLoader);
 
     this._bindEvents();
-  }
-
-  _attachPacketMonitor(bot) {
-    if (!bot || !bot._client || typeof bot._client.write !== 'function') return;
-    const origWrite = bot._client.write.bind(bot._client);
-    let cachedVersion = null;
-    let isShiftedEntityAction = false;
-
-    const resolveShiftedEntityAction = () => {
-      const ver = bot.version || (bot._client && bot._client.version);
-      if (!ver || ver === cachedVersion) return isShiftedEntityAction;
-      cachedVersion = ver;
-      isShiftedEntityAction = false;
-      try {
-        const mcData = require('minecraft-data')(ver);
-        const eaSchema = mcData &&
-          mcData.protocol &&
-          mcData.protocol.play &&
-          mcData.protocol.play.toServer &&
-          mcData.protocol.play.toServer.types &&
-          mcData.protocol.play.toServer.types.packet_entity_action;
-        const actionField = Array.isArray(eaSchema) && Array.isArray(eaSchema[1])
-          ? eaSchema[1].find((f) => f && f.name === 'actionId')
-          : null;
-        const mappings = actionField && Array.isArray(actionField.type) && actionField.type[1]
-          ? actionField.type[1].mappings
-          : null;
-        isShiftedEntityAction = Boolean(mappings && mappings['6'] === 'start_fall_flying');
-      } catch (_) {
-        isShiftedEntityAction = false;
-      }
-      return isShiftedEntityAction;
-    };
-
-    bot._client.write = (name, params, ...rest) => {
-      let outParams = params;
-
-      if (name === 'teleport_confirm' && params && typeof params === 'object') {
-        outParams = { teleportId: Math.trunc(Number(params.teleportId) || 0) };
-      } else if (name === 'entity_action' && params && typeof params === 'object') {
-        if (params.actionId === 'start_elytra_flying') {
-          outParams = { ...params, actionId: 'start_fall_flying' };
-        } else if (resolveShiftedEntityAction() && typeof params.actionId === 'number') {
-          // 1.21.6+ removed start_sneaking (0) / stop_sneaking (1) and shifted all later IDs down by 2
-          if (params.actionId === 0 || params.actionId === 1) {
-            return false;
-          }
-          const legacyMap = {
-            3: 'start_sprinting',
-            4: 'stop_sprinting',
-            5: 'start_riding_jump',
-            6: 'stop_riding_jump',
-            7: 'open_inventory',
-            8: 'start_fall_flying'
-          };
-          if (legacyMap[params.actionId]) {
-            outParams = { ...params, actionId: legacyMap[params.actionId] };
-          }
-        }
-      }
-
-      const now = Date.now();
-      this._packetTimestamps.push(now);
-      if (this._packetTimestamps.length > 200) {
-        this._packetTimestamps = this._packetTimestamps.filter((t) => (now - t) <= 1000);
-      }
-      return origWrite(name, outParams, ...rest);
-    };
-
-    if (typeof bot._client.on === 'function') {
-      bot._client.on('position', () => {
-        this.lastTeleportAt = Date.now();
-        if (this.aerial && typeof this.aerial.notifyTeleport === 'function') {
-          this.aerial.notifyTeleport(4);
-        }
-        if (this.combat && typeof this.combat.cancelSpearLunge === 'function') {
-          this.combat.cancelSpearLunge();
-        }
-      });
-    }
-  }
-
-  getOutgoingPacketRate() {
-    const now = Date.now();
-    this._packetTimestamps = this._packetTimestamps.filter((t) => (now - t) <= 1000);
-    return this._packetTimestamps.length;
   }
 
   _bindEvents() {
@@ -476,6 +371,7 @@ class PvPBotController {
         this._resetSpawnRoam();
       }
       if (this.survival) this.survival.setCombatActive(false);
+      if (this.liquidDeny) this.liquidDeny.setCombatActive(false);
       if (this.combat) this.combat.scanHotbarSlots();
     });
 
@@ -501,6 +397,8 @@ class PvPBotController {
       if (this.burst) this.burst.dispose();
       if (this.aerial) this.aerial.dispose();
       if (this.escape) this.escape.dispose();
+      if (this.liquidDeny) this.liquidDeny.dispose();
+      if (this.redWoolZone) this.redWoolZone.dispose();
       if (this.prediction) this.prediction.clear();
       this.bot = null;
       this._scheduleReconnect();
@@ -623,122 +521,6 @@ class PvPBotController {
         if (this.bot) this._sendLoginCommand('login', 'server prompt');
       }, 900);
     }
-  }
-
-  _isWearingCombatArmor() {
-    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return false;
-    for (const slot of [5, 6, 7, 8]) {
-      const item = this.bot.inventory.slots[slot];
-      if (item && item.name && (
-        item.name.endsWith('_helmet') ||
-        item.name.endsWith('_chestplate') ||
-        item.name.endsWith('_leggings') ||
-        item.name.endsWith('_boots') ||
-        item.name === 'elytra'
-      )) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Returns true when inventory contains spawn/lobby selector or GUI menu items
-   * (e.g. Settings, Kit Editor, Unranked/Ranked Queue, Party, Spectate).
-   * Overrides arena auto-engage so the bot never fights in spawn.
-   */
-  _hasLobbyMenuItems() {
-    if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return false;
-    const wearingArmor = this._isWearingCombatArmor();
-
-    for (const item of this.bot.inventory.slots) {
-      if (!item || !item.name) continue;
-      if (!wearingArmor && LOBBY_MENU_ITEM_NAMES.has(item.name)) {
-        return true;
-      }
-
-      const customStr = item.customName
-        ? (typeof item.customName === 'string' ? item.customName : JSON.stringify(item.customName))
-        : '';
-      const rawText = `${getItemMetadataText(item)} ${customStr} ${item.displayName || ''}`;
-      const cleanText = stripColorCodes(rawText).toLowerCase();
-      if (cleanText && LOBBY_MENU_KEYWORDS.some((kw) => cleanText.includes(kw))) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  _hasCombatKit() {
-    if (this._hasLobbyMenuItems()) return false;
-    if (this._isWearingCombatArmor()) return true;
-    if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return false;
-
-    let hasCombatWeapon = false;
-    for (const item of this.bot.inventory.slots) {
-      if (!item || !item.name) continue;
-      const n = item.name;
-      if (
-        n === 'netherite_sword' || n === 'diamond_sword' || n === 'iron_sword' ||
-        n === 'mace' || n === 'end_crystal' || n === 'respawn_anchor' ||
-        n === 'totem_of_undying' || n === 'wind_charge' || n === 'crossbow' ||
-        n === 'bow' || n === 'trident' || n.endsWith('_spear')
-      ) {
-        hasCombatWeapon = true;
-      }
-    }
-    return hasCombatWeapon;
-  }
-
-  /**
-   * Classifies the current environment as 'DUELS', 'FFA', or 'LOBBY'.
-   */
-  _detectArenaMode() {
-    if (!this.bot || !this.bot.entity) return 'LOBBY';
-    if (this._hasLobbyMenuItems()) return 'LOBBY';
-    if (this.inDuelArena || this.pendingDuelReady) return 'DUELS';
-
-    const hasKit = this._hasCombatKit();
-    const pos = this.bot.entity.position;
-    const botInRedWool = Boolean(this.redWoolZone && pos && this.redWoolZone.isPositionInSafeZone(pos));
-    const recentRedWool = Boolean(this.redWoolZone && this.redWoolZone.wasRecentlyInZone(180000));
-
-    if (this.inFfaArena || (hasKit && (botInRedWool || recentRedWool))) {
-      return 'FFA';
-    }
-
-    const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
-    if (hasKit && !recentlyEndedDuel) {
-      const nearbyCount = this._listNearbyPlayers().length;
-      if (nearbyCount >= 3) return 'FFA';
-      if (nearbyCount >= 1) return 'DUELS';
-    }
-
-    return 'LOBBY';
-  }
-
-  /**
-   * Picks the nearest eligible opponent within `maxRange`, strictly skipping players inside
-   * the FFA `red_wool` safe zone so the bot never targets or attacks safezoned players.
-   */
-  _pickEngageableTarget(arenaMode, maxRange) {
-    const respectRedWool = Boolean(
-      this.redWoolZone &&
-      (
-        arenaMode === 'FFA' ||
-        this.inFfaArena ||
-        (this.autoFight && arenaMode !== 'DUELS' && this.redWoolZone.wasRecentlyInZone(180000))
-      )
-    );
-    const nearby = this._listNearbyPlayers();
-    for (const candidate of nearby) {
-      if (candidate.dist > maxRange) break;
-      if (respectRedWool && this.redWoolZone.isPositionInSafeZone(candidate.entity.position)) {
-        continue;
-      }
-      return candidate;
-    }
-    return null;
   }
 
   /**
@@ -1537,69 +1319,6 @@ class PvPBotController {
     }
   }
 
-  _clearAdvertiseTimer() {
-    if (this.advertiseTimer) {
-      clearTimeout(this.advertiseTimer);
-      this.advertiseTimer = null;
-    }
-  }
-
-  /**
-   * Counts other real players on the server tab list (excluding the bot itself).
-   */
-  _countOtherOnlinePlayers() {
-    if (!this.bot || !this.bot.players) return 0;
-    const selfName = (this.bot.username || '').toLowerCase();
-    return Object.keys(this.bot.players).filter((name) => name && name.toLowerCase() !== selfName).length;
-  }
-
-  /**
-   * Schedules the next random "duel me, I'm a bot" chat message after a random 1–3min delay.
-   * Only speaks while IDLE (never mid-fight) and stays completely silent when nobody else is online.
-   */
-  _scheduleAdvertise() {
-    this._clearAdvertiseTimer();
-    if (!this.advertiseEnabled || this.shuttingDown) return;
-
-    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
-    const minDelay = Number.isFinite(advCfg.minDelayMs) ? advCfg.minDelayMs : 60000;
-    const maxDelay = Number.isFinite(advCfg.maxDelayMs) ? Math.max(minDelay, advCfg.maxDelayMs) : 180000;
-    const delayMs = Math.round(this._randRange(minDelay, maxDelay));
-
-    this.advertiseTimer = setTimeout(() => {
-      this.advertiseTimer = null;
-      this._sendAdvertise();
-      this._scheduleAdvertise();
-    }, delayMs);
-  }
-
-  _sendAdvertise() {
-    if (!this.advertiseEnabled || this.shuttingDown || !this.bot || !this.bot.entity) return false;
-    if (this.state !== STATES.IDLE || this.inDuelArena) return false;
-    if (this.loginPassword && !this.loginAttempted) return false;
-    if (this._countOtherOnlinePlayers() === 0) return false;
-
-    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
-    const messages = Array.isArray(advCfg.messages) ? advCfg.messages.filter((m) => typeof m === 'string' && m.trim()) : [];
-    if (messages.length === 0) return false;
-
-    // Pick a random message, never repeating the previous one back-to-back
-    let idx = Math.floor(Math.random() * messages.length);
-    if (messages.length > 1 && idx === this.lastAdvertiseIndex) {
-      idx = (idx + 1 + Math.floor(Math.random() * (messages.length - 1))) % messages.length;
-    }
-    this.lastAdvertiseIndex = idx;
-
-    let text = messages[idx].replace(/\{name\}/g, this.bot.username || 'me').trim();
-    const colorPrefix = typeof advCfg.colorPrefix === 'string' ? advCfg.colorPrefix : '&b';
-    if (colorPrefix && !/^&[0-9a-fk-orx]/i.test(text)) {
-      text = `${colorPrefix}${text}`;
-    }
-    this.bot.chat(text);
-    this.log(`[ADS] ${text}`);
-    return true;
-  }
-
   _scheduleReconnect() {
     const rc = this.config.bot.reconnect;
     if (this.shuttingDown || !rc || !rc.enabled) return;
@@ -1789,224 +1508,6 @@ class PvPBotController {
     }
 
     this._tickSpawnRoam();
-  }
-
-  _randRange(minVal, maxVal) {
-    return minVal + Math.random() * Math.max(0, maxVal - minVal);
-  }
-
-  _stopSpawnRoam() {
-    clearMovementControls(this.bot);
-    this.roamTargetPos = null;
-  }
-
-  _resetSpawnRoam() {
-    const botCfg = this.config.bot || {};
-    const pauseMin = botCfg.roamPauseMinMs !== undefined ? botCfg.roamPauseMinMs : 2200;
-    const pauseMax = botCfg.roamPauseMaxMs !== undefined ? botCfg.roamPauseMaxMs : 4800;
-    const now = Date.now();
-    this._stopSpawnRoam();
-    this.roamPhase = 'PAUSED';
-    this.roamPhaseUntil = now + this._randRange(Math.min(1200, pauseMin), pauseMax);
-    this.roamNextGlanceAt = now + this._randRange(1800, 3200);
-    if (this.bot && this.bot.entity) {
-      this.roamGlanceYaw = this.bot.entity.yaw || 0;
-      this.roamGlancePitch = 0;
-    }
-  }
-
-  _isRoamStepSafe(yaw) {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) {
-      return { safe: false, shouldStepUp: false };
-    }
-    if (typeof this.bot.blockAt !== 'function') {
-      return { safe: true, shouldStepUp: false };
-    }
-
-    const pos = this.bot.entity.position;
-    const stepX = pos.x - Math.sin(yaw) * 1.1;
-    const stepZ = pos.z - Math.cos(yaw) * 1.1;
-    const baseY = Math.floor(pos.y);
-
-    const feetBlock = this.bot.blockAt(new Vec3(pos.x, baseY, pos.z));
-    if (feetBlock && ROAM_HAZARD_BLOCKS.has(feetBlock.name)) {
-      return { safe: false, shouldStepUp: false };
-    }
-
-    const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
-    const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
-    const aheadAbove = this.bot.blockAt(new Vec3(stepX, baseY + 2, stepZ));
-    const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
-    const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
-
-    if (
-      (aheadFeet && ROAM_HAZARD_BLOCKS.has(aheadFeet.name)) ||
-      (aheadHead && ROAM_HAZARD_BLOCKS.has(aheadHead.name)) ||
-      (aheadFloor0 && ROAM_HAZARD_BLOCKS.has(aheadFloor0.name))
-    ) {
-      return { safe: false, shouldStepUp: false };
-    }
-
-    const solidFeet = Boolean(aheadFeet && aheadFeet.boundingBox === 'block');
-    const solidHead = Boolean(aheadHead && aheadHead.boundingBox === 'block');
-    const solidAbove = Boolean(aheadAbove && aheadAbove.boundingBox === 'block');
-
-    // Reject 2-block walls or tight overhangs
-    if (solidHead || (solidFeet && solidAbove)) {
-      return { safe: false, shouldStepUp: false };
-    }
-
-    // Require solid footing within 2 blocks down to avoid void drops / spawn ledges
-    const hasSupport =
-      solidFeet ||
-      Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
-      Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
-    if (!hasSupport) {
-      return { safe: false, shouldStepUp: false };
-    }
-
-    return {
-      safe: true,
-      shouldStepUp: solidFeet && !solidHead && !solidAbove && Boolean(this.bot.entity.onGround)
-    };
-  }
-
-  _pickRoamTarget() {
-    const pos = this.bot.entity.position;
-    const anchor = this.spawnAnchorPos || pos;
-    const botCfg = this.config.bot || {};
-    const radius = botCfg.roamRadius !== undefined ? botCfg.roamRadius : 10;
-
-    const dxFromAnchor = pos.x - anchor.x;
-    const dzFromAnchor = pos.z - anchor.z;
-    const distFromAnchor = Math.sqrt(dxFromAnchor * dxFromAnchor + dzFromAnchor * dzFromAnchor);
-
-    // If drifted far from spawn anchor, steer gently back toward anchor center
-    if (distFromAnchor > radius * 0.8) {
-      for (let attempt = 0; attempt < 4; attempt++) {
-        const backYaw = Math.atan2(-(anchor.x - pos.x), -(anchor.z - pos.z)) + (attempt * 0.45 * (attempt % 2 === 0 ? 1 : -1));
-        if (this._isRoamStepSafe(backYaw).safe) {
-          const dist = Math.min(radius * 0.7, Math.max(2.5, distFromAnchor));
-          return new Vec3(
-            pos.x - Math.sin(backYaw) * dist,
-            pos.y,
-            pos.z - Math.cos(backYaw) * dist
-          );
-        }
-      }
-    }
-
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const angle = Math.random() * Math.PI * 2;
-      const r = this._randRange(2.5, Math.max(3.5, radius));
-      const candidate = new Vec3(
-        anchor.x + Math.cos(angle) * r,
-        pos.y,
-        anchor.z + Math.sin(angle) * r
-      );
-      const yaw = Math.atan2(-(candidate.x - pos.x), -(candidate.z - pos.z));
-      if (this._isRoamStepSafe(yaw).safe) {
-        return candidate;
-      }
-    }
-
-    return null;
-  }
-
-  _tickSpawnRoam() {
-    if (!this.roamInSpawn || this.state !== STATES.IDLE || this.inDuelArena) return;
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return;
-
-    const botCfg = this.config.bot || {};
-    const walkMin = botCfg.roamWalkMinMs !== undefined ? botCfg.roamWalkMinMs : 1400;
-    const walkMax = botCfg.roamWalkMaxMs !== undefined ? botCfg.roamWalkMaxMs : 3200;
-    const pauseMin = botCfg.roamPauseMinMs !== undefined ? botCfg.roamPauseMinMs : 2200;
-    const pauseMax = botCfg.roamPauseMaxMs !== undefined ? botCfg.roamPauseMaxMs : 4800;
-
-    const now = Date.now();
-    const pos = this.bot.entity.position;
-    if (!this.spawnAnchorPos) {
-      this.spawnAnchorPos = pos.clone();
-    }
-
-    if (this.roamPhase === 'PAUSED') {
-      // Gentle occasional head glance (throttled <= 10 Hz) while standing relaxed
-      if (now >= this.roamNextGlanceAt) {
-        this.roamNextGlanceAt = now + this._randRange(1800, 3200);
-        const curYaw = this.bot.entity.yaw || 0;
-        this.roamGlanceYaw = normalizeAngle(curYaw + this._randRange(-0.6, 0.6));
-        this.roamGlancePitch = this._randRange(-0.14, 0.14);
-      }
-
-      if (this.aimer && (now - this.roamLastLookAt) >= 100) {
-        const yawDiff = Math.abs(normalizeAngle(this.roamGlanceYaw - (this.bot.entity.yaw || 0)));
-        const pitchDiff = Math.abs(this.roamGlancePitch - (this.bot.entity.pitch || 0));
-        if (yawDiff > 0.04 || pitchDiff > 0.04) {
-          this.roamLastLookAt = now;
-          this.aimer.stepTowardsAngles(this.roamGlanceYaw, this.roamGlancePitch, { speedMultiplier: 0.35, force: false });
-        }
-      }
-
-      if (now >= this.roamPhaseUntil) {
-        const nextDest = this._pickRoamTarget();
-        if (nextDest) {
-          this.roamTargetPos = nextDest;
-          this.roamPhase = 'WALKING';
-          this.roamPhaseUntil = now + this._randRange(walkMin, walkMax);
-        } else {
-          this.roamPhaseUntil = now + this._randRange(600, 1400);
-        }
-      }
-      return;
-    }
-
-    // WALKING phase
-    const dest = this.roamTargetPos;
-    if (!dest || now >= this.roamPhaseUntil) {
-      this._stopSpawnRoam();
-      this.roamPhase = 'PAUSED';
-      this.roamPhaseUntil = now + this._randRange(pauseMin, pauseMax);
-      return;
-    }
-
-    const dx = dest.x - pos.x;
-    const dz = dest.z - pos.z;
-    const horizDist = Math.sqrt(dx * dx + dz * dz);
-    if (horizDist < 1.1) {
-      this._stopSpawnRoam();
-      this.roamPhase = 'PAUSED';
-      this.roamPhaseUntil = now + this._randRange(pauseMin, pauseMax);
-      return;
-    }
-
-    const yawToDest = Math.atan2(-dx, -dz);
-    const stepCheck = this._isRoamStepSafe(yawToDest);
-    if (!stepCheck.safe) {
-      this._stopSpawnRoam();
-      this.roamPhase = 'PAUSED';
-      this.roamPhaseUntil = now + this._randRange(500, 1200);
-      return;
-    }
-
-    let yawErrorDeg = Math.abs(normalizeAngle(yawToDest - (this.bot.entity.yaw || 0))) * (180 / Math.PI);
-    if (this.aimer && (now - this.roamLastLookAt) >= 100) {
-      this.roamLastLookAt = now;
-      const aimStatus = this.aimer.stepTowardsAngles(yawToDest, 0, {
-        speedMultiplier: 0.5,
-        toleranceRad: 0.25,
-        force: false
-      });
-      yawErrorDeg = aimStatus.yawErrorDeg;
-    }
-
-    if (typeof this.bot.setControlState === 'function') {
-      this.bot.setControlState('forward', yawErrorDeg < 45);
-      this.bot.setControlState('back', false);
-      this.bot.setControlState('left', false);
-      this.bot.setControlState('right', false);
-      this.bot.setControlState('sprint', false);
-      this.bot.setControlState('jump', stepCheck.shouldStepUp);
-    }
   }
 
   _tickEngaging(target) {
@@ -2312,6 +1813,13 @@ class PvPBotController {
     }
   }
 }
+
+Object.assign(
+  PvPBotController.prototype,
+  packetSanitizerMethods,
+  arenaDetectorMethods,
+  spawnRoamMethods
+);
 
 const controller = new PvPBotController(config);
 

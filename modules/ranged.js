@@ -104,6 +104,10 @@ class RangedModule {
    * Cancels active bow draw or queued utility actions cleanly.
    */
   cancel() {
+    if (this._crossbowReleaseTimer) {
+      clearTimeout(this._crossbowReleaseTimer);
+      this._crossbowReleaseTimer = null;
+    }
     if (this.isDrawing) {
       this.bot.deactivateItem();
       this.isDrawing = false;
@@ -1368,12 +1372,14 @@ class RangedModule {
       this.bot.deactivateItem();
       this.lastBowShotTime = Date.now();
       if (isCrossbow) {
-        setTimeout(() => {
+        if (this._crossbowReleaseTimer) {
+          clearTimeout(this._crossbowReleaseTimer);
+        }
+        this._crossbowReleaseTimer = setTimeout(() => {
+          this._crossbowReleaseTimer = null;
+          if (!this.bot || !this.bot.entity) return;
           try {
             this.bot.activateItem(false);
-            setTimeout(() => {
-              try { this.bot.deactivateItem(); } catch (_) {}
-            }, 60);
           } catch (_) {}
         }, 100);
       }

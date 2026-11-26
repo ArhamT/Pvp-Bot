@@ -1,7 +1,8 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { HOTBAR_START } = require('./constants');
+const { posKey, isLiquidSource } = require('./constants');
+const { findInventoryItem, ensureItemHeld, findNearestLiquidSource } = require('./inventory_utils');
 
 const SOLID_DENY_BLOCKS = [
   'cobblestone',
@@ -25,28 +26,6 @@ const PLACEMENT_OFFSETS = [
   { offset: new Vec3(0, 0, -1), face: new Vec3(0, 0, 1) },
   { offset: new Vec3(0, 1, 0), face: new Vec3(0, -1, 0) }
 ];
-
-function posKey(pos) {
-  return `${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`;
-}
-
-/**
- * Returns true strictly for water/lava source blocks (level === 0 / metadata === 0).
- * Flowing streams (level > 0, metadata > 0, flowing_water, flowing_lava) return false.
- */
-function isLiquidSource(block) {
-  if (!block || (block.name !== 'water' && block.name !== 'lava')) return false;
-  if (typeof block.getProperties === 'function') {
-    const props = block.getProperties();
-    if (props && props.level !== undefined) {
-      return Number(props.level) === 0;
-    }
-  }
-  if (typeof block.metadata === 'number') {
-    return block.metadata === 0;
-  }
-  return true;
-}
 
 /**
  * Liquid Denial skill:
@@ -139,82 +118,20 @@ class LiquidDenyModule {
     };
   }
 
-  /**
-   * Scans nearby voxels for an unhandled water/lava source block within reach when carrying
-   * an empty bucket (catches pre-existing sources, multiBlockChange updates, or missed pickups).
-   */
   _findNearestLiquidSource(maxRange, now) {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
-      return null;
-    }
-    const eye = this._getEyePos();
-    const pos = this.bot.entity.position;
-    const bx = Math.floor(pos.x);
-    const by = Math.floor(pos.y);
-    const bz = Math.floor(pos.z);
-    const rInt = Math.min(4, Math.ceil(maxRange));
-
-    let best = null;
-    let bestDist = Infinity;
-    for (let dx = -rInt; dx <= rInt; dx++) {
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dz = -rInt; dz <= rInt; dz++) {
-          const bp = new Vec3(bx + dx, by + dy, bz + dz);
-          const key = posKey(bp);
-          const expiry = this.handledSources.get(key);
-          if (expiry && now < expiry) continue;
-
-          const b = this.bot.blockAt(bp);
-          if (!isLiquidSource(b)) continue;
-
-          const center = bp.offset(0.5, 0.5, 0.5);
-          const dist = eye.distanceTo(center);
-          if (dist <= maxRange && dist < bestDist) {
-            bestDist = dist;
-            best = { pos: bp, key, liquid: b.name };
-          }
-        }
-      }
-    }
-    return best;
+    return findNearestLiquidSource(this.bot, this.aimer, this.bot.entity && this.bot.entity.position, maxRange, {
+      handledSources: this.handledSources,
+      now,
+      maxRadius: 4
+    });
   }
 
   _findItem(nameOrList) {
-    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return null;
-    const names = Array.isArray(nameOrList) ? nameOrList : [nameOrList];
-    const start = this.bot.inventory.hotbarStart || HOTBAR_START;
-
-    for (const name of names) {
-      for (let i = 0; i < 9; i++) {
-        const item = this.bot.inventory.slots[start + i];
-        if (item && item.name === name) return { item, quickBarSlot: i };
-      }
-    }
-
-    const items = typeof this.bot.inventory.items === 'function' ? this.bot.inventory.items() : [];
-    for (const name of names) {
-      const found = items.find((i) => i && i.name === name);
-      if (found) return { item: found, quickBarSlot: -1 };
-    }
-    return null;
+    return findInventoryItem(this.bot, nameOrList);
   }
 
   _ensureItemHeld(found) {
-    if (!found || !found.item) return { held: false, swapped: false };
-    if (this.bot.heldItem && this.bot.heldItem.name === found.item.name) {
-      if (found.quickBarSlot < 0 || this.bot.quickBarSlot === found.quickBarSlot) {
-        return { held: true, swapped: false };
-      }
-    }
-    if (found.quickBarSlot >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
-      this.bot.setQuickBarSlot(found.quickBarSlot);
-      return { held: false, swapped: true };
-    }
-    if (typeof this.bot.equip === 'function') {
-      Promise.resolve(this.bot.equip(found.item, 'hand')).catch(() => {});
-      return { held: false, swapped: true };
-    }
-    return { held: false, swapped: false };
+    return ensureItemHeld(this.bot, found);
   }
 
   _overlapsBotBody(blockPos) {

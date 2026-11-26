@@ -144,6 +144,37 @@ function findOverlappingBlock(bot, predicate) {
   return null;
 }
 
+function posKey(pos) {
+  return `${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`;
+}
+
+function isAirLike(block) {
+  return Boolean(
+    !block ||
+    block.name === 'air' ||
+    block.name === 'cave_air' ||
+    block.name === 'void_air'
+  );
+}
+
+/**
+ * Returns true strictly for water/lava source blocks (level === 0 / metadata === 0).
+ * Flowing streams (level > 0, metadata > 0, flowing_water, flowing_lava) return false.
+ */
+function isLiquidSource(block) {
+  if (!block || (block.name !== 'water' && block.name !== 'lava')) return false;
+  if (typeof block.getProperties === 'function') {
+    const props = block.getProperties();
+    if (props && props.level !== undefined) {
+      return Number(props.level) === 0;
+    }
+  }
+  if (typeof block.metadata === 'number') {
+    return block.metadata === 0;
+  }
+  return true;
+}
+
 module.exports = {
   OFFHAND_SLOT,
   HOTBAR_START,
@@ -160,5 +191,8 @@ module.exports = {
   clearMovementControls,
   getItemMetadataText,
   hasItemEnchant,
-  findOverlappingBlock
+  findOverlappingBlock,
+  posKey,
+  isAirLike,
+  isLiquidSource
 };
