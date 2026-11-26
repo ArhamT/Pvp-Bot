@@ -106,7 +106,7 @@ const elytraSkillMethods = {
 
     const minDist = this.aerialCfg.elytraMinDistance !== undefined
       ? this.aerialCfg.elytraMinDistance
-      : 20.0;
+      : 6.0;
     const pos = this.bot.entity.position;
     const dist = pos.distanceTo(target.position);
     const horizDist = Math.hypot(target.position.x - pos.x, target.position.z - pos.z);
@@ -124,12 +124,25 @@ const elytraSkillMethods = {
 
     if (!this._findItemByName('firework_rocket')) return false;
 
+    const now = Date.now();
+    const takeoffCooldown = this.aerialCfg.elytraTakeoffCooldownMs !== undefined
+      ? this.aerialCfg.elytraTakeoffCooldownMs
+      : 900;
+    if (this.bot.entity.onGround && (now - this.lastElytraTakeoffTime) < takeoffCooldown) {
+      return false;
+    }
+
+    // Never rocket-takeoff under a low ceiling
+    if (this.bot.entity.onGround && !this._hasClearSkyAbove(5)) {
+      return false;
+    }
+
     const heightAboveGround = this._getHeightAboveGround();
     const afterVerticalLaunch = !this.bot.entity.onGround &&
-      dist >= 6.0 &&
-      (velY >= 0.55 || (velY > 0.05 && heightAboveGround >= 2.2));
+      dist >= 4.0 &&
+      (velY >= 0.45 || (velY > 0.05 && heightAboveGround >= 2.0));
 
-    return dist > minDist || afterVerticalLaunch;
+    return dist >= minDist || afterVerticalLaunch;
   },
 
   _enterElytraDive() {
@@ -237,7 +250,7 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 3: BOOST_CLIMB — Fire firework_rocket, or Elytra Wind-Boost / B-Hop to conserve rockets
+    // Stage 3: BOOST_CLIMB — HT1 Rocket Climb (+66..+76 deg) to lethal Density altitude
     // -----------------------------------------------------------------------
     if (this.stage === 'BOOST_CLIMB') {
       if (onGround && this.fireworkFired && this.climbTicksAfterBoost > 3) {
@@ -256,6 +269,7 @@ const elytraSkillMethods = {
       const dz = predPos.z - pos.z;
       const horizDist = Math.sqrt(dx * dx + dz * dz);
       const yawToTarget = Math.atan2(-dx, -dz);
+      const rocketSel = this._findItemByName('firework_rocket');
 
       // Retry start_elytra_flying once if server hasn't acknowledged glide state yet while airborne
       if (!onGround && this.bot.entity.elytraFlying === false && !this.elytraGlideRetrySent && this.stageTicks === 3) {
@@ -263,9 +277,11 @@ const elytraSkillMethods = {
         this.elytraGlideRetrySent = true;
       }
 
-      // Elytra Wind-Charge Boost (snap down -> fire wind_charge -> snap up on next tick)
+      // Only use Wind-Charge boost as a fallback when NO firework_rocket is available
       if (
         !onGround &&
+        !rocketSel &&
+        !this.fireworkFired &&
         this.aerialCfg.elytraWindBoostEnabled !== false &&
         this.stageTicks === 2 &&
         this._findItemByName('wind_charge')
@@ -283,14 +299,15 @@ const elytraSkillMethods = {
         return true;
       }
 
-      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, this.boostPitchRad, {
-        speedMultiplier: 1.75,
+      // Steep HT1 rocket climb pitch (+66..+76 deg) facing target XZ so we rise fast right over them
+      const climbPitchRad = horizDist > 16.0 ? 48 * DEG_TO_RAD : this.boostPitchRad;
+      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, climbPitchRad, {
+        speedMultiplier: 2.0,
         toleranceRad: 0.16,
         force: true
       });
 
       if (!this.fireworkFired) {
-        const rocketSel = this._findItemByName('firework_rocket');
         if (!rocketSel) {
           this.stage = 'DIVE';
           this.stageTicks = 0;
@@ -299,7 +316,7 @@ const elytraSkillMethods = {
 
         const eq = this._equipHand(rocketSel);
         const currentPitchDeg = this.bot.entity.pitch / DEG_TO_RAD;
-        if (eq.ready && !eq.swapped && (currentPitchDeg >= 22 || aimStatus.pitchErrorDeg <= 10 || this.stageTicks >= 3)) {
+        if (eq.ready && !eq.swapped && (currentPitchDeg >= 30 || aimStatus.pitchErrorDeg <= 12 || this.stageTicks >= 2)) {
           if (typeof this.bot.activateItem === 'function') {
             this.bot.activateItem(false);
           }
@@ -310,18 +327,31 @@ const elytraSkillMethods = {
         return true;
       }
 
-      // B-Hopping height preservation (pitch oscillation without spending extra rockets/wind charges)
-      if (this.aerialCfg.bHopEnabled !== false && this.climbTicksAfterBoost > 0 && this.climbTicksAfterBoost % 5 === 0) {
-        const oscPitch = (this.climbTicksAfterBoost % 10 === 0) ? -25 * DEG_TO_RAD : this.boostPitchRad;
-        this.aimer.stepTowardsAngles(yawToTarget, oscPitch, { force: true });
-      }
-
       this.climbTicksAfterBoost++;
       const heightAboveTarget = pos.y - predPos.y;
+
+      // HT1 2nd-rocket boost if first rocket burn faded before reaching lethal altitude (>11b)
+      const rocketCooldown = this.aerialCfg.elytraRocketCooldownMs !== undefined ? this.aerialCfg.elytraRocketCooldownMs : 1000;
+      if (
+        rocketSel &&
+        heightAboveTarget < 11.0 &&
+        velY < 0.28 &&
+        this.climbTicksAfterBoost >= 10 &&
+        (Date.now() - this.lastRocketTime) >= rocketCooldown
+      ) {
+        const eq = this._equipHand(rocketSel);
+        if (eq.ready && !eq.swapped && typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+          this.lastRocketTime = Date.now();
+          this.climbTicksAfterBoost = 0;
+          return true;
+        }
+      }
+
       const readyToDive =
-        heightAboveTarget >= 10.0 ||
-        (heightAboveTarget >= 5.0 && horizDist <= 10.0) ||
-        this.climbTicksAfterBoost >= 14;
+        heightAboveTarget >= 13.0 ||
+        (heightAboveTarget >= 8.0 && horizDist <= 9.0 && this.climbTicksAfterBoost >= 6) ||
+        this.climbTicksAfterBoost >= 16;
 
       if (readyToDive) {
         this.stage = 'DIVE';
@@ -331,7 +361,7 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 4: DIVE — Steer above predicted XZ, conserve low-durability Elytra, pitch -75 to -85 deg
+    // Stage 4: DIVE — HT1 Guided 3D Intercept + Mid-Glide Density Mace Pre-Equip
     // -----------------------------------------------------------------------
     if (this.stage === 'DIVE') {
       if (onGround || inWater) {
@@ -340,14 +370,25 @@ const elytraSkillMethods = {
         return true;
       }
 
-      const predPos = this._getPredictedPosition(target, 4);
+      // Dynamically scale target velocity lead based on closing time to impact (1..5 ticks)
+      const vel = this.bot.entity.velocity || new Vec3(0, 0, 0);
+      const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+      const rawDist = pos.distanceTo(target.position);
+      const leadTicks = clamp(Math.round(rawDist / Math.max(0.85, speed)), 1, 5);
+      const predPos = this._getPredictedPosition(target, leadTicks);
+
       const dx = predPos.x - pos.x;
       const dz = predPos.z - pos.z;
       const horizDist = Math.sqrt(dx * dx + dz * dz);
       const heightAboveTarget = pos.y - predPos.y;
       const strikeHeight = this.aerialCfg.elytraStrikeHeight !== undefined
         ? this.aerialCfg.elytraStrikeHeight
-        : 3.5;
+        : 4.8;
+
+      // Speed-scaled swap window so high-speed HT1 dives swap Chestplate BEFORE hitting ground
+      const speedMargin = clamp(Math.abs(velY) * 2.2, 0, 3.2);
+      const dynamicStrikeHeight = strikeHeight + speedMargin;
+      const dynamicSwapReach = 5.5 + speedMargin * 0.6;
 
       // Elytra durability conservation: alternate Chestplate / Elytra mid-flight when remaining < threshold
       const conserveInfo = shouldConserveElytra(this.bot, this.aerialCfg.elytraConserveThreshold || 50);
@@ -365,38 +406,62 @@ const elytraSkillMethods = {
         }
       }
 
-      // Transition to Stage 5 (STRIKE) once <= 3.5 blocks above target
-      if (heightAboveTarget <= strikeHeight && (horizDist <= 6.0 || reachDist <= 5.0)) {
+      // HT1 mid-dive rocket acceleration if target sprinted far away (>15b) and we're losing speed
+      const rocketSel = this._findItemByName('firework_rocket');
+      const rocketCooldown = this.aerialCfg.elytraRocketCooldownMs !== undefined ? this.aerialCfg.elytraRocketCooldownMs : 1000;
+      const needDiveRocket = Boolean(
+        rocketSel &&
+        horizDist > 15.0 &&
+        heightAboveTarget > 6.0 &&
+        speed < 0.95 &&
+        (Date.now() - this.lastRocketTime) >= rocketCooldown
+      );
+
+      if (needDiveRocket) {
+        const eq = this._equipHand(rocketSel);
+        if (eq.ready && !eq.swapped && typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+          this.lastRocketTime = Date.now();
+        }
+      } else {
+        // Pre-equip Density Mace DURING glide so zero hotbar-swap ticks are wasted at impact!
+        const densityMace = this._findDensityMace();
+        if (densityMace && !this.swappedThisTick) {
+          this._equipHand(densityMace);
+        }
+      }
+
+      // Transition to Chestplate swap -> instant Density Mace smash when entering impact window
+      if (
+        reachDist <= dynamicSwapReach ||
+        (heightAboveTarget <= dynamicStrikeHeight && horizDist <= 5.8 + speedMargin * 0.5)
+      ) {
         this.stage = 'STRIKE_CHESTPLATE';
         this.stageTicks = 0;
         return this._tickElytraStrikeChestplate(target);
       }
 
-      if (heightAboveTarget <= strikeHeight && horizDist > 6.0 && this._shouldTriggerClutch(target, true)) {
+      if (heightAboveTarget <= strikeHeight && horizDist > 7.5 && this._shouldTriggerClutch(target, true)) {
         this._enterClutch();
         return this._tickClutch();
       }
 
+      // True 3D intercept pitch directly into predicted opponent torso (no artificial -75° clamp!)
       const yawToPred = Math.atan2(-dx, -dz);
       const diveMinRad = (this.aerialCfg.elytraDivePitchMinDeg !== undefined
         ? this.aerialCfg.elytraDivePitchMinDeg
-        : -85) * DEG_TO_RAD;
+        : -86) * DEG_TO_RAD;
       const diveMaxRad = (this.aerialCfg.elytraDivePitchMaxDeg !== undefined
         ? this.aerialCfg.elytraDivePitchMaxDeg
-        : -75) * DEG_TO_RAD;
+        : -15) * DEG_TO_RAD;
 
-      let targetPitchRad;
-      if (horizDist > Math.max(12.0, heightAboveTarget * 1.15)) {
-        const directPitch = Math.atan2((predPos.y + 4.0) - pos.y, Math.max(0.1, horizDist));
-        targetPitchRad = clamp(directPitch, diveMaxRad, -15 * DEG_TO_RAD);
-      } else {
-        const steepPitch = Math.atan2(predPos.y - pos.y, Math.max(0.1, horizDist));
-        targetPitchRad = clamp(steepPitch, diveMinRad, diveMaxRad);
-      }
+      const aimY = (horizDist > 10.0) ? (predPos.y + 1.6) : (predPos.y + 0.9);
+      const directPitch = Math.atan2(aimY - pos.y, Math.max(0.1, horizDist));
+      const targetPitchRad = clamp(directPitch, diveMinRad, diveMaxRad);
 
       this.aimer.stepTowardsAngles(yawToPred, targetPitchRad, {
-        speedMultiplier: 1.65,
-        toleranceRad: 0.16,
+        speedMultiplier: 1.9,
+        toleranceRad: 0.14,
         force: true
       });
 
@@ -411,10 +476,10 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5b: STRIKE_EQUIP_MACE — Equip Density Mace on next tick
+    // Stage 5b: STRIKE_EQUIP_MACE — Equip Density Mace on next tick (skipped if already held!)
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_EQUIP_MACE') {
-      this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28, force: true });
+      this._aimAtTarget(target, 1, { speedMultiplier: 1.8, toleranceRad: 0.34, force: true });
       const maceSel = this._findDensityMace();
       if (maceSel) {
         this._equipHand(maceSel);
@@ -424,7 +489,7 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5c: STRIKE_SMASH — Flight Crit Density Mace Smash (<= 3.0b) + Shield Stun-Slam + Loop
+    // Stage 5c: STRIKE_SMASH — HT1 Density Mace Smash (<= 3.35b) + Shield Stun-Slam + Instant Re-Loop
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_SMASH') {
       if (onGround || inWater) {
@@ -433,8 +498,8 @@ const elytraSkillMethods = {
       }
 
       const aimStatus = this._aimAtTarget(target, 1, {
-        speedMultiplier: 1.6,
-        toleranceRad: 0.28,
+        speedMultiplier: 1.9,
+        toleranceRad: 0.42,
         force: true
       });
 
@@ -445,7 +510,7 @@ const elytraSkillMethods = {
         isAirborne: !onGround,
         isGliding: false
       });
-      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.8) {
+      if (counter.strategy === 'STUN_SLAM' && reachDist <= 4.0) {
         this.mode = AERIAL_MODES.STUN_SLAM;
         this.stage = 'AXE_BREAK';
         this.stageTicks = 0;
@@ -460,12 +525,21 @@ const elytraSkillMethods = {
         holdingMace = eq.ready && !eq.swapped;
       }
 
-      if (holdingMace && reachDist <= reach + 0.25 && aimStatus.aligned) {
+      if (holdingMace && reachDist <= reach + 0.35 && aimStatus.aligned) {
         if (typeof this.bot.setControlState === 'function') {
           this.bot.setControlState('sprint', false);
         }
         this.bot.attack(target);
         this._resetFallAfterSmash();
+
+        // If Mace has Wind Burst, chain immediately into airborne bounce/re-dive!
+        if (this.aerialCfg.windBurstChainEnabled && maceSel && hasItemEnchant(maceSel.item, 'wind_burst')) {
+          this.mode = AERIAL_MODES.MACE_LAUNCH;
+          this.stage = 'WIND_BURST_BOUNCE';
+          this.stageTicks = 0;
+          return true;
+        }
+
         // Loop back into Launch/Glide immediately to lock down non-elytra targets
         if (
           this.aerialCfg.loopDiveOnGrounded !== false &&
@@ -555,10 +629,14 @@ const elytraSkillMethods = {
   },
 
   _tickElytraStrikeChestplate(target) {
-    this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28, force: true });
+    this._aimAtTarget(target, 1, { speedMultiplier: 1.85, toleranceRad: 0.36, force: true });
     this.isGliding = false;
-    this._restoreChestplate();
-    this.stage = 'STRIKE_EQUIP_MACE';
+    this._restoreChestplate(true);
+    // If Density Mace was already pre-equipped during DIVE, go straight to STRIKE_SMASH with zero extra tick latency!
+    const densityMace = this._findDensityMace();
+    this.stage = (densityMace && this._isHoldingSelection(densityMace))
+      ? 'STRIKE_SMASH'
+      : 'STRIKE_EQUIP_MACE';
     return true;
   },
 
