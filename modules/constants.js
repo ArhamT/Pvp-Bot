@@ -1,5 +1,7 @@
 'use strict';
 
+const { Vec3 } = require('vec3');
+
 const OFFHAND_SLOT = 45;
 const HOTBAR_START = 36;
 const TORSO_SLOT = 6;
@@ -134,7 +136,7 @@ function findOverlappingBlock(bot, predicate) {
         const key = `${bx},${by},${bz}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const block = bot.blockAt({ x: bx, y: by, z: bz });
+        const block = bot.blockAt(new Vec3(bx, by, bz));
         if (block && predicate(block)) {
           return block;
         }
