@@ -524,7 +524,7 @@ const pearlCatchMethods = {
       }
 
       const reachDist = this._getReachDistance(target);
-      const aimStatus = this._aimAtTarget(target, 1, { speedMultiplier: 1.9, toleranceRad: 0.30, force: true });
+      const { aimStatus } = this._steerAirborneToward(target, 1);
 
       // If opponent raises shield frontally, stun-slam with Axe -> Density Mace!
       const counter = evaluateShieldCounter(this.bot, this.targetState, {

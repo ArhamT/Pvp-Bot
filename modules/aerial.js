@@ -907,13 +907,16 @@ class AerialModule {
   }
 
   /**
-   * 3D airborne steering: aims smoothly at target's predicted hitbox and drives
-   * forward/back/sprint controls to land directly on top of the opponent.
+   * Full 360-degree 3D airborne steering: snaps smoothly toward target's predicted hitbox
+   * (`force: true`) and projects the horizontal vector onto the bot's local forward/right axes
+   * so WASD + sprint air-control drifts directly onto the opponent on every airborne tick
+   * (during Wind Burst jumps, Pearl Catches, and post-Elytra Mace smashes).
    */
   _steerAirborneToward(target, leadTicks = 2) {
     const aimStatus = this._aimAtTarget(target, leadTicks, {
-      speedMultiplier: 1.75,
-      toleranceRad: 0.34
+      speedMultiplier: 2.0,
+      toleranceRad: 0.36,
+      force: true
     });
 
     const pos = this.bot.entity.position;
@@ -923,12 +926,35 @@ class AerialModule {
     const horizDist = Math.sqrt(dx * dx + dz * dz);
 
     if (typeof this.bot.setControlState === 'function') {
-      const facing = aimStatus.yawErrorDeg < 55;
-      this.bot.setControlState('forward', facing && horizDist > 1.0);
-      this.bot.setControlState('back', facing && horizDist < 0.6);
-      this.bot.setControlState('sprint', facing && horizDist > 2.2);
-      this.bot.setControlState('left', false);
-      this.bot.setControlState('right', false);
+      if (horizDist > 0.65) {
+        const nx = dx / horizDist;
+        const nz = dz / horizDist;
+        const yaw = this.bot.entity.yaw || 0;
+        const fx = -Math.sin(yaw);
+        const fz = -Math.cos(yaw);
+        const rx = Math.cos(yaw);
+        const rz = -Math.sin(yaw);
+
+        const fwdDot = nx * fx + nz * fz;
+        const rightDot = nx * rx + nz * rz;
+
+        const moveFwd = fwdDot > 0.25;
+        const moveBack = fwdDot < -0.35;
+        const moveRight = rightDot > 0.25;
+        const moveLeft = rightDot < -0.25;
+
+        this.bot.setControlState('forward', moveFwd);
+        this.bot.setControlState('back', moveBack);
+        this.bot.setControlState('right', moveRight);
+        this.bot.setControlState('left', moveLeft);
+        this.bot.setControlState('sprint', moveFwd && horizDist > 1.35);
+      } else {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('back', horizDist < 0.35);
+        this.bot.setControlState('left', false);
+        this.bot.setControlState('right', false);
+        this.bot.setControlState('sprint', false);
+      }
     }
 
     return { aimStatus, horizDist };

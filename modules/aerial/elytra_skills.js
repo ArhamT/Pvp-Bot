@@ -497,11 +497,7 @@ const elytraSkillMethods = {
         return this._tickSwordRestore();
       }
 
-      const aimStatus = this._aimAtTarget(target, 1, {
-        speedMultiplier: 1.9,
-        toleranceRad: 0.42,
-        force: true
-      });
+      const { aimStatus } = this._steerAirborneToward(target, 1);
 
       // Shield counter: stun-slam with Axe -> Density Mace if opponent shields frontally
       const counter = evaluateShieldCounter(this.bot, this.targetState, {
