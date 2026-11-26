@@ -505,6 +505,27 @@ class AerialModule {
     });
   }
 
+  /**
+   * Explicitly prefers the highest-Density Mace for high-altitude Elytra / Pearl-Catch dive smashes,
+   * falling back to `_findMace()` when no Density Mace is carried.
+   */
+  _findDensityMace() {
+    this.weaponEnchantments = scanWeaponEnchantments(this.bot);
+    if (
+      this.weaponEnchantments &&
+      this.weaponEnchantments.densityMace &&
+      this.weaponEnchantments.densityMace.density > 0
+    ) {
+      return {
+        item: this.weaponEnchantments.densityMace.item,
+        hotbarIndex: this.weaponEnchantments.densityMace.hotbarIndex,
+        slot: this.weaponEnchantments.densityMace.slot,
+        isDensity: true
+      };
+    }
+    return this._findMace(true);
+  }
+
   _findAxe() {
     const slots = this._getCombatHotbarSlots();
     const preferred = slots && typeof slots.axeSlot === 'number' ? slots.axeSlot : -1;

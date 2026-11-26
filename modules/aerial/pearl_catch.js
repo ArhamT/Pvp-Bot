@@ -12,7 +12,8 @@ const {
   AXE_PRIORITY,
   CHESTPLATE_PRIORITY,
   isSpearItem,
-  hasItemEnchant
+  hasItemEnchant,
+  clearMovementControls
 } = require('../constants');
 const {
   scanWeaponEnchantments,
@@ -264,14 +265,17 @@ const pearlCatchMethods = {
     const { onGround, inWater } = this._getEnvironmentFlags();
     const reach = this.combatCfg.reach || DEFAULT_REACH;
 
-    // Stage 1: Aim straight up (+90° pitch) when throwing Pearl + Wind Charge intercept,
-    // or solve ballistic arc toward target only when wind charges are unavailable.
+    // Stage 1: Stop horizontal running/sprinting, aim straight up (+90° pitch) for Pearl + Wind Charge intercept,
+    // and only release pearl once horizontal velocity has settled so wind_charge intercepts the pearl cleanly.
     if (this.stage === 'PEARL_AIM_THROW') {
       if (this.stageTicks > 18 || !this.pearlCatchLandingTarget) {
         this.mode = AERIAL_MODES.MACE_LAUNCH;
         this.stage = 'AIRBORNE_DESCENT';
         return true;
       }
+
+      // CRITICAL: Zero all WASD/sprint/jump controls while pearl catching so horizontal drift never breaks the vertical catch!
+      clearMovementControls(this.bot);
 
       const pearlSel = this._findItemByName('ender_pearl');
       if (!pearlSel) {
@@ -310,7 +314,11 @@ const pearlCatchMethods = {
         force: true
       });
 
-      if (eq.ready && !eq.swapped && aimStatus.aligned) {
+      const vel = this.bot.entity.velocity || new Vec3(0, 0, 0);
+      const horizSpeed = Math.hypot(vel.x || 0, vel.z || 0);
+      const horizontalSettled = !useVerticalCatch || horizSpeed <= 0.14 || this.stageTicks >= 3;
+
+      if (eq.ready && !eq.swapped && aimStatus.aligned && horizontalSettled) {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
@@ -327,8 +335,10 @@ const pearlCatchMethods = {
       return true;
     }
 
-    // Stage 1b: Next-tick Wind Charge interception straight up (+90° pitch) for high-speed Pearl Catch
+    // Stage 1b: Next-tick Wind Charge interception straight up (+90° pitch) while movement stays zeroed
     if (this.stage === 'PEARL_WIND_INTERCEPT') {
+      clearMovementControls(this.bot);
+
       const windSel = this._findItemByName('wind_charge');
       if (!windSel || !this.pearlInterceptVec) {
         this.stage = 'PEARL_WAIT_TP';
@@ -349,10 +359,11 @@ const pearlCatchMethods = {
       }
       this.stage = 'PEARL_WAIT_TP';
       this.stageTicks = 0;
+      this.elytraGlideRetrySent = false;
       return true;
     }
 
-    // Stage 2: Pre-equip Mace (7-Block Rule) while pearl flies -> instant smash on teleport/arrival!
+    // Stage 2: After Pearl Catch -> if coming down with Elytra available, equip Elytra & glide-aim onto opponent!
     if (this.stage === 'PEARL_WAIT_TP') {
       if (!target || !target.isValid) {
         if (this._shouldTriggerClutch(null, true)) {
@@ -363,13 +374,42 @@ const pearlCatchMethods = {
         return this._tickSwordRestore();
       }
 
+      const pos = this.bot.entity.position;
+      const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
+      const heightAboveTarget = pos.y - target.position.y;
       const reachDist = this._getReachDistance(target);
+
+      // Pro Mace-Elytra transition: while descending above opponent after pearl catch, equip Elytra & glide onto them
+      if (
+        !onGround &&
+        !inWater &&
+        this._hasElytraAvailable() &&
+        reachDist > reach + 0.45 &&
+        (velY < -0.04 || this.teleportedThisTick || heightAboveTarget >= 3.5)
+      ) {
+        const torso = this._getTorsoItem();
+        if (torso && torso.name && torso.name.endsWith('_chestplate')) {
+          this.savedChestplateName = torso.name;
+        }
+        if (!this._isWearingElytra()) {
+          const elytraSel = this._findItemByName('elytra');
+          if (elytraSel) {
+            this._equipTorso(elytraSel.item, true);
+            this.elytraSwappedIn = true;
+          }
+        }
+        this.stage = 'PEARL_ELYTRA_GLIDE';
+        this.stageTicks = 0;
+        this.elytraGlideRetrySent = false;
+        return this._tickPearlCatch(target);
+      }
+
       const { aimStatus } = this._steerAirborneToward(target, 1);
 
       // Shield countering branch (BACKSTAB / STUN_SLAM / SHIELD_DRAIN)
       const counter = evaluateShieldCounter(this.bot, this.targetState, {
         hasAxe: Boolean(this._findAxe()),
-        hasMace: Boolean(this._findMace(true)),
+        hasMace: Boolean(this._findDensityMace()),
         isAirborne: !onGround,
         isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
       });
@@ -381,7 +421,7 @@ const pearlCatchMethods = {
         return this._tickStunSlam(target);
       }
 
-      const maceSel = this._findMace(true);
+      const maceSel = this._findDensityMace();
       if (maceSel) {
         const eq = this._equipHand(maceSel);
         const arrivedInReach = reachDist <= reach + 0.25 && (this.teleportedThisTick || aimStatus.aligned || aimStatus.yawErrorDeg < 35);
@@ -400,7 +440,6 @@ const pearlCatchMethods = {
         }
       }
 
-      // Timeout or landed away from target -> recover cleanly
       if (this.stageTicks > 35 || ((onGround || inWater) && this.stageTicks > 6 && !this.teleportedThisTick)) {
         this.stage = 'SWORD_RESTORE';
         return this._tickSwordRestore();
@@ -409,6 +448,128 @@ const pearlCatchMethods = {
       if (this._shouldTriggerClutch(target, true)) {
         this._enterClutch();
         return this._tickClutch();
+      }
+
+      return true;
+    }
+
+    // Stage 2b: PEARL_ELYTRA_GLIDE — Glide down with Elytra aimed directly onto opponent's predicted hitbox
+    if (this.stage === 'PEARL_ELYTRA_GLIDE') {
+      if (!target || !target.isValid || onGround || inWater) {
+        this._restoreChestplate(true);
+        this.isGliding = false;
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+
+      if (!this._isWearingElytra()) {
+        const elytraSel = this._findItemByName('elytra');
+        if (elytraSel) {
+          this._equipTorso(elytraSel.item, true);
+          this.elytraSwappedIn = true;
+          return true;
+        }
+      }
+
+      if (!this.bot.entity.elytraFlying && !this.elytraGlideRetrySent) {
+        this._sendStartElytraFlying();
+        this.isGliding = true;
+        this.elytraGlideRetrySent = true;
+      }
+
+      const pos = this.bot.entity.position;
+      const predPos = this._getPredictedPosition(target, 2);
+      const dx = predPos.x - pos.x;
+      const dy = (predPos.y + ((target.height || 1.8) * 0.55)) - (pos.y + 1.2);
+      const dz = predPos.z - pos.z;
+      const horizDist = Math.hypot(dx, dz);
+      const heightAboveTarget = pos.y - predPos.y;
+      const reachDist = this._getReachDistance(target);
+
+      const yawToTarget = Math.atan2(-dx, -dz);
+      const glidePitch = clamp(Math.atan2(dy, Math.max(0.1, horizDist)), -82 * DEG_TO_RAD, -10 * DEG_TO_RAD);
+      this.aimer.stepTowardsAngles(yawToTarget, glidePitch, { speedMultiplier: 1.9, force: true });
+
+      // Pre-equip Density Mace while still gliding so smash fires with zero delay right after chestplate swap
+      const densitySel = this._findDensityMace();
+      if (densitySel && !this.swappedThisTick) {
+        this._equipHand(densitySel);
+      }
+
+      // Swap back to Chestplate right before impact (<= 5.2b reach or <= 4.2b height & <= 5.5b horizontal)
+      if (reachDist <= 5.2 || (heightAboveTarget <= 4.2 && horizDist <= 5.5)) {
+        this._restoreChestplate(true);
+        this.isGliding = false;
+        this.stage = 'PEARL_ELYTRA_SWAP_SMASH';
+        this.stageTicks = 0;
+        return true;
+      }
+
+      if (this.stageTicks > 55) {
+        this._restoreChestplate(true);
+        this.isGliding = false;
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+
+      return true;
+    }
+
+    // Stage 2c: PEARL_ELYTRA_SWAP_SMASH — Chestplate restored, lock onto opponent and deliver Density Mace Smash!
+    if (this.stage === 'PEARL_ELYTRA_SWAP_SMASH') {
+      if (!target || !target.isValid || onGround || inWater) {
+        this._restoreChestplate(true);
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
+      }
+
+      const reachDist = this._getReachDistance(target);
+      const aimStatus = this._aimAtTarget(target, 1, { speedMultiplier: 1.9, toleranceRad: 0.30, force: true });
+
+      // If opponent raises shield frontally, stun-slam with Axe -> Density Mace!
+      const counter = evaluateShieldCounter(this.bot, this.targetState, {
+        hasAxe: Boolean(this._findAxe()),
+        hasMace: Boolean(this._findDensityMace()),
+        isAirborne: !onGround,
+        isGliding: false
+      });
+      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.8) {
+        this.mode = AERIAL_MODES.STUN_SLAM;
+        this.stage = 'AXE_BREAK';
+        this.stageTicks = 0;
+        this.stunSlamAxeSwapped = false;
+        return this._tickStunSlam(target);
+      }
+
+      const densitySel = this._findDensityMace();
+      let holdingMace = densitySel ? this._isHoldingSelection(densitySel) : false;
+      if (!holdingMace && densitySel) {
+        const eq = this._equipHand(densitySel);
+        holdingMace = eq.ready && !eq.swapped;
+      }
+
+      if (holdingMace && reachDist <= reach + 0.35 && (aimStatus.aligned || aimStatus.yawErrorDeg < 35)) {
+        if (typeof this.bot.setControlState === 'function') {
+          this.bot.setControlState('sprint', false);
+        }
+        this.bot.attack(target);
+        this._resetFallAfterSmash();
+        this.windBurstChainCount++;
+        this.mode = AERIAL_MODES.MACE_LAUNCH;
+        this.stage = 'WIND_BURST_BOUNCE';
+        this.stageTicks = 0;
+        this.windBurstBounceTicks = 0;
+        return true;
+      }
+
+      if (this._shouldTriggerClutch(target, true)) {
+        this._enterClutch();
+        return this._tickClutch();
+      }
+
+      if (this.stageTicks > 25) {
+        this.stage = 'SWORD_RESTORE';
+        return this._tickSwordRestore();
       }
 
       return true;

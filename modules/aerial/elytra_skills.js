@@ -99,18 +99,31 @@ const elytraSkillMethods = {
     const { inWater, inLava } = this._getEnvironmentFlags();
     if (inWater || inLava) return false;
 
-    // Must carry elytra, firework_rocket, chestplate (torso or inventory), and mace
+    // Must carry elytra, chestplate (or already wearing elytra), and mace
     if (!this._hasElytraAvailable()) return false;
-    if (!this._findItemByName('firework_rocket')) return false;
     if (!this._hasChestplateAvailable()) return false;
     if (!this._findMace()) return false;
 
     const minDist = this.aerialCfg.elytraMinDistance !== undefined
       ? this.aerialCfg.elytraMinDistance
       : 20.0;
-    const dist = this.bot.entity.position.distanceTo(target.position);
-
+    const pos = this.bot.entity.position;
+    const dist = pos.distanceTo(target.position);
+    const horizDist = Math.hypot(target.position.x - pos.x, target.position.z - pos.z);
+    const heightAboveTarget = pos.y - target.position.y;
     const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
+
+    // Pro High-Tier Airborne Descent Dive: coming down from any high fall (> 4.5b above target) -> glide onto opponent even without rockets!
+    const highDescentGlide = !this.bot.entity.onGround &&
+      velY < -0.08 &&
+      heightAboveTarget >= 4.5 &&
+      horizDist >= 4.0;
+    if (highDescentGlide) {
+      return true;
+    }
+
+    if (!this._findItemByName('firework_rocket')) return false;
+
     const heightAboveGround = this._getHeightAboveGround();
     const afterVerticalLaunch = !this.bot.entity.onGround &&
       dist >= 6.0 &&
@@ -398,11 +411,11 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5b: STRIKE_EQUIP_MACE — Equip 7-Block Mace on next tick
+    // Stage 5b: STRIKE_EQUIP_MACE — Equip Density Mace on next tick
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_EQUIP_MACE') {
       this._aimAtTarget(target, 1, { speedMultiplier: 1.5, toleranceRad: 0.28, force: true });
-      const maceSel = this._findMace();
+      const maceSel = this._findDensityMace();
       if (maceSel) {
         this._equipHand(maceSel);
       }
@@ -411,7 +424,7 @@ const elytraSkillMethods = {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5c: STRIKE_SMASH — Flight Crit Mace Smash (<= 3.0b) + Immediate Loop on grounded target
+    // Stage 5c: STRIKE_SMASH — Flight Crit Density Mace Smash (<= 3.0b) + Shield Stun-Slam + Loop
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_SMASH') {
       if (onGround || inWater) {
@@ -425,14 +438,29 @@ const elytraSkillMethods = {
         force: true
       });
 
-      const maceSel = this._findMace();
+      // Shield counter: stun-slam with Axe -> Density Mace if opponent shields frontally
+      const counter = evaluateShieldCounter(this.bot, this.targetState, {
+        hasAxe: Boolean(this._findAxe()),
+        hasMace: Boolean(this._findDensityMace()),
+        isAirborne: !onGround,
+        isGliding: false
+      });
+      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.8) {
+        this.mode = AERIAL_MODES.STUN_SLAM;
+        this.stage = 'AXE_BREAK';
+        this.stageTicks = 0;
+        this.stunSlamAxeSwapped = false;
+        return this._tickStunSlam(target);
+      }
+
+      const maceSel = this._findDensityMace();
       let holdingMace = maceSel ? this._isHoldingSelection(maceSel) : false;
       if (!holdingMace && maceSel) {
         const eq = this._equipHand(maceSel);
         holdingMace = eq.ready && !eq.swapped;
       }
 
-      if (holdingMace && reachDist <= reach && aimStatus.aligned) {
+      if (holdingMace && reachDist <= reach + 0.25 && aimStatus.aligned) {
         if (typeof this.bot.setControlState === 'function') {
           this.bot.setControlState('sprint', false);
         }
