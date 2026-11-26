@@ -8,7 +8,7 @@ const { Vec3 } = require('vec3');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
 
-const { ROAM_HAZARD_BLOCKS, clearMovementControls } = require('./modules/constants');
+const { ROAM_HAZARD_BLOCKS, clearMovementControls, getItemMetadataText } = require('./modules/constants');
 const { SmoothAimer, normalizeAngle } = require('./modules/aim');
 const { PredictionModule } = require('./modules/prediction');
 const { CombatModule } = require('./modules/combat');
@@ -30,6 +30,20 @@ const STATES = Object.freeze({
 
 const DUEL_REQUEST_REGEX = /(?:^|[\s•|:\]>»-])([A-Za-z0-9_]{3,16})\s+(?:has\s+sent(?:\s+you)?\s+a\s+duel\s+request|sent(?:\s+you)?\s+a\s+duel\s+request|challenged\s+you\s+to\s+a\s+duel)/i;
 const DUEL_START_CUE_REGEX = /(?:^|[\s•|:\]>»-])(?:go!+|fight!+)(?:$|[\s!.,])/i;
+
+const LOBBY_MENU_KEYWORDS = [
+  'kit editor', 'kiteditor', 'edit kit', 'settings', 'preferences',
+  'unranked', 'ranked', 'join queue', 'queue', 'spectate', 'party',
+  'cosmetics', 'leaderboard', 'statistics', 'stats', 'profile',
+  'server selector', 'game menu', 'main menu', 'return to lobby',
+  'leave queue', 'play duels', 'duel menu', 'ffa menu'
+];
+
+const LOBBY_MENU_ITEM_NAMES = new Set([
+  'compass', 'clock', 'nether_star', 'comparator', 'repeater',
+  'writable_book', 'knowledge_book', 'book', 'paper',
+  'name_tag', 'player_head', 'anvil'
+]);
 
 /**
  * Strips legacy Minecraft color/formatting codes (§x / &x) and trims whitespace.
@@ -628,18 +642,42 @@ class PvPBotController {
     return false;
   }
 
+  /**
+   * Returns true when inventory contains spawn/lobby selector or GUI menu items
+   * (e.g. Settings, Kit Editor, Unranked/Ranked Queue, Party, Spectate).
+   * Overrides arena auto-engage so the bot never fights in spawn.
+   */
+  _hasLobbyMenuItems() {
+    if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return false;
+    const wearingArmor = this._isWearingCombatArmor();
+
+    for (const item of this.bot.inventory.slots) {
+      if (!item || !item.name) continue;
+      if (!wearingArmor && LOBBY_MENU_ITEM_NAMES.has(item.name)) {
+        return true;
+      }
+
+      const customStr = item.customName
+        ? (typeof item.customName === 'string' ? item.customName : JSON.stringify(item.customName))
+        : '';
+      const rawText = `${getItemMetadataText(item)} ${customStr} ${item.displayName || ''}`;
+      const cleanText = stripColorCodes(rawText).toLowerCase();
+      if (cleanText && LOBBY_MENU_KEYWORDS.some((kw) => cleanText.includes(kw))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   _hasCombatKit() {
+    if (this._hasLobbyMenuItems()) return false;
     if (this._isWearingCombatArmor()) return true;
     if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return false;
 
     let hasCombatWeapon = false;
-    let hasLobbySelector = false;
     for (const item of this.bot.inventory.slots) {
       if (!item || !item.name) continue;
       const n = item.name;
-      if (n === 'compass' || n === 'clock' || n === 'nether_star') {
-        hasLobbySelector = true;
-      }
       if (
         n === 'netherite_sword' || n === 'diamond_sword' || n === 'iron_sword' ||
         n === 'mace' || n === 'end_crystal' || n === 'respawn_anchor' ||
@@ -649,9 +687,6 @@ class PvPBotController {
         hasCombatWeapon = true;
       }
     }
-    if (hasLobbySelector && !this.inFfaArena && !this.inDuelArena) {
-      return false;
-    }
     return hasCombatWeapon;
   }
 
@@ -660,6 +695,7 @@ class PvPBotController {
    */
   _detectArenaMode() {
     if (!this.bot || !this.bot.entity) return 'LOBBY';
+    if (this._hasLobbyMenuItems()) return 'LOBBY';
     if (this.inDuelArena || this.pendingDuelReady) return 'DUELS';
 
     const hasKit = this._hasCombatKit();
@@ -1595,6 +1631,13 @@ class PvPBotController {
       return;
     }
 
+    if (!this.autoFight && this._hasLobbyMenuItems()) {
+      this._clearTargetState(true);
+      this.inFfaArena = false;
+      this.transitionState(STATES.IDLE, 'spawn/lobby menu items detected');
+      return;
+    }
+
     const target = this._resolveActiveTarget();
 
     // 1. HIGHEST PRIORITY: Offhand Totem of Undying (slot 45) / Shield safety
@@ -1703,6 +1746,16 @@ class PvPBotController {
     // Stay calm in safe LOBBY hubs, but always engage in DUELS/FFA arenas (respecting red_wool safe zone in FFA).
     const engageRange = this.config.combat.engageRange || 36.0;
     const arenaMode = this._detectArenaMode();
+    if (arenaMode === 'LOBBY' && this._hasLobbyMenuItems()) {
+      this.inDuelArena = false;
+      this.inFfaArena = false;
+      this.pendingDuelReady = false;
+      this.autoStartDuelUntil = 0;
+      if (!this.autoFight) {
+        this._tickSpawnRoam();
+        return;
+      }
+    }
     const canEngagePending = arenaMode === 'DUELS' || this._hasCombatKit();
 
     if (this.pendingDuelTarget && this.pendingDuelReady && canEngagePending) {
