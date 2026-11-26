@@ -250,5 +250,19 @@
     "lavaWaterCooldownMs": 2500,
     "stallTicksThreshold": 16,
     "allowBlockDig": true
+  },
+  "liquidDeny": {
+    "enabled": true,
+    "maxRange": 4.5,
+    "preferEmptyBucket": true,
+    "cooldownMs": 300,
+    "threatTtlMs": 1800
+  },
+  "redWoolZone": {
+    "enabled": true,
+    "blockNames": ["red_wool"],
+    "ringScanRadius": 14,
+    "exitBufferBlocks": 2.5,
+    "maxExitTicks": 120
   }
 }

@@ -1197,7 +1197,8 @@ class AerialModule {
     const { onGround, inWater } = this._getEnvironmentFlags();
     const reach = this.combatCfg.reach || DEFAULT_REACH;
 
-    // Stage 1: Aim along target vector (force = true) & throw Ender Pearl
+    // Stage 1: Aim straight up (+90° pitch) when throwing Pearl + Wind Charge intercept,
+    // or solve ballistic arc toward target only when wind charges are unavailable.
     if (this.stage === 'PEARL_AIM_THROW') {
       if (this.stageTicks > 18 || !this.pearlCatchLandingTarget) {
         this.mode = AERIAL_MODES.MACE_LAUNCH;
@@ -1213,18 +1214,32 @@ class AerialModule {
       }
 
       const eq = this._equipHand(pearlSel);
-      const targetPos = (this.pearlCatchLandingTarget.useTargetVel && target && target.isValid)
-        ? target.position.offset(0, 0.3, 0)
-        : this.pearlCatchLandingTarget.catchPos;
-      const targetVel = (this.pearlCatchLandingTarget.useTargetVel && target && target.velocity)
-        ? target.velocity
-        : null;
+      const hasWindCharge = Boolean(
+        this.aerialCfg.pearlWindInterceptEnabled !== false &&
+        this._findItemByName('wind_charge')
+      );
+      const useVerticalCatch = hasWindCharge ||
+        (this.pearlCatchLandingTarget && this.pearlCatchLandingTarget.reason === 'windburst_self_pearl_catch');
 
-      const sol = this._solvePearlBallistics(targetPos, targetVel);
-      this.pearlInterceptVec = { yaw: sol.yaw, pitch: sol.pitch };
-      const aimStatus = this.aimer.stepTowardsAngles(sol.yaw, sol.pitch, {
+      let aimYaw = this.bot.entity.yaw || 0;
+      let aimPitch = Math.PI / 2; // Exact +90 deg straight up for Wind Charge Pearl Catch
+
+      if (!useVerticalCatch) {
+        const targetPos = (this.pearlCatchLandingTarget.useTargetVel && target && target.isValid)
+          ? target.position.offset(0, 0.3, 0)
+          : this.pearlCatchLandingTarget.catchPos;
+        const targetVel = (this.pearlCatchLandingTarget.useTargetVel && target && target.velocity)
+          ? target.velocity
+          : null;
+        const sol = this._solvePearlBallistics(targetPos, targetVel);
+        aimYaw = sol.yaw;
+        aimPitch = sol.pitch;
+      }
+
+      this.pearlInterceptVec = { yaw: aimYaw, pitch: aimPitch, vertical: useVerticalCatch };
+      const aimStatus = this.aimer.stepTowardsAngles(aimYaw, aimPitch, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.14,
+        toleranceRad: 0.08,
         force: true
       });
 
@@ -1234,7 +1249,7 @@ class AerialModule {
         }
         this.lastPearlCatchTime = Date.now();
         this.trackedEnemyPearl = null;
-        if (this.aerialCfg.pearlWindInterceptEnabled !== false && this._findItemByName('wind_charge')) {
+        if (hasWindCharge) {
           this.stage = 'PEARL_WIND_INTERCEPT';
         } else {
           this.stage = 'PEARL_WAIT_TP';
@@ -1245,7 +1260,7 @@ class AerialModule {
       return true;
     }
 
-    // Stage 1b: Next-tick Wind Charge interception so the Pearl intercepts the Wind Charge for high-speed catch
+    // Stage 1b: Next-tick Wind Charge interception straight up (+90° pitch) for high-speed Pearl Catch
     if (this.stage === 'PEARL_WIND_INTERCEPT') {
       const windSel = this._findItemByName('wind_charge');
       if (!windSel || !this.pearlInterceptVec) {
@@ -1260,7 +1275,8 @@ class AerialModule {
         this._equipHand(windSel);
       }
 
-      this.aimer.stepTowardsAngles(this.pearlInterceptVec.yaw, this.pearlInterceptVec.pitch, { force: true });
+      const windPitch = this.pearlInterceptVec.vertical ? Math.PI / 2 : this.pearlInterceptVec.pitch;
+      this.aimer.stepTowardsAngles(this.pearlInterceptVec.yaw, windPitch, { force: true });
       if (typeof this.bot.activateItem === 'function') {
         this.bot.activateItem(false);
       }

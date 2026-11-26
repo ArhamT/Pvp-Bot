@@ -11,7 +11,12 @@ const {
   clearMovementControls,
   getItemMetadataText
 } = require('./constants');
-const { parseItemEnchantments, validateArmorInventory } = require('./mace_elytra');
+const {
+  parseItemEnchantments,
+  validateArmorInventory,
+  buildTargetState,
+  detectIncomingMaceAttack
+} = require('./mace_elytra');
 
 const GAPPLE_PRIORITY = [
   'enchanted_golden_apple',
@@ -217,8 +222,16 @@ class SurvivalModule {
 
     // Shield state
     this.isShielding = false;
+    this.shieldHand = 'off-hand'; // 'off-hand' | 'main-hand'
+    this.shieldingForMace = false;
+    this.prevShieldHotbarSlot = -1;
+    this.pendingMainhandShieldSlot = -1;
     this.shieldTicksRemaining = 0;
+    this.shieldHoldTicks = 0;
     this.lastShieldEndTime = 0;
+    this.lastMaceShieldEndTime = 0;
+    this.maceAntiStunActive = false;
+    this.maceShieldThreat = null;
 
     // Consumption, potion & XP armor mending state
     this.isConsuming = false;
@@ -679,7 +692,14 @@ class SurvivalModule {
         Array.isArray(target.equipment) &&
         target.equipment.some((e) => e && e.name === 'totem_of_undying')
       );
-      if (!isGrounded && targetHasTotem) {
+      const hasInventoryTotem = Boolean(this.findTotemInInventory());
+      const incomingMaceDive = Boolean(
+        !hasInventoryTotem &&
+        target &&
+        target.isValid &&
+        detectIncomingMaceAttack(this.bot, target).shouldShield
+      );
+      if (!isGrounded && targetHasTotem && !incomingMaceDive) {
         return false;
       }
 
@@ -1706,32 +1726,114 @@ class SurvivalModule {
    * - Enemy rushes with an axe/sword while our weapon is on cooldown (`weaponCooldownProgress < 0.88`).
    * Returns true while actively blocking so melee combat does not swing concurrently.
    */
+  _findHotbarShield() {
+    if (!this.bot || !this.bot.inventory || !Array.isArray(this.bot.inventory.slots)) return null;
+    const hotbarStart = this.bot.inventory.hotbarStart || HOTBAR_START;
+    for (let idx = 0; idx < 9; idx++) {
+      const item = this.bot.inventory.slots[hotbarStart + idx];
+      if (item && item.name === 'shield') {
+        return { item, hotbarIndex: idx };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Smart shield controller:
+   * - Raises offhand shield (`activateItem(true)`) OR main-hand hotbar shield (`activateItem(false)`)
+   *   without ever dropping offhand Totem of Undying on incoming Mace smashes!
+   * - Pre-raises shield for Mace dive smashes, Wind Burst bounces, & grounded Breach swaps.
+   * - Drops & sidesteps Axe Stun-Slam dive baits, and instantly drops post-impact for counter-punish.
+   * - Raises offhand shield against drawn bows (<12b) or melee rushes while on cooldown.
+   */
   tickShield(target, weaponCooldownProgress = 1.0) {
     if (!this.survCfg.shieldEnabled || this.totemEquipInFlight || this.totemSwapPending) {
+      this.maceAntiStunActive = false;
+      this.maceShieldThreat = null;
       this.lowerShield();
       return false;
     }
+
+    if (!target || !target.isValid || this.isConsuming || (this.bot.entity && this.bot.entity.elytraFlying)) {
+      this.maceAntiStunActive = false;
+      this.maceShieldThreat = null;
+      this.lowerShield();
+      return false;
+    }
+
+    const maceThreat = detectIncomingMaceAttack(
+      this.bot,
+      target,
+      buildTargetState(target),
+      weaponCooldownProgress
+    );
+    this.maceShieldThreat = maceThreat;
+    this.maceAntiStunActive = Boolean(maceThreat.antiStunBait);
 
     const offhand = this.getOffhandItem();
-    const hasShield = offhand && offhand.name === 'shield';
-    if (!hasShield || !target || !target.isValid || this.isConsuming) {
+    const hasOffhandShield = Boolean(offhand && offhand.name === 'shield');
+    const hotbarShield = !hasOffhandShield && (maceThreat.shouldShield || (this.isShielding && this.shieldHand === 'main-hand'))
+      ? this._findHotbarShield()
+      : null;
+
+    if (!hasOffhandShield && !hotbarShield) {
       this.lowerShield();
       return false;
     }
 
-    const bowThreat = this.isEnemyDrawingBow(target);
+    const bowThreat = hasOffhandShield ? this.isEnemyDrawingBow(target) : false;
     const weaponOnCooldown = weaponCooldownProgress < 0.88;
-    const rushThreat = weaponOnCooldown && this.isEnemyRushingMelee(target);
-    const shouldRaise = bowThreat || rushThreat;
+    const rushThreat = hasOffhandShield ? (weaponOnCooldown && this.isEnemyRushingMelee(target)) : false;
+    const shouldRaise = Boolean(maceThreat.shouldShield || bowThreat || rushThreat);
 
     const now = Date.now();
 
     if (this.isShielding) {
       this.shieldTicksRemaining--;
+      this.shieldHoldTicks++;
       // Never sprint while shielding (prevents NoSlow flags)
       this.bot.setControlState('sprint', false);
 
-      // Drop shield once threat ends, our weapon is ready (for melee rush), or timer elapses
+      // Axe Stun-Slam bait -> release block immediately without cooldown or slot swap so we can snap block in 1 tick on Mace swap
+      if (maceThreat.antiStunBait) {
+        if (this.shieldHand === 'main-hand') {
+          try { this.bot.deactivateItem(); } catch (_) {}
+          this.isShielding = false;
+          this.shieldTicksRemaining = 0;
+          this.shieldHoldTicks = 0;
+          if (this.bot && typeof this.bot.setControlState === 'function') {
+            this.bot.setControlState('back', false);
+          }
+        } else {
+          this.lowerShield();
+        }
+        return false;
+      }
+
+      if (this.shieldingForMace) {
+        // Step back slightly if diving opponent tries to pass overhead (prevents backstab)
+        if (maceThreat.horizDist < 2.2) {
+          this.bot.setControlState('back', true);
+        } else {
+          this.bot.setControlState('back', false);
+        }
+
+        if (maceThreat.shouldShield && this.shieldHoldTicks < 28) {
+          this.shieldTicksRemaining = Math.max(this.shieldTicksRemaining, 6);
+          return true;
+        }
+
+        // Drop immediately once smash completes / enemy lands for zero-delay counter-punish
+        if (maceThreat.postImpactWindow || this.shieldHoldTicks >= 28 || (!shouldRaise && this.shieldTicksRemaining <= 8) || this.shieldTicksRemaining <= 0) {
+          this.lowerShield();
+          this.lastMaceShieldEndTime = now;
+          this.lastShieldEndTime = now;
+          return false;
+        }
+        return true;
+      }
+
+      // Drop shield once standard threat ends, our weapon is ready (for melee rush), or timer elapses
       const rushFinished = !bowThreat && weaponCooldownProgress >= 0.90;
       if ((!shouldRaise && this.shieldTicksRemaining <= 6) || rushFinished || this.shieldTicksRemaining <= 0) {
         this.lowerShield();
@@ -1741,10 +1843,55 @@ class SurvivalModule {
       return true;
     }
 
+    if (maceThreat.antiStunBait) {
+      this.pendingMainhandShieldSlot = -1;
+      return false;
+    }
+
+    if (maceThreat.shouldShield) {
+      const maceCooldownMs = this.survCfg.maceShieldCooldownMs !== undefined ? this.survCfg.maceShieldCooldownMs : 150;
+      if ((now - this.lastMaceShieldEndTime) < maceCooldownMs) {
+        return false;
+      }
+
+      this.bot.setControlState('sprint', false);
+      if (hasOffhandShield) {
+        this.pendingMainhandShieldSlot = -1;
+        this.shieldHand = 'off-hand';
+        this.bot.activateItem(true); // Offhand shield raise
+      } else if (hotbarShield) {
+        // 1-tick anti-cheat safe hotbar switch into mainhand shield (preserves offhand Totem!)
+        if (this.bot.quickBarSlot !== hotbarShield.hotbarIndex && typeof this.bot.setQuickBarSlot === 'function') {
+          if (this.prevShieldHotbarSlot < 0) {
+            this.prevShieldHotbarSlot = typeof this.bot.quickBarSlot === 'number' ? this.bot.quickBarSlot : 0;
+          }
+          this.pendingMainhandShieldSlot = hotbarShield.hotbarIndex;
+          this.bot.setQuickBarSlot(hotbarShield.hotbarIndex);
+          return true;
+        }
+        this.pendingMainhandShieldSlot = -1;
+        this.shieldHand = 'main-hand';
+        this.bot.activateItem(false); // Mainhand shield raise
+      }
+
+      this.isShielding = true;
+      this.shieldingForMace = true;
+      this.shieldHoldTicks = 0;
+      this.shieldTicksRemaining = this.survCfg.maceShieldDurationTicks || 18;
+      if (maceThreat.horizDist < 2.2) {
+        this.bot.setControlState('back', true);
+      }
+      return true;
+    }
+
+    this.pendingMainhandShieldSlot = -1;
     const cooldownMs = this.survCfg.shieldCooldownMs || 1200;
     const bowCooldownMs = Math.min(cooldownMs, 650);
     if (shouldRaise && (now - this.lastShieldEndTime) >= (bowThreat ? bowCooldownMs : cooldownMs)) {
       this.bot.setControlState('sprint', false);
+      this.shieldHand = 'off-hand';
+      this.shieldingForMace = false;
+      this.shieldHoldTicks = 0;
       this.bot.activateItem(true); // Offhand shield raise
       this.isShielding = true;
       this.shieldTicksRemaining = this.survCfg.shieldBlockDurationTicks || 12;
@@ -1756,9 +1903,26 @@ class SurvivalModule {
 
   lowerShield() {
     if (this.isShielding) {
-      this.bot.deactivateItem();
+      try { this.bot.deactivateItem(); } catch (_) {}
       this.isShielding = false;
       this.shieldTicksRemaining = 0;
+      this.shieldHoldTicks = 0;
+    }
+    if (this.shieldHand === 'main-hand' && this.prevShieldHotbarSlot >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
+      if (this.bot.quickBarSlot !== this.prevShieldHotbarSlot) {
+        this.bot.setQuickBarSlot(this.prevShieldHotbarSlot);
+      }
+    } else if (this.pendingMainhandShieldSlot >= 0 && this.prevShieldHotbarSlot >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
+      if (this.bot.quickBarSlot !== this.prevShieldHotbarSlot) {
+        this.bot.setQuickBarSlot(this.prevShieldHotbarSlot);
+      }
+    }
+    this.shieldHand = 'off-hand';
+    this.shieldingForMace = false;
+    this.prevShieldHotbarSlot = -1;
+    this.pendingMainhandShieldSlot = -1;
+    if (this.bot && typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('back', false);
     }
   }
 

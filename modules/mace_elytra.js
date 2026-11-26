@@ -513,6 +513,160 @@ function executeAttributeSwapAttack(bot, target, baseSel, maceSel, options = {})
   return true;
 }
 
+/**
+ * Returns true if the engagement is a Mace / Wind Charge / Elytra duel context.
+ */
+function isMaceDuelContext(bot, target) {
+  const isMaceGear = (item) => Boolean(
+    item &&
+    (item.name === 'mace' || item.name === 'wind_charge' || item.name === 'elytra')
+  );
+
+  if (bot && bot.inventory) {
+    const items = typeof bot.inventory.items === 'function'
+      ? bot.inventory.items()
+      : (Array.isArray(bot.inventory.slots) ? bot.inventory.slots : []);
+    if (items.some(isMaceGear)) return true;
+  }
+
+  if (target) {
+    if (isMaceGear(target.heldItem)) return true;
+    if (Array.isArray(target.equipment) && target.equipment.some(isMaceGear)) return true;
+    if (bot && bot.entity && bot.entity.position && target.position) {
+      const dy = target.position.y - bot.entity.position.y;
+      const vy = target.velocity && typeof target.velocity.y === 'number' ? target.velocity.y : 0;
+      if (dy >= 2.0 && vy <= -0.25) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Pro high-tier Mace smash threat detector:
+ * - Raises shield pre-impact (`estTicks <= 11`, covering Minecraft's 5-tick shield warm-up)
+ *   for aerial dive smashes, close Wind Burst bounce chains, and grounded Breach swaps.
+ * - Detects Axe Stun-Slam dive bait (`dy >= 1.2 && vy < -0.08` holding an Axe) so the bot
+ *   drops shield & sidesteps the stun instead of eating a 5s shield disable.
+ * - Flags `postImpactWindow` right after impact/landing for zero-delay counter-punish.
+ */
+function detectIncomingMaceAttack(bot, target, targetState = null, weaponCooldownProgress = 1.0) {
+  const empty = {
+    threat: false,
+    shouldShield: false,
+    antiStunBait: false,
+    postImpactWindow: false,
+    reason: 'none',
+    estTicks: Infinity,
+    horizDist: Infinity,
+    dist3D: Infinity,
+    dy: 0,
+    vy: 0
+  };
+  if (!bot || !bot.entity || !bot.entity.position || !target || !target.position) {
+    return empty;
+  }
+
+  const state = targetState || buildTargetState(target);
+  const botPos = bot.entity.position;
+  const tPos = target.position;
+  const vel = (state && state.velocity) || target.velocity || { x: 0, y: 0, z: 0 };
+
+  const dx = botPos.x - tPos.x;
+  const dy = tPos.y - botPos.y;
+  const dz = botPos.z - tPos.z;
+  const vy = typeof vel.y === 'number' ? vel.y : 0;
+  const horizDist = Math.sqrt(dx * dx + dz * dz);
+  const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+  const closingSpeed = horizDist > 0.05
+    ? ((vel.x || 0) * (dx / horizDist) + (vel.z || 0) * (dz / horizDist))
+    : 1.0;
+
+  const enemyHeld = target.heldItem || (Array.isArray(target.equipment) ? target.equipment[0] : null);
+  const enemyHeldName = enemyHeld && enemyHeld.name ? String(enemyHeld.name).toLowerCase() : '';
+  const holdingMace = enemyHeldName === 'mace';
+  const holdingAxe = enemyHeldName.endsWith('_axe');
+  const isGliding = Boolean((state && state.isElytraGliding) || target.elytraFlying);
+
+  const estTicks = dy <= 3.0
+    ? 2
+    : Math.min(20, (dy - 2.2) / Math.max(0.15, Math.abs(vy) + 0.16));
+
+  // Anti-Stun-Slam Bait: diving attacker switched to Axe to disable our shield -> drop & sidestep
+  if (dy >= 1.2 && vy < -0.08 && holdingAxe && horizDist <= 6.5) {
+    return {
+      threat: true,
+      shouldShield: false,
+      antiStunBait: true,
+      postImpactWindow: false,
+      reason: 'axe_stun_bait',
+      estTicks,
+      horizDist,
+      dist3D,
+      dy,
+      vy
+    };
+  }
+
+  const maceContext = holdingMace || isMaceDuelContext(bot, target);
+
+  // 1. Aerial dive / Elytra-Mace smash approaching pre-impact window
+  const diveWindow = Boolean(
+    maceContext &&
+    dy >= 1.4 &&
+    (vy <= -0.14 || isGliding) &&
+    (horizDist <= 4.5 || (horizDist <= 8.0 && closingSpeed > 0.04)) &&
+    estTicks <= 11
+  );
+
+  // 2. Close Wind Burst / Wind Charge bounce smash chain
+  const bounceWindow = Boolean(
+    holdingMace &&
+    (!target.onGround || dy >= 1.1) &&
+    vy < -0.04 &&
+    dist3D <= 5.8
+  );
+
+  // 3. Grounded Breach Mace pressure while our weapon is on cooldown
+  const groundBreachWindow = Boolean(
+    holdingMace &&
+    dist3D <= 4.0 &&
+    weaponCooldownProgress < 0.85
+  );
+
+  let shouldShield = false;
+  let reason = 'none';
+  if (diveWindow) {
+    shouldShield = true;
+    reason = 'mace_dive_smash';
+  } else if (bounceWindow) {
+    shouldShield = true;
+    reason = 'mace_bounce_smash';
+  } else if (groundBreachWindow) {
+    shouldShield = true;
+    reason = 'mace_ground_breach';
+  }
+
+  const postImpactWindow = Boolean(
+    !shouldShield &&
+    (target.onGround || (dy < 1.1 && vy >= -0.05))
+  );
+
+  return {
+    threat: shouldShield,
+    shouldShield,
+    antiStunBait: false,
+    postImpactWindow,
+    reason,
+    estTicks,
+    horizDist,
+    dist3D,
+    dy,
+    vy
+  };
+}
+
 module.exports = {
   ELYTRA_MAX_DURABILITY,
   parseItemEnchantments,
@@ -523,6 +677,8 @@ module.exports = {
   evaluateShieldCounter,
   hasSlowFalling,
   detectEnemyDiveBomb,
+  isMaceDuelContext,
+  detectIncomingMaceAttack,
   getElytraDurabilityInfo,
   shouldConserveElytra,
   executeAttributeSwapAttack

@@ -17,6 +17,8 @@ const { RangedModule } = require('./modules/ranged');
 const { BurstModule } = require('./modules/burst');
 const { AerialModule } = require('./modules/aerial');
 const { EscapeModule } = require('./modules/escape');
+const { LiquidDenyModule } = require('./modules/liquid_deny');
+const { RedWoolZoneModule } = require('./modules/red_wool_zone');
 
 const STATES = Object.freeze({
   IDLE: 'IDLE',
@@ -107,6 +109,8 @@ class PvPBotController {
     this.burst = null;
     this.aerial = null;
     this.escape = null;
+    this.liquidDeny = null;
+    this.redWoolZone = null;
 
     this.state = STATES.IDLE;
     this.activeTargetName = null;
@@ -320,11 +324,14 @@ class PvPBotController {
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.escape = new EscapeModule(bot, this.config, this.aimer);
+        this.liquidDeny = new LiquidDenyModule(bot, this.config, this.aimer);
+        this.redWoolZone = new RedWoolZoneModule(bot, this.config, this.aimer);
 
         this.survival.configureAutoEat();
         // Stay completely quiet in IDLE lobbies (no locked-inventory clicks or auto-eat spam)
         this.survival.setCombatActive(false);
         this.survival.setAutoEatEnabled(false);
+        this.liquidDeny.setCombatActive(false);
 
         // Passive read-only hotbar scan (sends zero packets)
         this.combat.scanHotbarSlots();
@@ -1273,6 +1280,8 @@ class PvPBotController {
     if (this.burst) this.burst.cancel();
     if (this.aerial) this.aerial.cancel();
     if (this.escape) this.escape.cancel();
+    if (this.liquidDeny) this.liquidDeny.cancel();
+    if (this.redWoolZone) this.redWoolZone.cancel();
     if (nextState === STATES.IDLE && this.prediction) {
       this.prediction.clear();
     }
@@ -1287,11 +1296,14 @@ class PvPBotController {
     this.log(`State transition: ${prevState} -> ${nextState}${reason ? ` (${reason})` : ''}`);
 
     // Configure per-state background policies
+    const inCombatOrLoot = nextState !== STATES.IDLE;
     if (this.survival) {
-      const inCombatOrLoot = nextState !== STATES.IDLE;
       this.survival.setCombatActive(inCombatOrLoot);
       // Only allow background auto-eat during LOOTING (never in locked IDLE lobbies or active swings)
       this.survival.setAutoEatEnabled(nextState === STATES.LOOTING);
+    }
+    if (this.liquidDeny) {
+      this.liquidDeny.setCombatActive(inCombatOrLoot);
     }
 
     if (nextState === STATES.LOOTING) {
@@ -1483,7 +1495,9 @@ class PvPBotController {
       this.survival.isShielding ||
       this.survival.pendingLosBlock ||
       (this.burst && this.burst.isBusy()) ||
-      (this.aerial && this.aerial.isBusy())
+      (this.aerial && this.aerial.isBusy()) ||
+      (this.liquidDeny && this.liquidDeny.isBusy()) ||
+      (this.redWoolZone && this.redWoolZone.isBusy())
     );
     if (
       !totemSwapActive &&
@@ -1496,6 +1510,18 @@ class PvPBotController {
         this.burst.cancel();
       }
       if (this.survival) this.survival.lowerShield();
+      return;
+    }
+
+    // 1b3. Liquid Denial: scoop enemy-placed water/lava with empty bucket, or cover with solid block
+    const suppressOwnLiquid = Boolean(
+      (this.ranged && this.ranged.cobwebState !== 'IDLE') ||
+      (this.escape && this.escape.lavaWaterState !== 'IDLE') ||
+      (this.aerial && this.aerial.mode === 'CLUTCH')
+    );
+    if (!totemSwapActive && this.liquidDeny && this.liquidDeny.tick(target, { suppressOwnLiquid })) {
+      if (this.survival) this.survival.lowerShield();
+      if (this.combat) this.combat.stopMovement();
       return;
     }
 
@@ -1561,6 +1587,12 @@ class PvPBotController {
       const looksLikeArena = this.autoFight || (nearby.length >= 1 && nearby.length <= 2);
       if (looksLikeArena && nearby.length > 0 && nearby[0].dist <= engageRange) {
         this._engageTarget(nearby[0].entity, this.autoFight ? '!auto nearest target' : 'arena auto-start');
+        return;
+      }
+    }
+
+    if (this.autoFight || this.inDuelArena || now < this.autoStartDuelUntil) {
+      if (this.redWoolZone && this.redWoolZone.tick(null, { allowSprint: false, forceLook: false })) {
         return;
       }
     }
@@ -1881,12 +1913,45 @@ class PvPBotController {
       return;
     }
 
-    // 1. Smart shield blocking (only when offhand holds a shield instead of totem, and no nearby rail/hazard)
+    // 1. Smart shield blocking (off-hand shield OR main-hand hotbar shield vs incoming Mace smashes)
     const weaponCooldownProgress = this.combat.getCooldownProgress();
     const skipShieldForHazard = Boolean(this.escape && this.escape.hasNearbyRailOrHazard(target));
     if (!skipShieldForHazard && this.survival.tickShield(target, weaponCooldownProgress)) {
-      this.combat.stopMovement();
-      this.aimer.stepTowardsEntity(target);
+      if (this.survival.shieldingForMace) {
+        if (this.combat && this.combat.usingPathfinder && this.bot.pathfinder) {
+          this.bot.pathfinder.setGoal(null);
+          this.combat.usingPathfinder = false;
+        }
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('left', false);
+        this.bot.setControlState('right', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+        this.aimer.stepTowardsEntity(target, { force: true, heightOffset: 0.9 });
+      } else {
+        this.combat.stopMovement();
+        this.aimer.stepTowardsEntity(target);
+      }
+      return;
+    }
+
+    // 1b. Anti-Stun-Slam sidestep: dodge diving Axe stun so we can snap shield back on Mace swap
+    if (!skipShieldForHazard && this.survival.maceAntiStunActive) {
+      this.aimer.stepTowardsEntity(target, { force: true, heightOffset: 0.9 });
+      this.bot.setControlState('forward', false);
+      this.bot.setControlState('back', true);
+      this.bot.setControlState('left', this.combat ? this.combat.strafeDirection < 0 : true);
+      this.bot.setControlState('right', this.combat ? this.combat.strafeDirection >= 0 : false);
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('jump', false);
+      return;
+    }
+
+    // 1c. Red Wool Radius Exit: step/sprint out past red_wool safezone ring before fighting
+    if (this.redWoolZone && this.redWoolZone.tick(target, { allowSprint: true, forceLook: true })) {
+      if (this.burst && this.burst.state !== 'IDLE') {
+        this.burst.cancel();
+      }
       return;
     }
 
