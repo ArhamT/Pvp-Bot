@@ -307,7 +307,7 @@ const potionsFoodMethods = {
     const minHealth = this.survCfg.xpMendMinHealth !== undefined ? this.survCfg.xpMendMinHealth : 13;
     const startRatio = this.survCfg.xpMendDurabilityRatio !== undefined ? this.survCfg.xpMendDurabilityRatio : 0.45;
     const stopRatio = this.survCfg.xpMendStopRatio !== undefined ? this.survCfg.xpMendStopRatio : 0.78;
-    const throwIntervalMs = this.survCfg.xpMendThrowIntervalMs !== undefined ? this.survCfg.xpMendThrowIntervalMs : 100;
+    const throwIntervalMs = this.survCfg.xpMendThrowIntervalMs !== undefined ? this.survCfg.xpMendThrowIntervalMs : 80;
 
     const lowest = this.getLowestWornArmorDurability();
     const xpBottle = this.findXpBottle();

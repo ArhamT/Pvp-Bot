@@ -229,6 +229,12 @@ class SurvivalModule {
     // Don't re-enter HEALING right after finishing a gapple (let absorption/regen work while fighting!)
     if ((Date.now() - this.justAteGappleAt) < 2500 && this.bot.health > 7) return false;
 
+    // Intelligent Golden Apple healing: wait until active Regeneration runs out unless HP is critical
+    const criticalHp = this.survCfg.criticalHealthThreshold !== undefined ? this.survCfg.criticalHealthThreshold : 5;
+    if (this.isBuffActive('regen') && this.bot.health > criticalHp) {
+      return false;
+    }
+
     // If we have a splash healing potion ready, stay in ENGAGING and quick-pot inline!
     if (this.findHealingPotion() && this.bot.health > (this.survCfg.retreatHealthThreshold || 6)) {
       return false;

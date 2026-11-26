@@ -1621,6 +1621,16 @@ class CombatModule {
       this.bot.setControlState('sprint', false);
     }
 
+    // Prevent hitting through solid blocks
+    if (
+      this.ranged &&
+      typeof this.ranged.hasClearLineOfSight === 'function' &&
+      target.position &&
+      !this.ranged.hasClearLineOfSight(target.position.offset(0, 1.0, 0))
+    ) {
+      return;
+    }
+
     // Execute melee strike
     this.bot.attack(target);
     this.lastSwingTime = now;
