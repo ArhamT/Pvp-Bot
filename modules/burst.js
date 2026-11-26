@@ -143,8 +143,10 @@ class BurstModule {
     this.defenseTicksRemaining = 0;
     this.defenseShieldRaised = false;
 
-    // Track our own recent placements so blockUpdate/entitySpawn ignores them
+    // Track our own recent placements, failed anchors, and recently defended threats
     this.ownPlacements = new Map();
+    this.failedAnchors = new Map();
+    this.defendedThreats = new Map();
 
     // Real fall-distance tracking for Wind Charge Mace & Clutch
     this.fallDistance = 0;
@@ -173,6 +175,8 @@ class BurstModule {
     this._clearDefenseState();
     this._resetOffensiveState(true);
     this.ownPlacements.clear();
+    this.failedAnchors.clear();
+    this.defendedThreats.clear();
   }
 
   /**
@@ -236,7 +240,7 @@ class BurstModule {
       try { this.bot.deactivateItem(); } catch (_) {}
       this.defenseShieldRaised = false;
     }
-    if (this.defenseState !== 'IDLE' && this.bot && typeof this.bot.setControlState === 'function') {
+    if (this.bot && typeof this.bot.setControlState === 'function') {
       this.bot.setControlState('sneak', false);
     }
     this.defenseState = 'IDLE';
@@ -695,15 +699,100 @@ class BurstModule {
     return Number.isFinite(meta) && meta > 0 ? meta : 0;
   }
 
+  _markFailedAnchor(pos, ttlMs = 5000) {
+    if (!pos) return;
+    const now = Date.now();
+    this.failedAnchors.set(posKey(pos), now + ttlMs);
+    for (const [k, exp] of this.failedAnchors.entries()) {
+      if (exp <= now) this.failedAnchors.delete(k);
+    }
+  }
+
+  _isFailedAnchor(pos) {
+    if (!pos) return false;
+    const key = posKey(pos);
+    const exp = this.failedAnchors.get(key);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      this.failedAnchors.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  _threatKey(threat) {
+    if (!threat) return '';
+    const ref = threat.blockPos || threat.blastOrigin;
+    return ref ? `${threat.type}:${posKey(ref)}` : `${threat.type}`;
+  }
+
+  _markDefendedThreat(threat, ttlMs = 2500) {
+    const key = this._threatKey(threat);
+    if (!key) return;
+    const now = Date.now();
+    this.defendedThreats.set(key, now + ttlMs);
+    for (const [k, exp] of this.defendedThreats.entries()) {
+      if (exp <= now) this.defendedThreats.delete(k);
+    }
+  }
+
+  _isDefendedThreat(threat) {
+    const key = this._threatKey(threat);
+    if (!key) return false;
+    const exp = this.defendedThreats.get(key);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      this.defendedThreats.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  _findVisibleBlockFace(blockPos) {
+    if (!this.bot || !this.bot.entity || typeof this.bot.blockAt !== 'function' || !blockPos) {
+      return new Vec3(0, 1, 0);
+    }
+    const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
+    const center = blockPos.offset(0.5, 0.5, 0.5);
+    const toEye = eyePos.minus(center);
+
+    const above = this.bot.blockAt(blockPos.offset(0, 1, 0));
+    if (isAirLike(above) && eyePos.y > blockPos.y + 0.5) {
+      return new Vec3(0, 1, 0);
+    }
+
+    const candidates = [
+      new Vec3(0, 1, 0),
+      new Vec3(1, 0, 0),
+      new Vec3(-1, 0, 0),
+      new Vec3(0, 0, 1),
+      new Vec3(0, 0, -1),
+      new Vec3(0, -1, 0)
+    ];
+
+    let bestFace = null;
+    let bestDot = -Infinity;
+    for (const face of candidates) {
+      const neighbor = this.bot.blockAt(blockPos.plus(face));
+      if (!isAirLike(neighbor)) continue;
+      const dot = face.x * toEye.x + face.y * toEye.y + face.z * toEye.z;
+      if (dot > bestDot) {
+        bestDot = dot;
+        bestFace = face;
+      }
+    }
+    return bestFace || new Vec3(0, 1, 0);
+  }
+
   /**
    * Mandatory non-glowstone hotbar swap selector:
-   * Strictly prioritizes Totem -> Sword -> Obsidian -> any other non-glowstone/non-anchor slot.
+   * Strictly prioritizes non-placeable slots (Totem -> Sword -> Axe -> Empty) before blocks.
    */
   _findNonGlowstoneHotbarSlot() {
     if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return -1;
     const start = this._getHotbarStart();
 
-    // 1. Totem of Undying in hotbar
+    // 1. Totem of Undying in hotbar (non-placeable)
     for (let i = 0; i < 9; i++) {
       const item = this.bot.inventory.slots[start + i];
       if (item && item.name === 'totem_of_undying') return i;
@@ -724,13 +813,23 @@ class BurstModule {
       if (item && item.name.endsWith('_sword')) return i;
     }
 
-    // 3. Obsidian in hotbar
+    // 3. Axe in hotbar (non-placeable)
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name.endsWith('_axe')) return i;
+    }
+
+    // 4. Empty hotbar slot (non-placeable)
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (!item) return i;
+    }
+
+    // 5. Obsidian or any other non-glowstone, non-anchor hotbar slot
     for (let i = 0; i < 9; i++) {
       const item = this.bot.inventory.slots[start + i];
       if (item && item.name === 'obsidian') return i;
     }
-
-    // 4. Any other non-glowstone, non-anchor hotbar slot (including empty slots)
     for (let i = 0; i < 9; i++) {
       const item = this.bot.inventory.slots[start + i];
       if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
@@ -914,6 +1013,12 @@ class BurstModule {
         Array.isArray(target.equipment) &&
         target.equipment.some((eq) => eq && eq.name === 'end_crystal')
       );
+      const targetHoldingGlowstone = Boolean(
+        target &&
+        target.isValid &&
+        Array.isArray(target.equipment) &&
+        target.equipment.some((eq) => eq && eq.name === 'glowstone')
+      );
 
       let anchorThreat = null;
       let anchorDist = Infinity;
@@ -933,23 +1038,30 @@ class BurstModule {
             if (!block) continue;
 
             if (block.name === 'respawn_anchor' && dist < anchorDist) {
-              anchorDist = dist;
-              anchorThreat = {
+              const charges = this._getAnchorCharges(block);
+              // Ignore uncharged abandoned anchors unless opponent is actively holding glowstone
+              if (charges < 1 && !targetHoldingGlowstone) continue;
+              const cand = {
                 type: 'respawn_anchor',
                 blockPos: pos,
                 blastOrigin: center,
                 detectedAt: Date.now()
               };
+              if (this._isDefendedThreat(cand)) continue;
+              anchorDist = dist;
+              anchorThreat = cand;
             } else if (targetHoldingCrystal && block.name === 'obsidian' && dist < obsDist) {
               const above = this.bot.blockAt(pos.offset(0, 1, 0));
               if (isAirLike(above)) {
-                obsDist = dist;
-                obsThreat = {
+                const cand = {
                   type: 'obsidian',
                   blockPos: pos,
                   blastOrigin: pos.offset(0.5, 1.0, 0.5),
                   detectedAt: Date.now()
                 };
+                if (this._isDefendedThreat(cand)) continue;
+                obsDist = dist;
+                obsThreat = cand;
               }
             }
           }
@@ -1056,13 +1168,18 @@ class BurstModule {
       this._registerThreat(scanned);
     }
 
-    if (this.activeThreat && !this._isThreatStillValid(this.activeThreat)) {
+    if (this.activeThreat && (this._isDefendedThreat(this.activeThreat) || !this._isThreatStillValid(this.activeThreat))) {
       this._clearDefenseState();
       return false;
     }
 
     if (!this.activeThreat) {
       this._clearDefenseState();
+      return false;
+    }
+
+    // Do not interrupt our own active ANCHOR_* detonation sequence for non-crystal threats
+    if (this.state.startsWith('ANCHOR_') && this.activeThreat.type !== 'end_crystal') {
       return false;
     }
 
@@ -1079,16 +1196,17 @@ class BurstModule {
       if (blockPlan) {
         this.defenseState = 'DEFENSE_BLOCK';
         this.defensePlan = blockPlan;
-        this.defenseTicksRemaining = 12;
+        this.defenseTicksRemaining = 10;
       } else {
         this.defenseState = 'DEFENSE_SHIELD';
         this.defensePlan = null;
-        this.defenseTicksRemaining = 12;
+        this.defenseTicksRemaining = 6;
       }
     }
 
     this.defenseTicksRemaining--;
     if (this.defenseTicksRemaining < 0) {
+      this._markDefendedThreat(threat, 2500);
       this._clearDefenseState();
       return false;
     }
@@ -1129,8 +1247,9 @@ class BurstModule {
       if (threat.type === 'end_crystal' || threat.type === 'respawn_anchor') {
         this.defenseState = 'DEFENSE_SHIELD';
         this.defensePlan = null;
-        this.defenseTicksRemaining = 6;
+        this.defenseTicksRemaining = 5;
       } else {
+        this._markDefendedThreat(threat, 2500);
         this._clearDefenseState();
       }
       return true;
@@ -1159,6 +1278,7 @@ class BurstModule {
     }
 
     if (this.defenseTicksRemaining <= 0) {
+      this._markDefendedThreat(threat, 2500);
       this._clearDefenseState();
     }
     return true;
@@ -1389,6 +1509,7 @@ class BurstModule {
 
           if (blastPos.distanceTo(predictedFeet) > scanRadius) continue;
           if (eyePos.distanceTo(blastPos) > 4.5) continue;
+          if (this._isFailedAnchor(anchorPos)) continue;
 
           const existing = this.bot.blockAt(anchorPos);
           if (!existing) continue;
@@ -1720,6 +1841,9 @@ class BurstModule {
     }
 
     this.bot.setControlState('sprint', false);
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('sneak', false);
+    }
     const anchorAim = plan.anchorPos.offset(0.5, 0.5, 0.5);
 
     // Step 0: Feet Blast-Shield Cover Placement before Anchor combo
@@ -1807,9 +1931,33 @@ class BurstModule {
         return false;
       }
 
-      if (plan.charged || this._getAnchorCharges(anchorBlock) >= 1) {
+      if (this._getAnchorCharges(anchorBlock) >= 1) {
+        plan.chargeInFlight = false;
+        plan.charged = true;
+        this.stepDelayTicks = this.placeDelayTicks;
         this.state = 'ANCHOR_SWITCH_SLOT';
         return true;
+      }
+
+      if (plan.chargeInFlight) {
+        return true;
+      }
+
+      if (plan.chargeAttempted) {
+        plan.chargeWaitTicks = (plan.chargeWaitTicks || 0) + 1;
+        if (plan.chargeWaitTicks < 3) {
+          return true;
+        }
+        if ((plan.chargeRetries || 0) < 1) {
+          plan.chargeRetries = (plan.chargeRetries || 0) + 1;
+          plan.chargeAttempted = false;
+          plan.charged = false;
+          plan.chargeWaitTicks = 0;
+        } else {
+          this._markFailedAnchor(plan.anchorPos, 5000);
+          this._resetOffensiveState(true);
+          return false;
+        }
       }
 
       const glowstoneItem = this._findItem('glowstone');
@@ -1818,7 +1966,9 @@ class BurstModule {
         return false;
       }
 
-      const aimStatus = this.aimer.stepTowardsPoint(anchorAim, {
+      const face = this._findVisibleBlockFace(plan.anchorPos);
+      const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
+      const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 1.35,
         toleranceRad: 0.16
       });
@@ -1827,19 +1977,39 @@ class BurstModule {
         return true;
       }
 
+      plan.chargeInFlight = true;
+      plan.chargeWaitTicks = 0;
       if (typeof this.bot.activateBlock === 'function') {
-        Promise.resolve(this.bot.activateBlock(anchorBlock)).catch(() => {});
+        Promise.resolve(this.bot.activateBlock(anchorBlock, face))
+          .catch(() => {})
+          .finally(() => {
+            plan.chargeInFlight = false;
+            plan.chargeAttempted = true;
+            plan.charged = true;
+          });
+      } else {
+        plan.chargeInFlight = false;
+        plan.chargeAttempted = true;
+        plan.charged = true;
       }
 
-      plan.charged = true;
-      this.stepDelayTicks = this.placeDelayTicks;
-      this.state = 'ANCHOR_SWITCH_SLOT';
+      // If synchronous mock already charged the block, advance on next tick cleanly
+      const updatedBlock = this.bot.blockAt(plan.anchorPos);
+      if (updatedBlock && updatedBlock.name === 'respawn_anchor' && this._getAnchorCharges(updatedBlock) >= 1) {
+        plan.chargeInFlight = false;
+        plan.chargeAttempted = true;
+        plan.charged = true;
+        this.stepDelayTicks = this.placeDelayTicks;
+        this.state = 'ANCHOR_SWITCH_SLOT';
+      }
       return true;
     }
 
-    // Step 3: Mandatory Hotbar Swap to non-glowstone slot (Totem, Sword, or Obsidian) before detonating
+    // Step 3: Mandatory Hotbar Swap to non-glowstone slot (Totem, Sword, Axe, Empty) before detonating
     if (this.state === 'ANCHOR_SWITCH_SLOT') {
-      this.aimer.stepTowardsPoint(anchorAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
+      const face = this._findVisibleBlockFace(plan.anchorPos);
+      const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
+      this.aimer.stepTowardsPoint(faceAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
       if (this.stepDelayTicks > 0) return true;
 
       const heldName = this.bot.heldItem ? this.bot.heldItem.name : '';
@@ -1863,8 +2033,34 @@ class BurstModule {
     if (this.state === 'ANCHOR_DETONATE') {
       const anchorBlock = this.bot.blockAt(plan.anchorPos);
       if (!anchorBlock || anchorBlock.name !== 'respawn_anchor') {
+        if (plan.detonateAttempted || plan.detonateInFlight) {
+          this.lastAnchorTime = Date.now();
+          this._resetOffensiveState(true);
+          return true;
+        }
         this._resetOffensiveState(true);
         return false;
+      }
+
+      if (plan.detonateInFlight) {
+        return true;
+      }
+
+      if (plan.detonateAttempted) {
+        plan.detonateWaitTicks = (plan.detonateWaitTicks || 0) + 1;
+        if (plan.detonateWaitTicks < 3) {
+          return true;
+        }
+        if ((plan.detonateRetries || 0) < 1) {
+          plan.detonateRetries = (plan.detonateRetries || 0) + 1;
+          plan.detonateAttempted = false;
+          plan.detonateWaitTicks = 0;
+        } else {
+          this._markFailedAnchor(plan.anchorPos, 5000);
+          this.lastAnchorTime = Date.now();
+          this._resetOffensiveState(true);
+          return false;
+        }
       }
 
       // Safety check: ensure we are NOT holding glowstone
@@ -1879,7 +2075,9 @@ class BurstModule {
         return false;
       }
 
-      const aimStatus = this.aimer.stepTowardsPoint(anchorAim, {
+      const face = this._findVisibleBlockFace(plan.anchorPos);
+      const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
+      const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 1.4,
         toleranceRad: 0.18
       });
@@ -1888,12 +2086,26 @@ class BurstModule {
         return true;
       }
 
+      plan.detonateInFlight = true;
+      plan.detonateWaitTicks = 0;
       if (typeof this.bot.activateBlock === 'function') {
-        Promise.resolve(this.bot.activateBlock(anchorBlock)).catch(() => {});
+        Promise.resolve(this.bot.activateBlock(anchorBlock, face))
+          .catch(() => {})
+          .finally(() => {
+            plan.detonateInFlight = false;
+            plan.detonateAttempted = true;
+          });
+      } else {
+        plan.detonateInFlight = false;
+        plan.detonateAttempted = true;
       }
 
-      this.lastAnchorTime = Date.now();
-      this._resetOffensiveState(true);
+      // If synchronous mock already popped the anchor, finish cleanly
+      const afterBlock = this.bot.blockAt(plan.anchorPos);
+      if (!afterBlock || afterBlock.name !== 'respawn_anchor') {
+        this.lastAnchorTime = Date.now();
+        this._resetOffensiveState(true);
+      }
       return true;
     }
 

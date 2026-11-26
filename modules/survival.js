@@ -1649,8 +1649,16 @@ class SurvivalModule {
     const isDrawing = (typeof handFlags === 'number' && (handFlags & 0x01) !== 0) ||
       Boolean(target.usingHeldItem || target.isUsingItem);
 
-    // Also treat a charged crossbow aimed at us as an immediate ranged threat
-    const chargedCrossbow = [mainHand, offHand].some((item) => {
+    // Also treat a charged crossbow aimed at us (facing within ~40 deg) as an immediate ranged threat
+    const toBot = this.bot.entity.position.minus(target.position);
+    const horizLen = Math.sqrt(toBot.x * toBot.x + toBot.z * toBot.z);
+    let aimingAtBot = true;
+    if (typeof target.yaw === 'number' && horizLen > 0.1) {
+      const yawToBot = Math.atan2(-toBot.x, -toBot.z);
+      aimingAtBot = Math.abs(normalizeAngle(target.yaw - yawToBot)) <= 0.7;
+    }
+
+    const chargedCrossbow = aimingAtBot && [mainHand, offHand].some((item) => {
       if (!item || item.name !== 'crossbow') return false;
       const raw = getItemMetadataText(item);
       return raw.includes('charged') && (raw.includes('arrow') || raw.includes('firework'));
@@ -1734,7 +1742,8 @@ class SurvivalModule {
     }
 
     const cooldownMs = this.survCfg.shieldCooldownMs || 1200;
-    if (shouldRaise && (bowThreat || (now - this.lastShieldEndTime) >= cooldownMs)) {
+    const bowCooldownMs = Math.min(cooldownMs, 650);
+    if (shouldRaise && (now - this.lastShieldEndTime) >= (bowThreat ? bowCooldownMs : cooldownMs)) {
       this.bot.setControlState('sprint', false);
       this.bot.activateItem(true); // Offhand shield raise
       this.isShielding = true;

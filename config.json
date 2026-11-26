@@ -242,5 +242,13 @@
     "enabled": true,
     "radius": 12.0,
     "maxDurationMs": 8000
+  },
+  "escape": {
+    "enabled": true,
+    "railEvadeRadius": 4.2,
+    "railEvadeTicks": 12,
+    "lavaWaterCooldownMs": 2500,
+    "stallTicksThreshold": 16,
+    "allowBlockDig": true
   }
 }

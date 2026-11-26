@@ -16,6 +16,7 @@ const { SurvivalModule } = require('./modules/survival');
 const { RangedModule } = require('./modules/ranged');
 const { BurstModule } = require('./modules/burst');
 const { AerialModule } = require('./modules/aerial');
+const { EscapeModule } = require('./modules/escape');
 
 const STATES = Object.freeze({
   IDLE: 'IDLE',
@@ -105,6 +106,7 @@ class PvPBotController {
     this.ranged = null;
     this.burst = null;
     this.aerial = null;
+    this.escape = null;
 
     this.state = STATES.IDLE;
     this.activeTargetName = null;
@@ -247,6 +249,7 @@ class PvPBotController {
         this.survival = new SurvivalModule(bot, this.config, this.aimer);
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
+        this.escape = new EscapeModule(bot, this.config, this.aimer);
 
         this.survival.configureAutoEat();
         // Stay completely quiet in IDLE lobbies (no locked-inventory clicks or auto-eat spam)
@@ -389,6 +392,7 @@ class PvPBotController {
       if (this.ranged) this.ranged.dispose();
       if (this.burst) this.burst.dispose();
       if (this.aerial) this.aerial.dispose();
+      if (this.escape) this.escape.dispose();
       if (this.prediction) this.prediction.clear();
       this.bot = null;
       this._scheduleReconnect();
@@ -1198,6 +1202,7 @@ class PvPBotController {
     if (this.survival) this.survival.stopConsumption();
     if (this.burst) this.burst.cancel();
     if (this.aerial) this.aerial.cancel();
+    if (this.escape) this.escape.cancel();
     if (nextState === STATES.IDLE && this.prediction) {
       this.prediction.clear();
     }
@@ -1399,6 +1404,28 @@ class PvPBotController {
 
     // 1b. Immediate Water Bucket cobweb escape (place water -> pick up after 1 tick)
     if (!totemSwapActive && this.ranged && this.ranged.tickCobwebEscape()) {
+      return;
+    }
+
+    // 1b2. Lava escape, stuck-in-block digging, rail/TNT-cart sprint evasion, and stall recovery
+    const isStationaryAction = Boolean(
+      this.survival.isConsuming ||
+      this.survival.isShielding ||
+      this.survival.pendingLosBlock ||
+      (this.burst && this.burst.isBusy()) ||
+      (this.aerial && this.aerial.isBusy())
+    );
+    if (
+      !totemSwapActive &&
+      this.escape &&
+      this.escape.tick(target, {
+        canTrackStall: (this.state === STATES.ENGAGING || this.state === STATES.RETREATING) && !isStationaryAction
+      })
+    ) {
+      if (this.burst && this.burst.state !== 'IDLE' && this.burst.state !== 'WIND_CLUTCH') {
+        this.burst.cancel();
+      }
+      if (this.survival) this.survival.lowerShield();
       return;
     }
 
@@ -1778,9 +1805,10 @@ class PvPBotController {
       return;
     }
 
-    // 1. Smart shield blocking (only when offhand holds a shield instead of totem)
+    // 1. Smart shield blocking (only when offhand holds a shield instead of totem, and no nearby rail/hazard)
     const weaponCooldownProgress = this.combat.getCooldownProgress();
-    if (this.survival.tickShield(target, weaponCooldownProgress)) {
+    const skipShieldForHazard = Boolean(this.escape && this.escape.hasNearbyRailOrHazard(target));
+    if (!skipShieldForHazard && this.survival.tickShield(target, weaponCooldownProgress)) {
       this.combat.stopMovement();
       this.aimer.stepTowardsEntity(target);
       return;

@@ -1261,13 +1261,16 @@ class CombatModule {
         this.bot.setControlState('jump', false);
       }
     } else {
-      // < 2.2 blocks: Backpedal slightly while strafing
+      // < 2.2 blocks: Backpedal slightly while strafing; if cornered, step forward-jump instead of stalling
       const safeBack = this._isBackpedalSafe();
-      this.bot.setControlState('forward', false);
+      const canStrafeLeft = this._isStrafeDirectionSafe(-1);
+      const canStrafeRight = this._isStrafeDirectionSafe(1);
+      const cornered = !safeBack && !canStrafeLeft && !canStrafeRight;
+      this.bot.setControlState('forward', cornered);
       this.bot.setControlState('back', safeBack);
       this.bot.setControlState('sprint', false);
       if (!this.critInProgress) {
-        this.bot.setControlState('jump', false);
+        this.bot.setControlState('jump', cornered && onGround);
       }
     }
 
