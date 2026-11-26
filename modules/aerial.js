@@ -66,6 +66,7 @@ class AerialModule {
     this.lastY = (bot && bot.entity && bot.entity.position) ? bot.entity.position.y : null;
     this.lastBotPos = (bot && bot.entity && bot.entity.position) ? bot.entity.position.clone() : null;
     this.teleportedThisTick = false;
+    this.postTeleportWaitTicks = 0;
 
     // Active aerial state machine
     this.mode = AERIAL_MODES.IDLE;
@@ -504,18 +505,63 @@ class AerialModule {
   }
 
   /**
-   * Version-safe Elytra glide activation across MC 1.20.4 (actionId: 8)
-   * and MC 1.21.2+ (string mapper 'start_elytra_flying').
+   * Resolves the protocol-safe `entity_action` actionId for starting Elytra flight.
+   * MC 1.21.6+ shifted `start_fall_flying` from 8 to 6 (removing sneaking actions),
+   * and `'start_elytra_flying'` is not a valid minecraft-data mapper key on any version.
+   */
+  _resolveStartFallFlyingActionId() {
+    const version = this.bot && this.bot.version;
+    if (version) {
+      try {
+        const mcData = require('minecraft-data')(version);
+        const eaSchema = mcData &&
+          mcData.protocol &&
+          mcData.protocol.play &&
+          mcData.protocol.play.toServer &&
+          mcData.protocol.play.toServer.types &&
+          mcData.protocol.play.toServer.types.packet_entity_action;
+        const actionField = Array.isArray(eaSchema) && Array.isArray(eaSchema[1])
+          ? eaSchema[1].find((f) => f && f.name === 'actionId')
+          : null;
+        const mappings = actionField && Array.isArray(actionField.type) && actionField.type[1]
+          ? actionField.type[1].mappings
+          : null;
+        if (mappings && Object.values(mappings).includes('start_fall_flying')) {
+          return 'start_fall_flying';
+        }
+      } catch (_) {}
+    }
+
+    const useString = this.bot &&
+      typeof this.bot.supportFeature === 'function' &&
+      this.bot.supportFeature('entityActionUsesStringMapper');
+    return useString ? 'start_fall_flying' : 8;
+  }
+
+  /**
+   * Notifies the aerial controller that a server teleport packet just arrived.
+   * Suppresses Elytra takeoff/packets briefly so teleport confirmation settles cleanly.
+   */
+  notifyTeleport(waitTicks = 4) {
+    this.teleportedThisTick = true;
+    this.postTeleportWaitTicks = Math.max(this.postTeleportWaitTicks, waitTicks);
+    if (this.mode === AERIAL_MODES.ELYTRA_SPEAR || this.mode === AERIAL_MODES.ELYTRA_DIVE) {
+      this._releaseSpearChargeIfActive();
+      this._resetState();
+    }
+  }
+
+  /**
+   * Version-safe Elytra glide activation across MC 1.20.4–1.21.5 (8 / start_fall_flying)
+   * and MC 1.21.6–1.21.11+ (6 / start_fall_flying).
    */
   _sendStartElytraFlying() {
     if (!this.bot || !this.bot._client || typeof this.bot._client.write !== 'function') {
       return false;
     }
-    const useString = typeof this.bot.supportFeature === 'function' &&
-      this.bot.supportFeature('entityActionUsesStringMapper');
     this.bot._client.write('entity_action', {
       entityId: this.bot.entity.id,
-      actionId: useString ? 'start_elytra_flying' : 8,
+      actionId: this._resolveStartFallFlyingActionId(),
       jumpBoost: 0
     });
     return true;
@@ -885,6 +931,11 @@ class AerialModule {
     this._updateFallDistance();
     const curPos = this.bot.entity.position;
     this.teleportedThisTick = Boolean(this.lastBotPos && curPos.distanceTo(this.lastBotPos) > 2.5);
+    if (this.teleportedThisTick) {
+      this.notifyTeleport(4);
+    } else if (this.postTeleportWaitTicks > 0) {
+      this.postTeleportWaitTicks--;
+    }
     this.lastBotPos = curPos.clone();
     this.targetState = (target && target.isValid) ? buildTargetState(target) : null;
 
@@ -1940,6 +1991,7 @@ class AerialModule {
 
   _canStartElytraDive(target) {
     if (!this.aerialCfg.enableElytraMace) return false;
+    if (this.postTeleportWaitTicks > 0) return false;
     if (!target || !target.isValid || !target.position) return false;
 
     const { inWater, inLava } = this._getEnvironmentFlags();
@@ -2386,6 +2438,7 @@ class AerialModule {
 
   _canStartElytraSpear(target) {
     if (this.aerialCfg.enableElytraSpear === false) return false;
+    if (this.postTeleportWaitTicks > 0) return false;
     if (!target || !target.isValid || !target.position) return false;
 
     const { onGround, inWater, inLava, inCobweb } = this._getEnvironmentFlags();

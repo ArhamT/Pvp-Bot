@@ -150,6 +150,7 @@ class PvPBotController {
     this._recentDuelAccepts = new Map();
     this._physicsTickHandler = null;
     this._packetTimestamps = [];
+    this.lastTeleportAt = 0;
 
     this.rl = null;
     this.tickTimer = null;
@@ -203,14 +204,81 @@ class PvPBotController {
   _attachPacketMonitor(bot) {
     if (!bot || !bot._client || typeof bot._client.write !== 'function') return;
     const origWrite = bot._client.write.bind(bot._client);
-    bot._client.write = (...args) => {
+    let cachedVersion = null;
+    let isShiftedEntityAction = false;
+
+    const resolveShiftedEntityAction = () => {
+      const ver = bot.version || (bot._client && bot._client.version);
+      if (!ver || ver === cachedVersion) return isShiftedEntityAction;
+      cachedVersion = ver;
+      isShiftedEntityAction = false;
+      try {
+        const mcData = require('minecraft-data')(ver);
+        const eaSchema = mcData &&
+          mcData.protocol &&
+          mcData.protocol.play &&
+          mcData.protocol.play.toServer &&
+          mcData.protocol.play.toServer.types &&
+          mcData.protocol.play.toServer.types.packet_entity_action;
+        const actionField = Array.isArray(eaSchema) && Array.isArray(eaSchema[1])
+          ? eaSchema[1].find((f) => f && f.name === 'actionId')
+          : null;
+        const mappings = actionField && Array.isArray(actionField.type) && actionField.type[1]
+          ? actionField.type[1].mappings
+          : null;
+        isShiftedEntityAction = Boolean(mappings && mappings['6'] === 'start_fall_flying');
+      } catch (_) {
+        isShiftedEntityAction = false;
+      }
+      return isShiftedEntityAction;
+    };
+
+    bot._client.write = (name, params, ...rest) => {
+      let outParams = params;
+
+      if (name === 'teleport_confirm' && params && typeof params === 'object') {
+        outParams = { teleportId: Math.trunc(Number(params.teleportId) || 0) };
+      } else if (name === 'entity_action' && params && typeof params === 'object') {
+        if (params.actionId === 'start_elytra_flying') {
+          outParams = { ...params, actionId: 'start_fall_flying' };
+        } else if (resolveShiftedEntityAction() && typeof params.actionId === 'number') {
+          // 1.21.6+ removed start_sneaking (0) / stop_sneaking (1) and shifted all later IDs down by 2
+          if (params.actionId === 0 || params.actionId === 1) {
+            return false;
+          }
+          const legacyMap = {
+            3: 'start_sprinting',
+            4: 'stop_sprinting',
+            5: 'start_riding_jump',
+            6: 'stop_riding_jump',
+            7: 'open_inventory',
+            8: 'start_fall_flying'
+          };
+          if (legacyMap[params.actionId]) {
+            outParams = { ...params, actionId: legacyMap[params.actionId] };
+          }
+        }
+      }
+
       const now = Date.now();
       this._packetTimestamps.push(now);
       if (this._packetTimestamps.length > 200) {
         this._packetTimestamps = this._packetTimestamps.filter((t) => (now - t) <= 1000);
       }
-      return origWrite(...args);
+      return origWrite(name, outParams, ...rest);
     };
+
+    if (typeof bot._client.on === 'function') {
+      bot._client.on('position', () => {
+        this.lastTeleportAt = Date.now();
+        if (this.aerial && typeof this.aerial.notifyTeleport === 'function') {
+          this.aerial.notifyTeleport(4);
+        }
+        if (this.combat && typeof this.combat.cancelSpearLunge === 'function') {
+          this.combat.cancelSpearLunge();
+        }
+      });
+    }
   }
 
   getOutgoingPacketRate() {
@@ -239,6 +307,8 @@ class PvPBotController {
 
       if (!this.initializedOnSpawn) {
         this.initializedOnSpawn = true;
+        const protoNum = bot._client && bot._client.protocolVersion ? bot._client.protocolVersion : 'unknown';
+        this.log(`Connected protocol: ${bot.version || 'unknown'} (protocol ${protoNum}).`);
         this.log(`Spawned in world at ${bot.entity.position.floored()}.`);
 
         // Instantiate modular subsystems once per connection
@@ -1796,6 +1866,12 @@ class PvPBotController {
     }
     if (this.survival.needsHealing()) {
       this.transitionState(STATES.HEALING, `gapple heal (${this.bot.health.toFixed(1)} HP)`);
+      return;
+    }
+
+    // Let server teleport synchronization settle for 4 ticks (~200ms) before forced combat/elytra packets
+    if (this.lastTeleportAt && (Date.now() - this.lastTeleportAt) < 200) {
+      this.combat.stopMovement();
       return;
     }
 

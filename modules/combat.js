@@ -87,6 +87,7 @@ class CombatModule {
     this.breachSwappedAt = 0;
     this.spearSlot = -1;
     this.lastSpearLungeTime = 0;
+    this.spearLungeTimer = null;
 
     // Target telemetry for smart crits & W-tap confirmation
     this.targetLastHurtTime = 0;
@@ -146,7 +147,18 @@ class CombatModule {
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
       this.bot.inventory.removeListener('updateSlot', this._onInventoryUpdateSlot);
     }
+    this.cancelSpearLunge();
     this.stopMovement();
+  }
+
+  /**
+   * Cancels any queued delayed Spear deactivateItem() timer safely.
+   */
+  cancelSpearLunge() {
+    if (this.spearLungeTimer) {
+      clearTimeout(this.spearLungeTimer);
+      this.spearLungeTimer = null;
+    }
   }
 
   /**
@@ -986,6 +998,7 @@ class CombatModule {
     this.critInProgress = false;
     this.shieldBreakActive = false;
     this.swapBackToSwordNextTick = false;
+    this.cancelSpearLunge();
   }
 
   /**
@@ -1397,9 +1410,12 @@ class CombatModule {
           typeof this.bot.activateItem === 'function'
         ) {
           this.lastSpearLungeTime = now;
+          this.cancelSpearLunge();
           try {
             this.bot.activateItem(false);
-            setTimeout(() => {
+            this.spearLungeTimer = setTimeout(() => {
+              this.spearLungeTimer = null;
+              if (!this.bot || !this.bot.entity || !this._isSpearItem(this.bot.heldItem)) return;
               try { this.bot.deactivateItem(); } catch (_) {}
             }, 120);
           } catch (_) {}
