@@ -4,9 +4,11 @@ const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('./aim');
 const {
   HAZARD_BLOCKS,
+  OFFHAND_SLOT,
   PEARL_SPEED,
   PEARL_GRAVITY,
   PEARL_DRAG,
+  getItemMetadataText,
   findOverlappingBlock,
   inspectColumnStep
 } = require('./constants');
@@ -37,7 +39,12 @@ class RangedModule {
     this.isDrawing = false;
     this.startingDraw = false;
     this.drawWeaponType = null; // 'bow' | 'crossbow'
+    this.drawWeaponItem = null;
     this.drawTicks = 0;
+    this.drawSettleTicks = 0;
+    this.drawActivated = false;
+    this.crossbowFirePending = false;
+    this.crossbowSettleTicks = 0;
 
     // Cooldowns
     this.lastBowShotTime = 0;
@@ -98,7 +105,12 @@ class RangedModule {
    * Returns true if the ranged module currently controls aim/item usage.
    */
   isBusy() {
-    return this.isDrawing || Boolean(this.pendingAction) || this.cobwebEscapeState !== 'IDLE';
+    return (
+      this.isDrawing ||
+      this.crossbowFirePending ||
+      Boolean(this.pendingAction) ||
+      this.cobwebEscapeState !== 'IDLE'
+    );
   }
 
   /**
@@ -110,11 +122,18 @@ class RangedModule {
       this._crossbowReleaseTimer = null;
     }
     if (this.isDrawing) {
-      this.bot.deactivateItem();
+      if (this.drawActivated) {
+        this.bot.deactivateItem();
+      }
       this.isDrawing = false;
       this.drawWeaponType = null;
+      this.drawWeaponItem = null;
       this.drawTicks = 0;
+      this.drawSettleTicks = 0;
+      this.drawActivated = false;
     }
+    this.crossbowFirePending = false;
+    this.crossbowSettleTicks = 0;
     this.pendingAction = null;
   }
 
@@ -130,9 +149,77 @@ class RangedModule {
     );
   }
 
+  _isCrossbowLoaded(item) {
+    if (!item || item.name !== 'crossbow') return false;
+    if (Array.isArray(item.components)) {
+      const cp = item.components.find((c) => c && (c.type === 'charged_projectiles' || c.name === 'charged_projectiles'));
+      if (cp) {
+        const list = Array.isArray(cp.data) ? cp.data : (Array.isArray(cp.value) ? cp.value : []);
+        if (list.length > 0) return true;
+      }
+    }
+    if (item.nbt && item.nbt.value) {
+      const charged = item.nbt.value.Charged;
+      if (charged && (charged.value === 1 || charged === 1)) return true;
+      const proj = item.nbt.value.ChargedProjectiles;
+      if (proj && proj.value && Array.isArray(proj.value.value) && proj.value.value.length > 0) return true;
+    }
+    const meta = getItemMetadataText(item);
+    return meta.includes('charged_projectiles') && (meta.includes('arrow') || meta.includes('firework'));
+  }
+
+  _getCrossbowQuickChargeLevel(item) {
+    if (!item || item.name !== 'crossbow') return 0;
+    const meta = getItemMetadataText(item);
+    const m = meta.match(/quick_charge["':\s,=\]]*(\d)/);
+    return m ? Math.min(3, Number(m[1]) || 0) : 0;
+  }
+
+  _findBestCrossbow() {
+    if (!this.bot.inventory) return null;
+    const crossbows = this.bot.inventory.items().filter((i) => i && i.name === 'crossbow');
+    if (crossbows.length === 0) return null;
+    // Prefer an already-loaded crossbow first (0-tick charge -> instant shot!)
+    const loaded = crossbows.find((c) => this._isCrossbowLoaded(c));
+    if (loaded) return loaded;
+    // Otherwise pick highest Quick Charge crossbow
+    crossbows.sort((a, b) => this._getCrossbowQuickChargeLevel(b) - this._getCrossbowQuickChargeLevel(a));
+    return crossbows[0];
+  }
+
+  _hasCrossbowAmmo(crossbowItem) {
+    if (crossbowItem && this._isCrossbowLoaded(crossbowItem)) return true;
+    if (this._hasArrows()) return true;
+    const offhand = this.bot.inventory && this.bot.inventory.slots && this.bot.inventory.slots[OFFHAND_SLOT];
+    return Boolean(offhand && offhand.name === 'firework_rocket');
+  }
+
+  _isItemHeld(item) {
+    if (!item || !this.bot.heldItem) return false;
+    if (typeof item.slot === 'number' && typeof this.bot.heldItem.slot === 'number') {
+      return this.bot.heldItem.slot === item.slot && this.bot.heldItem.name === item.name;
+    }
+    return this.bot.heldItem.name === item.name && this.bot.heldItem.type === item.type;
+  }
+
+  _equipHotbarImmediate(item) {
+    if (!item) return false;
+    if (this._isItemHeld(item)) return true;
+    const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || 36;
+    if (
+      item.slot >= hotbarStart &&
+      item.slot < hotbarStart + 9 &&
+      typeof this.bot.setQuickBarSlot === 'function'
+    ) {
+      this.bot.setQuickBarSlot(item.slot - hotbarStart);
+      return true;
+    }
+    return false;
+  }
+
   async _equipSafe(item) {
     if (!item) return false;
-    if (this.bot.heldItem && this.bot.heldItem.type === item.type) return true;
+    if (this._isItemHeld(item)) return true;
 
     // Instant hotbar select if item is in slots 36..44
     const hotbarStart = (this.bot.inventory && this.bot.inventory.hotbarStart) || 36;
@@ -302,20 +389,38 @@ class RangedModule {
     if (!allowBow && !allowCrossbow) return false;
 
     const dist = this.bot.entity.position.distanceTo(target.position);
-    const minRange = this.rangedCfg.bowMinRange || 8.0;
     const maxRange = this.rangedCfg.bowMaxRange || 28.0;
+    if (dist > maxRange) return false;
 
-    if (dist < minRange || dist > maxRange) return false;
-    if (!this.isDrawing && (Date.now() - this.lastBowShotTime) < (this.rangedCfg.bowShotCooldownMs || 2800)) {
+    const crossbow = allowCrossbow ? this._findBestCrossbow() : null;
+    const bow = allowBow ? this._findItem('bow') : null;
+    const crossbowLoaded = Boolean(crossbow && this._isCrossbowLoaded(crossbow));
+    const canUseCrossbow = Boolean(crossbow && this._hasCrossbowAmmo(crossbow));
+    const canUseBow = Boolean(bow && this._hasArrows());
+    if (!canUseCrossbow && !canUseBow) return false;
+
+    // Loaded crossbows fire near-instantly from 4.2b+; unloaded crossbows charge safely at >=6.5b; bows at >=9.0b
+    const minRange = canUseCrossbow
+      ? (crossbowLoaded
+          ? (this.rangedCfg.crossbowLoadedMinRange !== undefined ? this.rangedCfg.crossbowLoadedMinRange : 4.2)
+          : (this.rangedCfg.crossbowMinRange !== undefined ? this.rangedCfg.crossbowMinRange : 6.5))
+      : (this.rangedCfg.bowMinRange || 8.0);
+
+    // If opponent rushes inside melee range (<4.5b) while charging an unloaded weapon, abort so melee takes over!
+    if (this.isDrawing && !this.crossbowFirePending && dist < 4.5) {
       return false;
     }
-    if (!this._hasArrows()) return false;
-    const hasBow = allowBow && Boolean(this._findItem('bow'));
-    const hasCrossbow = allowCrossbow && Boolean(this._findItem('crossbow'));
-    if (!hasBow && !hasCrossbow) return false;
+    if (!this.isDrawing && !this.crossbowFirePending && dist < minRange) return false;
+
+    const shotCooldown = canUseCrossbow
+      ? (this.rangedCfg.crossbowShotCooldownMs !== undefined ? this.rangedCfg.crossbowShotCooldownMs : 1400)
+      : (this.rangedCfg.bowShotCooldownMs || 2800);
+    if (!this.isDrawing && !this.crossbowFirePending && (Date.now() - this.lastBowShotTime) < shotCooldown) {
+      return false;
+    }
 
     const aimTarget = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
-    if (!this.isDrawing && !this.hasClearLineOfSight(aimTarget)) return false;
+    if (!this.isDrawing && !this.crossbowFirePending && !this.hasClearLineOfSight(aimTarget)) return false;
     return true;
   }
 
@@ -1142,9 +1247,11 @@ class RangedModule {
       return this._tickPendingAction();
     }
 
-    // 3. Continue active predictive bow/crossbow draw
-    if (this.isDrawing) {
+    // 3. Continue active predictive bow/crossbow draw OR instant loaded-crossbow fire
+    if (this.isDrawing || this.crossbowFirePending) {
       if (!target || !target.isValid || !this.shouldUseRangedWeapon(target)) {
+        this.crossbowFirePending = false;
+        this.crossbowSettleTicks = 0;
         this.cancel();
         return false;
       }
@@ -1276,34 +1383,61 @@ class RangedModule {
   }
 
   _startRangedShot(target) {
-    if (this.startingDraw || this.isDrawing) return true;
+    if (this.startingDraw || this.isDrawing || this.crossbowFirePending) return true;
     const allowBow = this.rangedCfg.bowEnabled !== false;
     const allowCrossbow = this.rangedCfg.crossbowEnabled === true;
+    const crossbow = allowCrossbow ? this._findBestCrossbow() : null;
     const bow = allowBow ? this._findItem('bow') : null;
-    const crossbow = allowCrossbow ? this._findItem('crossbow') : null;
-    const weapon = bow || crossbow;
+    const canCrossbow = Boolean(crossbow && this._hasCrossbowAmmo(crossbow));
+    const canBow = Boolean(bow && this._hasArrows());
+    // Prefer loaded crossbow immediately, else bow or unloaded crossbow
+    const weapon = (canCrossbow && this._isCrossbowLoaded(crossbow))
+      ? crossbow
+      : (canBow ? bow : (canCrossbow ? crossbow : null));
     if (!weapon) return false;
 
-    const beginDraw = () => {
+    const isLoadedCrossbow = weapon.name === 'crossbow' && this._isCrossbowLoaded(weapon);
+    const alreadyHeld = this._isItemHeld(weapon);
+
+    const beginAction = (swapped) => {
       this.bot.setControlState('sprint', false);
-      this.bot.activateItem(false);
-      this.isDrawing = true;
       this.drawWeaponType = weapon.name === 'crossbow' ? 'crossbow' : 'bow';
+      this.drawWeaponItem = weapon;
       this.drawTicks = 0;
+      if (isLoadedCrossbow) {
+        // Loaded crossbow: 1-tick settle after swap, then instant predictive fire!
+        this.crossbowFirePending = true;
+        this.crossbowSettleTicks = swapped ? 1 : 0;
+        this.isDrawing = false;
+        this.drawSettleTicks = 0;
+        this.drawActivated = false;
+      } else {
+        this.crossbowFirePending = false;
+        this.isDrawing = true;
+        if (swapped) {
+          // Strict 1-tick post-swap settle before activateItem (anti-cheat safe)
+          this.drawSettleTicks = 1;
+          this.drawActivated = false;
+        } else {
+          this.drawSettleTicks = 0;
+          this.drawActivated = true;
+          this.bot.activateItem(false);
+        }
+      }
     };
 
     // Fast synchronous hotbar select when bow/crossbow is already on hotbar
     if (this._equipHotbarImmediate(weapon)) {
-      beginDraw();
+      beginAction(!alreadyHeld);
       return true;
     }
 
-    // Async equip fallback if bow is in main inventory (guarded so it never re-enters)
+    // Async equip fallback if weapon is in main inventory
     this.startingDraw = true;
     this._equipSafe(weapon)
       .then((equipped) => {
         if (equipped && this.bot && this.bot.entity) {
-          beginDraw();
+          beginAction(true);
         }
       })
       .catch(() => {})
@@ -1314,6 +1448,17 @@ class RangedModule {
   }
 
   _tickBowOrCrossbow(target) {
+    // Wait 1 tick after hotbar swap before activating bow/crossbow charge
+    if (this.isDrawing && !this.drawActivated) {
+      this.bot.setControlState('sprint', false);
+      if (this.drawSettleTicks > 0) {
+        this.drawSettleTicks--;
+        return;
+      }
+      this.drawActivated = true;
+      this.bot.activateItem(false);
+    }
+
     this.drawTicks++;
 
     // Never sprint while drawing a bow/crossbow (prevents NoSlow flags)
@@ -1321,7 +1466,7 @@ class RangedModule {
     this.bot.setControlState('forward', false);
     this.bot.setControlState('back', false);
 
-    // Hazard-aware lateral strafing while drawing
+    // Hazard-aware lateral strafing while aiming/drawing
     const hazards = this.scanHazardsAroundFeet();
     const wantLeft = (this.drawTicks % 30) < 15;
     if (wantLeft && hazards.leftSafe) {
@@ -1337,8 +1482,10 @@ class RangedModule {
 
     const isCrossbow = this.drawWeaponType === 'crossbow';
     const speed = isCrossbow ? CROSSBOW_SPEED : ARROW_SPEED;
+    const qcLevel = isCrossbow ? this._getCrossbowQuickChargeLevel(this.drawWeaponItem || this.bot.heldItem) : 0;
+    const baseCrossbowTicks = this.rangedCfg.crossbowChargeTicks || 26;
     const requiredTicks = isCrossbow
-      ? (this.rangedCfg.crossbowChargeTicks || 26)
+      ? Math.max(8, baseCrossbowTicks - qcLevel * 5)
       : (this.rangedCfg.bowChargeTicks || 21);
 
     let targetVel = target.velocity || new Vec3(0, 0, 0);
@@ -1362,10 +1509,42 @@ class RangedModule {
     );
 
     const aimStatus = this.aimer.stepTowardsAngles(solution.yaw, solution.pitch, {
-      toleranceRad: 0.065 // Tight ~3.7° accuracy for predictive shots
+      toleranceRad: 0.065,
+      force: Boolean(this.crossbowFirePending)
     });
 
-    // Timeout safeguard so bot never freezes holding a bow if LOS gets blocked mid-draw
+    // Tick-driven fire for loaded Crossbow (no racy setTimeout; strict 1-tick post-swap settle!)
+    if (this.crossbowFirePending) {
+      if (this.crossbowSettleTicks > 0) {
+        this.crossbowSettleTicks--;
+        return;
+      }
+      if (this.drawTicks > 15) {
+        this.crossbowFirePending = false;
+        this.drawWeaponType = null;
+        this.drawWeaponItem = null;
+        this.drawTicks = 0;
+        return;
+      }
+      if (
+        this.bot.heldItem &&
+        this.bot.heldItem.name === 'crossbow' &&
+        aimStatus.aligned &&
+        this.hasClearLineOfSight(solution.predictedPos)
+      ) {
+        if (typeof this.bot.activateItem === 'function') {
+          this.bot.activateItem(false);
+        }
+        this.lastBowShotTime = Date.now();
+        this.crossbowFirePending = false;
+        this.drawWeaponType = null;
+        this.drawWeaponItem = null;
+        this.drawTicks = 0;
+      }
+      return;
+    }
+
+    // Timeout safeguard so bot never freezes holding a bow/crossbow if LOS gets blocked mid-draw
     if (this.drawTicks > requiredTicks + 25) {
       this.cancel();
       this.lastBowShotTime = Date.now();
@@ -1378,22 +1557,20 @@ class RangedModule {
       this.hasClearLineOfSight(solution.predictedPos)
     ) {
       this.bot.deactivateItem();
-      this.lastBowShotTime = Date.now();
-      if (isCrossbow) {
-        if (this._crossbowReleaseTimer) {
-          clearTimeout(this._crossbowReleaseTimer);
-        }
-        this._crossbowReleaseTimer = setTimeout(() => {
-          this._crossbowReleaseTimer = null;
-          if (!this.bot || !this.bot.entity) return;
-          try {
-            this.bot.activateItem(false);
-          } catch (_) {}
-        }, 100);
-      }
       this.isDrawing = false;
-      this.drawWeaponType = null;
-      this.drawTicks = 0;
+      this.drawActivated = false;
+      this.drawSettleTicks = 0;
+      if (isCrossbow) {
+        // Crossbow is now loaded -> fire cleanly on the very next tick!
+        this.crossbowFirePending = true;
+        this.crossbowSettleTicks = 1;
+        this.drawTicks = 0;
+      } else {
+        this.lastBowShotTime = Date.now();
+        this.drawWeaponType = null;
+        this.drawWeaponItem = null;
+        this.drawTicks = 0;
+      }
     }
   }
 }

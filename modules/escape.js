@@ -4,6 +4,7 @@ const { posKey, findOverlappingBlock, isPlayerEmbeddedInBlock } = require('./con
 const { findInventoryItem, ensureItemHeld } = require('./inventory_utils');
 const { cobwebEscapeMethods } = require('./escape/cobweb_escape');
 const { liquidEscapeMethods } = require('./escape/liquid_escape');
+const { blockEscapeMethods } = require('./escape/block_escape');
 const {
   hazardUnstickMethods,
   RAIL_BLOCK_NAMES,
@@ -62,6 +63,8 @@ class EscapeModule {
 
     this.pillarSettleTicks = 0;
     this.pillarActive = false;
+    this.blockEscapePlan = null;
+    this.lastBlockEscapeAt = 0;
     this.boxMinePlan = null;
     this.boxedTicks = 0;
 
@@ -106,6 +109,7 @@ class EscapeModule {
     this.detourTicks = 0;
     this.pillarActive = false;
     this.pillarSettleTicks = 0;
+    this.blockEscapePlan = null;
     this.boxMinePlan = null;
     this.boxedTicks = 0;
   }
@@ -261,6 +265,10 @@ class EscapeModule {
       return true;
     }
 
+    if (this._tickBlockEscape(target, context)) {
+      return true;
+    }
+
     if (this._tickBoxBreakout(target, context)) {
       return true;
     }
@@ -277,6 +285,7 @@ Object.assign(
   EscapeModule.prototype,
   cobwebEscapeMethods,
   liquidEscapeMethods,
+  blockEscapeMethods,
   hazardUnstickMethods
 );
 
