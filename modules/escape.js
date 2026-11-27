@@ -40,6 +40,10 @@ class EscapeModule {
     this.modeTicks = 0;
 
     this.diggingInProgress = false;
+    this.cobwebDigLock = false;
+    this.cobwebDigPos = null;
+    this._cobwebDigToken = 0;
+    this._chorusInFlight = false;
     this.miner = new BlockMiner(bot, aimer);
     this.waterCtrl = new WaterBucketController(bot, aimer);
 
@@ -101,6 +105,10 @@ class EscapeModule {
     this.activeMode = 'IDLE';
     this.modeTicks = 0;
     this.diggingInProgress = false;
+    this._cobwebDigToken++;
+    this.cobwebDigLock = false;
+    this.cobwebDigPos = null;
+    this._chorusInFlight = false;
     if (this.miner) this.miner.cancel();
     if (this.waterCtrl) this.waterCtrl.cancel();
     this.pearlSettleTicks = 0;
@@ -172,6 +180,13 @@ class EscapeModule {
     return Boolean(this.waterCtrl && this.waterCtrl.isActive());
   }
 
+  /**
+   * Returns true while last-resort Cobweb Sword Mining is actively digging (locks weapon/armor swaps!).
+   */
+  isDigLocked() {
+    return Boolean(this.cobwebDigLock);
+  }
+
   hasFireResistance(context = {}) {
     if (context && context.hasFireRes) return true;
     return hasStatusEffect(this.bot, 'fire_resistance');
@@ -225,8 +240,8 @@ class EscapeModule {
     }
 
     const overlappingCobweb = this._bodyHazardCache.cobweb;
-    if (overlappingCobweb || this.waterCtrl.isActive('cobweb')) {
-      return this._tickCobwebEscape(overlappingCobweb, target);
+    if (overlappingCobweb || this.cobwebDigLock || this.waterCtrl.isActive('cobweb')) {
+      return this._tickCobwebEscape(overlappingCobweb, target, context);
     }
 
     const embedded = this.isEmbeddedInSolidBlock();

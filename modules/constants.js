@@ -53,17 +53,26 @@ const BLAST_SHIELD_BLOCK_PRIORITY = [
   'stone',
   'end_stone',
   'netherrack',
-  'dirt'
+  'dirt',
+  'oak_planks',
+  'spruce_planks',
+  'birch_planks',
+  'jungle_planks',
+  'acacia_planks',
+  'dark_oak_planks',
+  'mangrove_planks',
+  'cherry_planks',
+  'bamboo_planks',
+  'crimson_planks',
+  'warped_planks',
+  'pale_oak_planks'
 ];
 
 /**
- * General solid building/cover/escape block priority (cheap solid blocks first, obsidian fallback).
+ * General solid building/cover/escape block priority (planks, cobblestone, stone, cheap solid blocks first, obsidian fallback).
  */
 const COVER_BLOCK_PRIORITY = [
   'cobblestone',
-  'cobbled_deepslate',
-  'netherrack',
-  'dirt',
   'stone',
   'oak_planks',
   'spruce_planks',
@@ -76,6 +85,10 @@ const COVER_BLOCK_PRIORITY = [
   'bamboo_planks',
   'crimson_planks',
   'warped_planks',
+  'pale_oak_planks',
+  'cobbled_deepslate',
+  'netherrack',
+  'dirt',
   'end_stone',
   'deepslate',
   'sandstone',

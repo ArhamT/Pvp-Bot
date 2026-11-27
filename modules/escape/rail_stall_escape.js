@@ -366,7 +366,7 @@ const railStallEscapeMethods = {
         this.bot.setControlState('left', false);
         this.bot.setControlState('right', false);
         this.bot.setControlState('sprint', this.bot.food > 6 && !this.isInWater());
-        this.bot.setControlState('jump', Boolean(this.bot.entity.onGround || this.isInWater()));
+        this.bot.setControlState('jump', Boolean((this._detourNeedsJump && this.bot.entity.onGround) || this.isInWater()));
       }
       return true;
     }
@@ -389,7 +389,9 @@ const railStallEscapeMethods = {
     if (this.lastCheckPos) {
       const dx = pos.x - this.lastCheckPos.x;
       const dz = pos.z - this.lastCheckPos.z;
-      if (Math.sqrt(dx * dx + dz * dz) < 0.04) {
+      const moved = Math.sqrt(dx * dx + dz * dz);
+      // Catch both hard stalls (<0.06b/t) AND wall/barrier side-grinding (isCollidedHorizontally + <0.09b/t)
+      if (moved < 0.06 || (this.bot.entity.isCollidedHorizontally && moved < 0.09)) {
         this.stallTicks += 1;
       } else {
         this.stallTicks = 0;
@@ -397,19 +399,37 @@ const railStallEscapeMethods = {
     }
     this.lastCheckPos = pos.clone();
 
-    const threshold = this.escapeCfg.stallTicksThreshold || 10;
-    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 1800) {
+    const threshold = Math.min(6, this.escapeCfg.stallTicksThreshold || 6);
+    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 900) {
       return false;
     }
 
     this.stallTicks = 0;
     this.lastStallRecoveryAt = now;
 
-    const exit = this._findBestEscapeYaw(null, true);
+    // Compute wall/barrier contact centroid so _findBestEscapeYaw pushes AWAY from any touched wall or barrier!
+    let wallSumX = 0;
+    let wallSumZ = 0;
+    let wallCount = 0;
+    if (typeof this.bot.blockAt === 'function') {
+      for (const [ox, oz] of [[0.55, 0], [-0.55, 0], [0, 0.55], [0, -0.55], [0.5, 0.5], [-0.5, 0.5], [0.5, -0.5], [-0.5, -0.5]]) {
+        const b0 = this.bot.blockAt(new Vec3(Math.floor(pos.x + ox), Math.floor(pos.y), Math.floor(pos.z + oz)));
+        const b1 = this.bot.blockAt(new Vec3(Math.floor(pos.x + ox), Math.floor(pos.y + 1), Math.floor(pos.z + oz)));
+        if ((b0 && b0.boundingBox === 'block') || (b1 && b1.boundingBox === 'block')) {
+          wallSumX += pos.x + ox;
+          wallSumZ += pos.z + oz;
+          wallCount++;
+        }
+      }
+    }
+    const wallAvoidPos = wallCount > 0 ? new Vec3(wallSumX / wallCount, pos.y, wallSumZ / wallCount) : null;
+
+    const exit = this._findBestEscapeYaw(wallAvoidPos, true);
     if (exit && !exit.hasLava) {
       this._setActiveMode('STALL_UNSTICK');
       this.detourYaw = exit.yaw;
-      this.detourTicks = 8;
+      this._detourNeedsJump = Boolean(exit.needsJump);
+      this.detourTicks = 12;
       return this._tickStallUnstick(target, context);
     }
 

@@ -139,7 +139,10 @@ function getToolSpeedScore(item, priorityList) {
 function getCategoryPriority(blockName) {
   const name = String(blockName || '').toLowerCase();
   if (name === 'cobweb') {
-    return [...SWORD_PRIORITY, 'shears'];
+    return ['shears', ...SWORD_PRIORITY];
+  }
+  if (name === 'bamboo' || name === 'bamboo_sapling') {
+    return [...SWORD_PRIORITY, ...AXE_PRIORITY];
   }
   if (name.includes('wool') || name === 'vine' || name === 'glow_lichen') {
     return ['shears', ...SWORD_PRIORITY];
@@ -151,28 +154,42 @@ function getCategoryPriority(blockName) {
     name.includes('hay_block') || name.includes('sponge') ||
     name.includes('sculk') || name.includes('wart_block') || name === 'shroomlight' ||
     name === 'target' || name.includes('moss_block') || name.includes('moss_carpet') ||
-    name === 'dried_kelp_block'
+    name === 'dried_kelp_block' || name === 'leaf_litter'
   ) {
     return HOE_PRIORITY;
   }
   if (
     name.includes('dirt') || name.includes('sand') || name.includes('gravel') ||
-    name.includes('soul_') || name.includes('snow') || name.includes('clay') ||
+    name.includes('soul_sand') || name.includes('soul_soil') ||
+    name.includes('snow') || name.includes('clay') ||
     name.includes('mud') || name.includes('grass_block') || name.includes('mycelium') ||
-    name.includes('podzol') || name.includes('concrete_powder') || name === 'farmland'
+    name.includes('podzol') || name.includes('concrete_powder') ||
+    name === 'farmland' || name === 'grass_path'
   ) {
-    return SHOVEL_PRIORITY;
+    // Note: sandstone / red_sandstone are pickaxe blocks, not shovel blocks!
+    if (!name.includes('sandstone')) {
+      return SHOVEL_PRIORITY;
+    }
   }
   if (
     name.includes('planks') || name.includes('log') || name.includes('wood') ||
-    name.includes('stem') || name.includes('hyphae') || name.includes('bamboo') ||
-    name.includes('fence') || name.includes('gate') || name.includes('door') ||
+    name.includes('stem') || name.includes('hyphae') ||
+    name.includes('fence') || name.includes('gate') ||
+    name.includes('trapdoor') || name.includes('door') ||
     name.includes('chest') || name.includes('barrel') || name.includes('bookshelf') ||
-    name.includes('sign') || name === 'crafting_table' || name === 'melon' ||
-    name === 'pumpkin' || name === 'jack_o_lantern' || name === 'scaffolding' ||
-    name === 'ladder' || name === 'composter' || name === 'lectern' || name === 'beehive'
+    name.includes('sign') || name.includes('banner') ||
+    name.includes('campfire') || name === 'crafting_table' ||
+    name === 'melon' || name === 'pumpkin' || name === 'jack_o_lantern' ||
+    name === 'carved_pumpkin' || name === 'scaffolding' || name === 'ladder' ||
+    name === 'composter' || name === 'lectern' || name === 'beehive' ||
+    name === 'bee_nest' || name === 'note_block' || name === 'jukebox' ||
+    name === 'loom' || name === 'smithing_table' || name === 'fletching_table' ||
+    name === 'cartography_table'
   ) {
-    return AXE_PRIORITY;
+    // Iron doors/trapdoors & ender chests require pickaxe, not axe!
+    if (!name.includes('iron_') && !name.includes('copper_') && name !== 'ender_chest') {
+      return AXE_PRIORITY;
+    }
   }
   return PICKAXE_PRIORITY;
 }

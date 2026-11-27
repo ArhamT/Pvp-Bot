@@ -132,6 +132,29 @@
     "hitCrystalCooldownMs": 250,
     "anchorCooldownMs": 120
   },
+  "tntCart": {
+    "enabled": false,
+    "maxStackCount": 3,
+    "minHealth": 10,
+    "maxSelfBlastDist": 4.2,
+    "requireTotemForCloseBlast": true,
+    "engageMinRange": 1.5,
+    "engageMaxRange": 5.0,
+    "leadTicks": 4,
+    "bowDetonateTicks": 7,
+    "comboCooldownMs": 900,
+    "refillClickDelayMs": 120,
+    "debug": true
+  },
+  "shulkerBuff": {
+    "enabled": true,
+    "strengthThresholdSec": 5,
+    "withdrawCount": 2,
+    "minHealth": 11,
+    "openTimeoutMs": 1500,
+    "cooldownMs": 6000,
+    "debug": true
+  },
   "cart": {
     "enabled": false,
     "minHealth": 10,
@@ -263,7 +286,31 @@
     "railEvadeTicks": 12,
     "lavaWaterCooldownMs": 2500,
     "stallTicksThreshold": 10,
-    "allowBlockDig": true
+    "allowBlockDig": true,
+    "cobwebDigTimeoutMs": 2200,
+    "buildableBlocks": [
+      "cobblestone",
+      "stone",
+      "oak_planks",
+      "spruce_planks",
+      "birch_planks",
+      "jungle_planks",
+      "acacia_planks",
+      "dark_oak_planks",
+      "mangrove_planks",
+      "cherry_planks",
+      "bamboo_planks",
+      "crimson_planks",
+      "warped_planks",
+      "pale_oak_planks",
+      "cobbled_deepslate",
+      "deepslate",
+      "netherrack",
+      "dirt",
+      "end_stone",
+      "sandstone",
+      "obsidian"
+    ]
   },
   "liquidDeny": {
     "enabled": true,

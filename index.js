@@ -14,7 +14,8 @@ const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
 const { RangedModule } = require('./modules/ranged');
 const { BurstModule } = require('./modules/burst');
-const { CartModule } = require('./modules/cart');
+const { TntCartSkill } = require('./modules/tntcart');
+const { ShulkerBuffSkill } = require('./modules/shulker_buff');
 const { AerialModule } = require('./modules/aerial');
 const { EscapeModule } = require('./modules/escape');
 const { LiquidDenyModule } = require('./modules/liquid_deny');
@@ -98,7 +99,9 @@ class PvPBotController {
     this.survival = null;
     this.ranged = null;
     this.burst = null;
+    this.tntCart = null;
     this.cart = null;
+    this.shulkerBuff = null;
     this.aerial = null;
     this.escape = null;
     this.miner = null;
@@ -238,7 +241,9 @@ class PvPBotController {
         this.combat = new CombatModule(bot, this.config, this.aimer, this.ranged, this.prediction);
         this.survival = new SurvivalModule(bot, this.config, this.aimer);
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat, this.survival);
-        this.cart = new CartModule(bot, this.config, this.aimer, this.prediction, this.combat);
+        this.tntCart = new TntCartSkill(bot, this.config, this.aimer, this.prediction, this.combat, (m) => this.log(m));
+        this.cart = this.tntCart;
+        this.shulkerBuff = new ShulkerBuffSkill(bot, this.config, this.aimer, this.survival, (m) => this.log(m));
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.escape = new EscapeModule(bot, this.config, this.aimer);
         this.miner = new BlockMiner(bot, this.aimer);
@@ -400,7 +405,8 @@ class PvPBotController {
       if (this.survival) this.survival.dispose();
       if (this.ranged) this.ranged.dispose();
       if (this.burst) this.burst.dispose();
-      if (this.cart) this.cart.dispose();
+      if (this.tntCart) this.tntCart.dispose();
+      if (this.shulkerBuff) this.shulkerBuff.dispose();
       if (this.aerial) this.aerial.dispose();
       if (this.escape) this.escape.dispose();
       if (this.miner) this.miner.cancel(true);
@@ -544,10 +550,13 @@ class PvPBotController {
 
     const target = this._resolveActiveTarget();
 
-    // 1. HIGHEST PRIORITY: Offhand Totem of Undying / Shield safety
-    const totemSwapActive = this.survival.ensureOffhandSafety(target);
+    // Priority Lock Arbitration:
+    // 1. Off-Hand Totem safety (suppressed ONLY when an open Shulker window is actively being looted)
+    const shulkerLocked = Boolean(this.shulkerBuff && this.shulkerBuff.isContainerLocked());
+    const totemSwapActive = !shulkerLocked && this.survival.ensureOffhandSafety(target);
     if (totemSwapActive) {
       if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
+      if (this.tntCart && this.tntCart.isBusy()) this.tntCart.cancel();
       if (this.combat && this.state === STATES.ENGAGING) this.combat.stopMovement();
       if (this.state === STATES.ENGAGING) return;
     }
@@ -556,11 +565,13 @@ class PvPBotController {
       this.prediction.tick(target);
     }
 
-    // 1b. Escape & Unstick subsystem (lava, fire, cobweb, suffocation, rail/cart, box breakout, stall)
+    // 1b. Priority #1 Lock: Escape & Last-Resort Cobweb Sword Mining (`COBWEB_ESCAPE` > `SHULKER_BUFF` > `TNTCART_COMBO` > `DEFAULT_PVP`)
     const isStationaryAction = Boolean(
       this.survival.isConsuming ||
       this.survival.isShielding ||
       this.survival.pendingLosBlock ||
+      (this.shulkerBuff && this.shulkerBuff.isBusy()) ||
+      (this.tntCart && this.tntCart.isBusy()) ||
       (this.burst && this.burst.isBusy()) ||
       (this.aerial && this.aerial.isBusy()) ||
       (this.liquidDeny && this.liquidDeny.isBusy()) ||
@@ -568,6 +579,7 @@ class PvPBotController {
     );
     if (
       !totemSwapActive &&
+      !shulkerLocked &&
       this.escape &&
       this.escape.tick(target, {
         canTrackStall: (this.state === STATES.ENGAGING || this.state === STATES.RETREATING) && !isStationaryAction,
@@ -575,7 +587,9 @@ class PvPBotController {
       })
     ) {
       if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
+      if (this.tntCart && this.tntCart.isBusy()) this.tntCart.cancel();
       if (this.survival) this.survival.lowerShield();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
@@ -862,6 +876,21 @@ class PvPBotController {
 
     // 1c. Red Wool Radius Exit
     if (this.redWoolZone && this.redWoolZone.tick(target, { allowSprint: true })) {
+      if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
+      if (this.combat) this.combat.resetTransientState();
+      return;
+    }
+
+    // Priority #2 Lock: Shulker Box Strength Restock & Splash Buffing (`SHULKER_BUFF` > `TNTCART_COMBO` > `DEFAULT_PVP`)
+    if (this.shulkerBuff && this.shulkerBuff.tick(target)) {
+      if (this.tntCart && this.tntCart.isBusy()) this.tntCart.cancel();
+      if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
+      if (this.combat) this.combat.resetTransientState();
+      return;
+    }
+
+    // Priority #3 Lock: Dedicated TNT Minecart Skill (`TNTCART_COMBO` > `DEFAULT_PVP`)
+    if (this.tntCart && this.tntCart.tick(target)) {
       if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
       if (this.combat) this.combat.resetTransientState();
       return;

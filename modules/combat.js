@@ -896,6 +896,16 @@ class CombatModule {
     if (!this.bot.entity) return false;
     // Mineflayer yaw: +PI/2 = LEFT (-X at yaw=0), -PI/2 = RIGHT (+X at yaw=0)
     const sideYaw = this.bot.entity.yaw - (dir * Math.PI) / 2;
+    const pos = this.bot.entity.position;
+
+    // Immediate shoulder check (0.52b): prevents strafing into a thin 1-block wall, barrier, or pillar!
+    if (typeof this.bot.blockAt === 'function') {
+      const nearX = pos.x - Math.sin(sideYaw) * 0.52;
+      const nearZ = pos.z - Math.cos(sideYaw) * 0.52;
+      const nearCol = inspectColumnStep(this.bot, nearX, pos.y, nearZ);
+      if (nearCol.blocked || nearCol.hasHazard) return false;
+    }
+
     if (this.hazardChecker && typeof this.hazardChecker.isDirectionSafe === 'function') {
       return this.hazardChecker.isDirectionSafe(sideYaw, 1.15);
     }
@@ -903,7 +913,6 @@ class CombatModule {
     const stepX = -Math.sin(sideYaw) * 1.1;
     const stepZ = -Math.cos(sideYaw) * 1.1;
 
-    const pos = this.bot.entity.position;
     const targetPos = pos.offset(stepX, 0, stepZ);
     const feetBlock = this.bot.blockAt(targetPos);
     const headBlock = this.bot.blockAt(targetPos.offset(0, 1, 0));
@@ -1295,6 +1304,12 @@ class CombatModule {
       }
     }
 
+    // Direct lateral side-wall / barrier check at ±0.52b so touching the side of a wall/barrier pushes off cleanly!
+    const sideLeftCol = inspectColumnStep(this.bot, pos.x - rx * 0.52, pos.y, pos.z - rz * 0.52);
+    const sideRightCol = inspectColumnStep(this.bot, pos.x + rx * 0.52, pos.y, pos.z + rz * 0.52);
+    const sideLeftWall = Boolean(sideLeftCol.blocked);
+    const sideRightWall = Boolean(sideRightCol.blocked);
+
     // Detect 3-block-high cobweb directly above the bot's footprint so we don't jump into it repeatedly
     const aboveY = Math.floor(pos.y) + 2;
     for (const ox of [0, -0.29, 0.29]) {
@@ -1308,15 +1323,23 @@ class CombatModule {
       if (overheadCobweb) break;
     }
 
-    // Only jump on horizontal collision when NOT touching/sliding past a 2-high wall (prevents in-place jump stutter!)
-    if (!needLedgeJump && !centerBlocked2High && !leftBlocked2High && !rightBlocked2High && this.bot.entity.isCollidedHorizontally) {
+    // Only jump on horizontal collision when NOT scraping a 2-high wall/barrier on front or side!
+    if (
+      !needLedgeJump &&
+      !centerBlocked2High &&
+      !leftBlocked2High &&
+      !rightBlocked2High &&
+      !sideLeftWall &&
+      !sideRightWall &&
+      this.bot.entity.isCollidedHorizontally
+    ) {
       const centerCol = inspectColumnStep(this.bot, pos.x + fx * 0.7, pos.y, pos.z + fz * 0.7);
       if (!centerCol.blocked) {
         needLedgeJump = true;
       }
     }
 
-    return { needLedgeJump, centerBlocked2High, leftBlocked2High, rightBlocked2High, overheadCobweb };
+    return { needLedgeJump, centerBlocked2High, leftBlocked2High, rightBlocked2High, sideLeftWall, sideRightWall, overheadCobweb };
   }
 
   _updateDynamicSpacingAndStrafe(reachDist, aimStatus) {
@@ -1333,25 +1356,33 @@ class CombatModule {
     );
     const canSprint = facingTarget && this.bot.food > 6;
 
-    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips, 2-high walls/corners, or 3-high cobwebs)
+    // 3-ray shoulder, lateral side-wall/barrier, & ledge check
     const yaw = this.bot.entity.yaw;
-    const { needLedgeJump, centerBlocked2High, leftBlocked2High, rightBlocked2High, overheadCobweb } = this._inspectForwardAndShoulders(yaw);
+    const {
+      needLedgeJump,
+      centerBlocked2High,
+      leftBlocked2High,
+      rightBlocked2High,
+      sideLeftWall,
+      sideRightWall,
+      overheadCobweb
+    } = this._inspectForwardAndShoulders(yaw);
 
-    // Slide cleanly away from a 2-high corner OR flat wall directly in front (with hysteresis to prevent 20-Hz jitter)
+    // Slide cleanly away from a side wall/barrier, 2-high corner, or flat wall (with hysteresis to prevent stutter)
     let edgeSlideDir = 0;
     const wallDirectlyAhead = centerBlocked2High || (leftBlocked2High && rightBlocked2High);
-    if (leftBlocked2High && !rightBlocked2High) {
+    if ((leftBlocked2High || sideLeftWall) && !(rightBlocked2High || sideRightWall)) {
       this.strafeDirection = 1;
       this._edgeSlideDir = 1;
-      this._edgeSlideHoldTicks = 4;
+      this._edgeSlideHoldTicks = 6;
       edgeSlideDir = 1;
-    } else if (rightBlocked2High && !leftBlocked2High) {
+    } else if ((rightBlocked2High || sideRightWall) && !(leftBlocked2High || sideLeftWall)) {
       this.strafeDirection = -1;
       this._edgeSlideDir = -1;
-      this._edgeSlideHoldTicks = 4;
+      this._edgeSlideHoldTicks = 6;
       edgeSlideDir = -1;
     } else if (wallDirectlyAhead) {
-      // Touching/facing a flat wall head-on -> slide parallel along the open lateral side instead of grinding into the wall!
+      // Touching/facing a flat wall head-on -> commit to sliding parallel along the open lateral side
       const rightOpen = this._isStrafeDirectionSafe(1);
       const leftOpen = this._isStrafeDirectionSafe(-1);
       if (rightOpen && !leftOpen) {
@@ -1363,7 +1394,7 @@ class CombatModule {
       }
       this.strafeDirection = edgeSlideDir;
       this._edgeSlideDir = edgeSlideDir;
-      this._edgeSlideHoldTicks = 5;
+      this._edgeSlideHoldTicks = 8;
     } else if (this._edgeSlideHoldTicks > 0) {
       this._edgeSlideHoldTicks--;
       edgeSlideDir = this._edgeSlideDir || 0;
@@ -1373,9 +1404,9 @@ class CombatModule {
     const shouldClimbOrSwim = inWater || (allowJump && onGround && needLedgeJump);
 
     if (wallDirectlyAhead && !needLedgeJump) {
-      // Facing/touching a 2-high wall: slide smoothly around the open side (only release forward when flush/colliding)
+      // Facing/touching a 2-high wall or barrier: detach cleanly (never stutter forward/back in place!)
       const touchingWall = Boolean(this.bot.entity.isCollidedHorizontally);
-      this.bot.setControlState('forward', !touchingWall);
+      this.bot.setControlState('forward', false);
       this.bot.setControlState('back', touchingWall && this._isBackpedalSafe());
       this.bot.setControlState('sprint', false);
       this.bot.setControlState('jump', inWater);
