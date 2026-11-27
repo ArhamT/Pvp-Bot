@@ -283,16 +283,18 @@ class PvPBotController {
 
         const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
         const nearbyCount = this._listNearbyPlayers(true).length;
+        const hasLobbyMenu = this._hasLobbyMenuItems();
         const hasCombatKit = this._hasCombatKit();
         const inRedWoolSafeZone = Boolean(
           this.redWoolZone && this.redWoolZone.isPositionInSafeZone(bot.entity.position)
         );
 
-        if (recentlyEndedDuel) {
+        if (recentlyEndedDuel || hasLobbyMenu) {
           this.pendingDuelTarget = null;
           this.pendingDuelReady = false;
           this.autoStartDuelUntil = 0;
           this.inDuelArena = false;
+          this.inFfaArena = false;
         } else if (hasCombatKit && (inRedWoolSafeZone || nearbyCount >= 3)) {
           this.pendingDuelTarget = null;
           this.pendingDuelReady = false;

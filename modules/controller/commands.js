@@ -16,6 +16,7 @@ const commandMethods = {
 
   _isAuthorized(username) {
     if (!username || !this.bot || username === this.bot.username) return false;
+    if (this._isIgnoredPlayer(username)) return false;
     const owner = this.config.bot.owner;
     if (!owner || owner === '*') return true;
     return username.toLowerCase() === owner.toLowerCase();
@@ -150,8 +151,10 @@ const commandMethods = {
         : {};
       const potSummary = Object.entries(pots).filter(([, v]) => v > 0).map(([k, v]) => `${k}x${v}`).join(',') || 'none';
       const aerialInfo = this.aerial ? `${this.aerial.mode}/${this.aerial.stage || '-'}` : 'off';
+      const arenaFlags = this._getArenaInventoryFlags();
+      const arenaMode = this._detectArenaMode();
       reply(
-        `[DEBUG] State=${this.state} Target=${this.activeTargetName || 'none'} (found=${Boolean(target)}, dist=${dist}) ` +
+        `[DEBUG] State=${this.state} Arena=${arenaMode}(lobby=${arenaFlags.lobbyReason || 'none'}) Target=${this.activeTargetName || 'none'} (found=${Boolean(target)}, dist=${dist}) ` +
         `Auto=${this.autoFight} PendingDuel=${this.pendingDuelTarget || 'none'} Controls=[${ctrlState}] ` +
         `Aerial=${aerialInfo} Pots=[${potSummary}] ` +
         `Busy(aerial=${this.aerial ? this.aerial.isBusy() : false}, burst=${this.burst ? this.burst.isBusy() : false}, ranged=${this.ranged ? this.ranged.isBusy() : false}, shield=${this.survival ? this.survival.isShielding : false}) ` +

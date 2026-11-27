@@ -8,6 +8,10 @@
   "bot": {
     "username": "PvPBot",
     "owner": "OwnerName",
+    "ignoredPlayers": [
+      "toxic666",
+      "bachacute"
+    ],
     "commandPrefix": "!",
     "kitCommand": "/kit pvp",
     "autoRetaliate": true,
@@ -31,7 +35,7 @@
     "roamPauseMinMs": 2200,
     "roamPauseMaxMs": 4800,
     "advertise": {
-      "enabled": true,
+      "enabled": false,
       "colorPrefix": "&b",
       "minDelayMs": 60000,
       "maxDelayMs": 180000,

@@ -89,6 +89,7 @@ const duelChatMethods = {
     const senderLower = sender.toLowerCase();
     const selfName = ((this.bot && this.bot.username) || botCfg.username || '').toLowerCase();
     if (!sender || senderLower === 'you' || (selfName && senderLower === selfName)) return false;
+    if (this._isIgnoredPlayer(sender)) return false;
 
     const now = Date.now();
     const lastAcceptedAt = this._recentDuelAccepts.get(senderLower) || 0;
@@ -182,6 +183,7 @@ const duelChatMethods = {
     ) {
       const now = Date.now();
       if ((now - this.duelEndedAt) < 2000) return;
+      if (this._hasLobbyMenuItems()) return;
 
       this._clearDuelsRejoinTimer('duel started');
       const preferred = this.pendingDuelTarget ? this._findPlayerEntity(this.pendingDuelTarget) : null;

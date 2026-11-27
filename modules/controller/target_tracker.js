@@ -5,6 +5,23 @@
  * (`modules/controller/target_tracker.js`).
  */
 const targetTrackerMethods = {
+  _isIgnoredPlayer(nameOrEntity) {
+    if (!nameOrEntity) return false;
+    const rawName = typeof nameOrEntity === 'string'
+      ? nameOrEntity
+      : (nameOrEntity.username || '');
+    if (!rawName) return false;
+    const lower = rawName.toLowerCase();
+    const list = (this.config && this.config.bot && Array.isArray(this.config.bot.ignoredPlayers))
+      ? this.config.bot.ignoredPlayers
+      : null;
+    if (!list || list.length === 0) return false;
+    for (let i = 0; i < list.length; i++) {
+      if (String(list[i]).toLowerCase() === lower) return true;
+    }
+    return false;
+  },
+
   _clearTargetState(clearDuel = false) {
     this.activeTargetName = null;
     this.activeTargetEntityId = null;
@@ -20,6 +37,16 @@ const targetTrackerMethods = {
 
   _engageTarget(target, reason = 'engage', reply = null) {
     if (!target || !target.isValid) return false;
+    if (this._isIgnoredPlayer(target)) {
+      if (reply) reply(`Ignoring ${target.username || 'player'} (in ignoredPlayers list).`);
+      return false;
+    }
+    const isManualCommand = typeof reason === 'string' && (reason.startsWith('!duel') || reason.startsWith('!auto'));
+    if (!isManualCommand && !this.autoFight && this._hasLobbyMenuItems()) {
+      const flags = this._getArenaInventoryFlags();
+      this.log(`[SPAWN GUARD] Blocked engage in spawn/lobby (${flags.lobbyReason || 'lobby menu detected'}).`);
+      return false;
+    }
     if (this.miner) this.miner.cancel(true);
     this.activeTargetName = target.username || `entity#${target.id}`;
     this.activeTargetEntityId = target.id !== undefined ? target.id : null;
@@ -49,6 +76,11 @@ const targetTrackerMethods = {
     if ((now - (this._lastAutoRetaliateAt || 0)) < 150) return false;
     this._lastAutoRetaliateAt = now;
 
+    // Never auto-retaliate inside spawn/lobby (e.g., fall damage or lobby toys)
+    if (!this.autoFight && this._hasLobbyMenuItems()) {
+      return false;
+    }
+
     const nearby = this._listNearbyPlayers(true);
     const recentlyEnded = (now - this.duelEndedAt) < 8000;
     if (!this.inDuelArena && !this._isWearingCombatArmor() && (nearby.length >= 3 || recentlyEnded)) {
@@ -63,6 +95,9 @@ const targetTrackerMethods = {
     }
 
     const arenaMode = this._detectArenaMode();
+    if (arenaMode === 'LOBBY' && !this.autoFight) {
+      return false;
+    }
     for (let i = 0; i < nearby.length; i++) {
       const cand = nearby[i];
       if (cand.dist > 14.0) break;
@@ -110,6 +145,7 @@ const targetTrackerMethods = {
       if (entity.id !== undefined && (entity.id === selfId || seenIds.has(entity.id))) return;
       const username = entity.username || fallbackName || `player_${entity.id}`;
       if (username.toLowerCase() === selfName) return;
+      if (this._isIgnoredPlayer(username)) return;
       if (entity.id !== undefined) seenIds.add(entity.id);
       const dist = botPos.distanceTo(entity.position);
       results.push({ username, entity, dist });
