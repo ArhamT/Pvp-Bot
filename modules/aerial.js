@@ -407,7 +407,7 @@ class AerialModule {
     const map = this._getWeaponEnchantments();
     const minDensityFall = this.aerialCfg.densityMinFallDistance !== undefined
       ? this.aerialCfg.densityMinFallDistance
-      : 5.0;
+      : 4.0;
     return selectMaceForFall(this.fallDistance, map, {
       preferWindBurst: preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false,
       densityMinFallDistance: minDensityFall

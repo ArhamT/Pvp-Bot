@@ -196,7 +196,7 @@
     "stunSlamRange": 4.8,
     "maceLaunchEnabled": true,
     "maceLaunchCooldownMs": 1800,
-    "densityMinFallDistance": 5.0,
+    "densityMinFallDistance": 4.0,
     "maceMinChargeRatio": 0.88,
     "maceAttributeSwap": true,
     "macePreEquipOnAscent": true,

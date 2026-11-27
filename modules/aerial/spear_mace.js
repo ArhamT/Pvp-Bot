@@ -63,7 +63,7 @@ const spearMaceMethods = {
     const effectiveFall = Math.max(this.fallDistance || 0, heightAbove);
     const minDensityFall = this.aerialCfg.densityMinFallDistance !== undefined
       ? this.aerialCfg.densityMinFallDistance
-      : 5.0;
+      : 4.0;
     if (this.weaponEnchantments) {
       const rule = selectMaceForFall(effectiveFall, this.weaponEnchantments, {
         densityMinFallDistance: minDensityFall

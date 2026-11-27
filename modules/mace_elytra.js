@@ -149,13 +149,13 @@ function validateArmorInventory(bot) {
 
 /**
  * Selects Density vs Breach Mace by fall height:
- * - fallDistance >= 5.0 (default, configurable via `densityMinFallDistance`) -> Density Mace
- * - fallDistance < 5.0 -> Breach Mace
+ * - fallDistance >= 4.0 (default, configurable via `densityMinFallDistance`) -> Density Mace
+ * - fallDistance < 4.0 -> Breach Mace
  */
 function selectMaceForFall(fallDistance, weaponMap, options = {}) {
   if (!weaponMap || !Array.isArray(weaponMap.maces) || weaponMap.maces.length === 0) return null;
   const preferWindBurst = options.preferWindBurst !== false;
-  const minDensityFall = options.densityMinFallDistance !== undefined ? options.densityMinFallDistance : 5.0;
+  const minDensityFall = options.densityMinFallDistance !== undefined ? options.densityMinFallDistance : 4.0;
   const useDensity = fallDistance >= minDensityFall;
 
   const ranked = weaponMap.maces.slice().sort((a, b) => {
