@@ -2,10 +2,13 @@
 
 const { Vec3 } = require('vec3');
 const { posKey, isAirLike } = require('../constants');
-const { BLAST_SHIELD_BLOCK_PRIORITY } = require('../cpvp_tactics');
+const {
+  CRYSTAL_POWER,
+  BLAST_SHIELD_BLOCK_PRIORITY,
+  isCrystalEntity
+} = require('../cpvp_tactics');
 
 const HOTBAR_END = 44;
-const CRYSTAL_POWER = 6.0;
 const ANCHOR_POWER = 5.0;
 const COVER_BLOCK_PRIORITY = BLAST_SHIELD_BLOCK_PRIORITY;
 
@@ -51,13 +54,6 @@ const PLACEMENT_FACES = [
   { offset: new Vec3(0, 0, -1), face: new Vec3(0, 0, 1) },
   { offset: new Vec3(0, 1, 0), face: new Vec3(0, -1, 0) }
 ];
-
-function isCrystalEntity(entity) {
-  if (!entity || !entity.isValid) return false;
-  const name = String(entity.name || '').toLowerCase();
-  const display = String(entity.displayName || '').toLowerCase();
-  return name === 'end_crystal' || name === 'ender_crystal' || name === 'endercrystal' || display === 'end crystal';
-}
 
 module.exports = {
   HOTBAR_END,

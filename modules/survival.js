@@ -1,19 +1,6 @@
 'use strict';
 
-const { OFFHAND_SLOT, HOTBAR_START, clearMovementControls } = require('./constants');
-const {
-  GAPPLE_PRIORITY,
-  HEAL_FOOD_PRIORITY,
-  LOS_BLOCK_NAMES,
-  ARMOR_SLOTS,
-  ARMOR_MATERIAL_SCORE,
-  ARMOR_MAX_DURABILITY,
-  DEFAULT_BUFF_DURATION_MS,
-  VANILLA_POTION_ID_TO_KEY,
-  ZERO_BASED_EFFECT_TO_KIND,
-  ZERO_BASED_EFFECT_TO_CLASS,
-  ONE_BASED_EFFECT_TO_KIND
-} = require('./survival/constants');
+const { OFFHAND_SLOT, HOTBAR_START } = require('./constants');
 const { totemShieldMethods } = require('./survival/totem_shield');
 const { potionsFoodMethods } = require('./survival/potions_food');
 const { kitManagerMethods } = require('./survival/kit_manager');

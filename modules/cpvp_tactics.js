@@ -1,6 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
+const { isAirLike: isConstantsAirLike } = require('./constants');
 
 const CRYSTAL_POWER = 6.0;
 
@@ -30,9 +31,9 @@ const CARDINAL_OFFSETS = [
   new Vec3(0, 0, -1)
 ];
 
+// Preserves strict non-null semantics for CPvP block placement (unloaded null chunks are NOT air)
 function isAirLike(block) {
-  if (!block) return false;
-  return block.name === 'air' || block.name === 'cave_air' || block.name === 'void_air';
+  return Boolean(block) && isConstantsAirLike(block);
 }
 
 function isCrystalEntity(entity) {

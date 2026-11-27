@@ -1,44 +1,7 @@
 'use strict';
 
-const { Vec3 } = require('vec3');
-const { clamp, DEG_TO_RAD } = require('../aim');
-const {
-  TORSO_SLOT,
-  HOTBAR_START: DEFAULT_HOTBAR_START,
-  PEARL_SPEED,
-  PEARL_GRAVITY,
-  PEARL_DRAG,
-  SWORD_PRIORITY,
-  AXE_PRIORITY,
-  CHESTPLATE_PRIORITY,
-  isSpearItem,
-  hasItemEnchant
-} = require('../constants');
-const {
-  scanWeaponEnchantments,
-  selectMaceForFall,
-  buildTargetState,
-  evaluateShieldCounter,
-  hasSlowFalling,
-  detectEnemyDiveBomb,
-  shouldConserveElytra,
-  executeAttributeSwapAttack
-} = require('../mace_elytra');
-
-const DEFAULT_REACH = 3.0;
-const AERIAL_MODES = Object.freeze({
-  IDLE: 'IDLE',
-  STUN_SLAM: 'STUN_SLAM',
-  MACE_LAUNCH: 'MACE_LAUNCH',
-  PEARL_CATCH: 'PEARL_CATCH',
-  SPEAR_MACE: 'SPEAR_MACE',
-  ELYTRA_DIVE: 'ELYTRA_DIVE',
-  ELYTRA_SPEAR: 'ELYTRA_SPEAR',
-  ELYTRA_BOOST: 'ELYTRA_BOOST',
-  DIVE_DODGE: 'DIVE_DODGE',
-  SLOW_FALL_EVADE: 'SLOW_FALL_EVADE',
-  CLUTCH: 'CLUTCH'
-});
+const { DEG_TO_RAD } = require('../aim');
+const { AERIAL_MODES } = require('./constants');
 
 const defenseClutchMethods = {
   _shouldTriggerClutch(target, allowNearTargetMiss = false) {

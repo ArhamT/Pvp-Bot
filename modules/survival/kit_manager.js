@@ -3,33 +3,22 @@
 const { Vec3 } = require('vec3');
 const { normalizeAngle } = require('../aim');
 const {
-  OFFHAND_SLOT,
   HOTBAR_START,
   SWORD_PRIORITY,
   AXE_PRIORITY,
   isSpearItem,
   clearMovementControls,
-  getItemMetadataText,
   inspectColumnStep
 } = require('../constants');
 const {
   parseItemEnchantments,
-  validateArmorInventory,
-  buildTargetState,
-  detectIncomingMaceAttack
+  validateArmorInventory
 } = require('../mace_elytra');
 const {
   GAPPLE_PRIORITY,
-  HEAL_FOOD_PRIORITY,
   LOS_BLOCK_NAMES,
   ARMOR_SLOTS,
-  ARMOR_MATERIAL_SCORE,
-  ARMOR_MAX_DURABILITY,
-  DEFAULT_BUFF_DURATION_MS,
-  VANILLA_POTION_ID_TO_KEY,
-  ZERO_BASED_EFFECT_TO_KIND,
-  ZERO_BASED_EFFECT_TO_CLASS,
-  ONE_BASED_EFFECT_TO_KIND
+  ARMOR_MATERIAL_SCORE
 } = require('./constants');
 
 const kitManagerMethods = {

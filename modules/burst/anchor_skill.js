@@ -1,33 +1,11 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { clamp, normalizeAngle } = require('../aim');
+const { findFeetBlastShieldSpot } = require('../cpvp_tactics');
 const {
-  HOTBAR_START,
-  OFFHAND_SLOT,
-  SWORD_PRIORITY,
-  getItemMetadataText,
-  hasItemEnchant
-} = require('../constants');
-const {
-  BLAST_SHIELD_BLOCK_PRIORITY,
-  isTargetInSurround,
-  hasExistingCrystalAt,
-  findFeetBlastShieldSpot,
-  planHitCrystalTrajectory,
-  planSurroundPressurePlacement
-} = require('../cpvp_tactics');
-const {
-  HOTBAR_END,
-  CRYSTAL_POWER,
   ANCHOR_POWER,
   COVER_BLOCK_PRIORITY,
-  DEFENSE_BLOCK_PRIORITY,
-  ARMOR_STATS,
-  PLACEMENT_FACES,
-  posKey,
-  isAirLike,
-  isCrystalEntity
+  isAirLike
 } = require('./shared');
 
 const anchorSkillMethods = {

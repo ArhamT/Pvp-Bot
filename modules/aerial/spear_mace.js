@@ -1,24 +1,8 @@
 'use strict';
 
-const { Vec3 } = require('vec3');
 const { DEG_TO_RAD } = require('../aim');
-const { hasItemEnchant } = require('../constants');
 const { selectMaceForFall, evaluateShieldCounter } = require('../mace_elytra');
-
-const DEFAULT_REACH = 3.0;
-const AERIAL_MODES = Object.freeze({
-  IDLE: 'IDLE',
-  STUN_SLAM: 'STUN_SLAM',
-  MACE_LAUNCH: 'MACE_LAUNCH',
-  PEARL_CATCH: 'PEARL_CATCH',
-  SPEAR_MACE: 'SPEAR_MACE',
-  ELYTRA_DIVE: 'ELYTRA_DIVE',
-  ELYTRA_SPEAR: 'ELYTRA_SPEAR',
-  ELYTRA_BOOST: 'ELYTRA_BOOST',
-  DIVE_DODGE: 'DIVE_DODGE',
-  SLOW_FALL_EVADE: 'SLOW_FALL_EVADE',
-  CLUTCH: 'CLUTCH'
-});
+const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 /**
  * Dedicated HT1 Unbeatable Spear-Mace PvP Skill (`modules/aerial/spear_mace.js`):

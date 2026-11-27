@@ -2,52 +2,23 @@
 
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('../aim');
-const {
-  TORSO_SLOT,
-  HOTBAR_START: DEFAULT_HOTBAR_START,
-  PEARL_SPEED,
-  PEARL_GRAVITY,
-  PEARL_DRAG,
-  SWORD_PRIORITY,
-  AXE_PRIORITY,
-  CHESTPLATE_PRIORITY,
-  isSpearItem,
-  hasItemEnchant
-} = require('../constants');
-const {
-  scanWeaponEnchantments,
-  selectMaceForFall,
-  buildTargetState,
-  evaluateShieldCounter,
-  hasSlowFalling,
-  detectEnemyDiveBomb,
-  shouldConserveElytra,
-  executeAttributeSwapAttack
-} = require('../mace_elytra');
+const { hasItemEnchant } = require('../constants');
+const { evaluateShieldCounter, shouldConserveElytra } = require('../mace_elytra');
+const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
-const DEFAULT_REACH = 3.0;
-const AERIAL_MODES = Object.freeze({
-  IDLE: 'IDLE',
-  STUN_SLAM: 'STUN_SLAM',
-  MACE_LAUNCH: 'MACE_LAUNCH',
-  PEARL_CATCH: 'PEARL_CATCH',
-  SPEAR_MACE: 'SPEAR_MACE',
-  ELYTRA_DIVE: 'ELYTRA_DIVE',
-  ELYTRA_SPEAR: 'ELYTRA_SPEAR',
-  ELYTRA_BOOST: 'ELYTRA_BOOST',
-  DIVE_DODGE: 'DIVE_DODGE',
-  SLOW_FALL_EVADE: 'SLOW_FALL_EVADE',
-  CLUTCH: 'CLUTCH'
-});
+const _fallFlyingActionCache = new Map();
 
 const elytraSkillMethods = {
   /**
-   * Resolves the protocol-safe `entity_action` actionId for starting Elytra flight.
+   * Resolves (and caches per version) the protocol-safe `entity_action` actionId for starting Elytra flight.
    * MC 1.21.6+ shifted `start_fall_flying` from 8 to 6 (removing sneaking actions),
    * and `'start_elytra_flying'` is not a valid minecraft-data mapper key on any version.
    */
   _resolveStartFallFlyingActionId() {
     const version = this.bot && this.bot.version;
+    if (version && _fallFlyingActionCache.has(version)) {
+      return _fallFlyingActionCache.get(version);
+    }
     if (version) {
       try {
         const mcData = require('minecraft-data')(version);
@@ -64,6 +35,7 @@ const elytraSkillMethods = {
           ? actionField.type[1].mappings
           : null;
         if (mappings && Object.values(mappings).includes('start_fall_flying')) {
+          _fallFlyingActionCache.set(version, 'start_fall_flying');
           return 'start_fall_flying';
         }
       } catch (_) {}
@@ -72,7 +44,9 @@ const elytraSkillMethods = {
     const useString = this.bot &&
       typeof this.bot.supportFeature === 'function' &&
       this.bot.supportFeature('entityActionUsesStringMapper');
-    return useString ? 'start_fall_flying' : 8;
+    const resolved = useString ? 'start_fall_flying' : 8;
+    if (version) _fallFlyingActionCache.set(version, resolved);
+    return resolved;
   },
 
   /**

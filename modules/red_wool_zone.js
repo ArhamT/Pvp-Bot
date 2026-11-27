@@ -1,7 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { ROAM_HAZARD_BLOCKS, clearMovementControls, inspectColumnStep } = require('./constants');
+const { ROAM_HAZARD_BLOCKS, clearMovementControls, inspectColumnStep, isAirLike } = require('./constants');
 const { normalizeAngle } = require('./aim');
 
 const DEFAULT_RED_WOOL_NAMES = ['red_wool'];
@@ -23,9 +23,8 @@ function isRedWoolBlock(block, blockNames = DEFAULT_RED_WOOL_NAMES) {
   return Array.isArray(blockNames) ? blockNames.includes(block.name) : block.name === 'red_wool';
 }
 
-function isAirLike(block) {
-  return !block || block.boundingBox === 'empty' ||
-    block.name === 'air' || block.name === 'cave_air' || block.name === 'void_air';
+function isPassableBlock(block) {
+  return isAirLike(block) || block.boundingBox === 'empty';
 }
 
 /**
@@ -179,13 +178,13 @@ class RedWoolZoneModule {
       if (feet && ROAM_HAZARD_BLOCKS.has(feet.name)) return { walkable: false, stepUpNeeded: false };
       if (head && ROAM_HAZARD_BLOCKS.has(head.name)) return { walkable: false, stepUpNeeded: false };
 
-      if (!isAirLike(feet)) {
+      if (!isPassableBlock(feet)) {
         // 1-block lip is jumpable if head+aboveHead are clear
-        if (!isAirLike(head) || !isAirLike(aboveHead)) {
+        if (!isPassableBlock(head) || !isPassableBlock(aboveHead)) {
           return { walkable: false, stepUpNeeded: false };
         }
         stepUpNeeded = true;
-      } else if (!isAirLike(head)) {
+      } else if (!isPassableBlock(head)) {
         return { walkable: false, stepUpNeeded: false };
       }
 

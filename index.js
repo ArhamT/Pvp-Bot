@@ -4,12 +4,10 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const mineflayer = require('mineflayer');
-const { Vec3 } = require('vec3');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
 
-const { ROAM_HAZARD_BLOCKS, clearMovementControls, getItemMetadataText } = require('./modules/constants');
-const { SmoothAimer, normalizeAngle } = require('./modules/aim');
+const { SmoothAimer } = require('./modules/aim');
 const { PredictionModule } = require('./modules/prediction');
 const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
