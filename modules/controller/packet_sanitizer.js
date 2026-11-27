@@ -63,10 +63,80 @@ const packetSanitizerMethods = {
       8: 'start_fall_flying'
     };
 
+    const MOVE_PACKETS = new Set(['position', 'position_look', 'look', 'flying']);
+    const MAX_COORD = 2.9999e7;
+    let lastGood = { x: null, y: null, z: null, yaw: 0, pitch: 0 };
+    this._movePacketFixes = 0;
+
+    /**
+     * Strict Paper 26.x `handleMovePlayer` guard: the server disconnects with
+     * "Invalid move player packet received" if ANY pos/rot field is NaN/Infinity (or absurdly large).
+     * Sanitize every outgoing movement packet: replace bad values with last-known-good,
+     * clamp pitch to [-90, 90], wrap yaw to [-180, 180), and force on-ground to a strict boolean.
+     */
+    const sanitizeMovePacket = (params) => {
+      if (!params || typeof params !== 'object') return params;
+      let fixed = false;
+      const out = { ...params };
+      const ent = bot.entity;
+
+      const fixCoord = (key) => {
+        if (typeof out[key] !== 'number') return;
+        const v = out[key];
+        if (!Number.isFinite(v) || Math.abs(v) > MAX_COORD) {
+          const fb = lastGood[key] !== null
+            ? lastGood[key]
+            : (ent && ent.position && Number.isFinite(ent.position[key]) ? ent.position[key] : 0);
+          out[key] = fb;
+          fixed = true;
+        } else {
+          lastGood[key] = v;
+        }
+      };
+      fixCoord('x');
+      fixCoord('y');
+      fixCoord('z');
+
+      if (typeof out.yaw === 'number') {
+        if (!Number.isFinite(out.yaw)) {
+          out.yaw = lastGood.yaw;
+          fixed = true;
+        } else {
+          let y = out.yaw % 360;
+          if (y >= 180) y -= 360;
+          else if (y < -180) y += 360;
+          if (y !== out.yaw) {
+            out.yaw = y;
+          }
+          lastGood.yaw = out.yaw;
+        }
+      }
+      if (typeof out.pitch === 'number') {
+        if (!Number.isFinite(out.pitch)) {
+          out.pitch = lastGood.pitch;
+          fixed = true;
+        } else {
+          const p = Math.max(-90, Math.min(90, out.pitch));
+          if (p !== out.pitch) {
+            out.pitch = p;
+            fixed = true;
+          }
+          lastGood.pitch = out.pitch;
+        }
+      }
+      if ('onGround' in out && typeof out.onGround !== 'boolean') {
+        out.onGround = Boolean(out.onGround);
+      }
+      if (fixed) this._movePacketFixes = (this._movePacketFixes || 0) + 1;
+      return out;
+    };
+
     bot._client.write = (name, params, ...rest) => {
       let outParams = params;
 
-      if (name === 'teleport_confirm' && params && typeof params === 'object') {
+      if (MOVE_PACKETS.has(name)) {
+        outParams = sanitizeMovePacket(params);
+      } else if (name === 'teleport_confirm' && params && typeof params === 'object') {
         outParams = { teleportId: Math.trunc(Number(params.teleportId) || 0) };
       } else if (name === 'entity_action' && params && typeof params === 'object') {
         if (params.actionId === 'start_elytra_flying') {
@@ -95,6 +165,7 @@ const packetSanitizerMethods = {
         if (!usesLpVec3Velocity || !packet || !packet.velocity || typeof packet.velocity !== 'object') return;
         const v = packet.velocity;
         if (typeof v.x !== 'number' || typeof v.y !== 'number' || typeof v.z !== 'number') return;
+        if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) return;
 
         const entity = (bot.entities && bot.entities[packet.entityId]) ||
           (bot.entity && bot.entity.id === packet.entityId ? bot.entity : null);
@@ -118,6 +189,18 @@ const packetSanitizerMethods = {
 
       ensureVelocityFixLast();
       if (typeof bot.on === 'function') {
+        // NaN/Infinity physics-state guard: a poisoned velocity would propagate into outgoing move packets
+        bot.on('physicsTick', () => {
+          const e = bot.entity;
+          if (!e || !e.velocity) return;
+          const v = e.velocity;
+          if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) {
+            if (typeof v.set === 'function') v.set(0, 0, 0);
+            else { v.x = 0; v.y = 0; v.z = 0; }
+          }
+          if (Number.isFinite(e.yaw) === false) e.yaw = lastGood.yaw * Math.PI / -180 || 0;
+          if (Number.isFinite(e.pitch) === false) e.pitch = 0;
+        });
         bot.on('inject_allowed', () => setImmediate(ensureVelocityFixLast));
         bot.on('login', ensureVelocityFixLast);
         bot.on('spawn', () => {
