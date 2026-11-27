@@ -21,6 +21,11 @@
     "duelsRejoinDelayMs": 15000,
     "roamInSpawn": true,
     "roamRadius": 10,
+    "roamCenter": {
+      "x": 803,
+      "y": 18,
+      "z": 1173
+    },
     "roamWalkMinMs": 1400,
     "roamWalkMaxMs": 3200,
     "roamPauseMinMs": 2200,

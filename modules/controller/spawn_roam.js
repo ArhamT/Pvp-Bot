@@ -138,9 +138,31 @@ const spawnRoamMethods = {
     };
   },
 
+  _getRoamAnchor() {
+    const pos = this.bot && this.bot.entity && this.bot.entity.position;
+    const botCfg = this.config.bot || {};
+    const cfgCenter = botCfg.roamCenter;
+    if (
+      cfgCenter &&
+      typeof cfgCenter.x === 'number' &&
+      typeof cfgCenter.y === 'number' &&
+      typeof cfgCenter.z === 'number'
+    ) {
+      const configured = new Vec3(cfgCenter.x, cfgCenter.y, cfgCenter.z);
+      // Use configured spawn center whenever in the same spawn region (within 80 blocks)
+      if (!pos || Math.hypot(pos.x - configured.x, pos.z - configured.z) <= 80) {
+        return configured;
+      }
+    }
+    if (!this.spawnAnchorPos && pos) {
+      this.spawnAnchorPos = pos.clone();
+    }
+    return this.spawnAnchorPos || pos;
+  },
+
   _pickRoamTarget() {
     const pos = this.bot.entity.position;
-    const anchor = this.spawnAnchorPos || pos;
+    const anchor = this._getRoamAnchor() || pos;
     const botCfg = this.config.bot || {};
     const radius = botCfg.roamRadius !== undefined ? botCfg.roamRadius : 10;
 
@@ -148,7 +170,7 @@ const spawnRoamMethods = {
     const dzFromAnchor = pos.z - anchor.z;
     const distFromAnchor = Math.sqrt(dxFromAnchor * dxFromAnchor + dzFromAnchor * dzFromAnchor);
 
-    if (distFromAnchor > radius * 0.8) {
+    if (distFromAnchor > radius * 0.85) {
       for (let attempt = 0; attempt < 4; attempt++) {
         const backYaw = Math.atan2(-(anchor.x - pos.x), -(anchor.z - pos.z)) + (attempt * 0.45 * (attempt % 2 === 0 ? 1 : -1));
         if (this._isRoamStepSafe(backYaw).safe) {
@@ -164,7 +186,7 @@ const spawnRoamMethods = {
 
     for (let attempt = 0; attempt < 6; attempt++) {
       const angle = Math.random() * Math.PI * 2;
-      const r = this._randRange(2.5, Math.max(3.5, radius));
+      const r = this._randRange(1.5, Math.max(2.5, radius - 0.5));
       const candidate = new Vec3(
         anchor.x + Math.cos(angle) * r,
         pos.y,
@@ -244,6 +266,19 @@ const spawnRoamMethods = {
     }
 
     const yawToDest = Math.atan2(-dx, -dz);
+    const anchor = this._getRoamAnchor();
+    const radius = botCfg.roamRadius !== undefined ? botCfg.roamRadius : 10;
+    if (anchor) {
+      const curDist = Math.hypot(pos.x - anchor.x, pos.z - anchor.z);
+      const nextDist = Math.hypot((pos.x - Math.sin(yawToDest)) - anchor.x, (pos.z - Math.cos(yawToDest)) - anchor.z);
+      if (nextDist > radius && nextDist > curDist) {
+        this._stopSpawnRoam();
+        this.roamPhase = 'PAUSED';
+        this.roamPhaseUntil = now + this._randRange(400, 900);
+        return;
+      }
+    }
+
     const stepCheck = this._isRoamStepSafe(yawToDest);
     if (!stepCheck.safe) {
       this._stopSpawnRoam();
