@@ -873,14 +873,8 @@ class PvPBotController {
       return;
     }
 
-    // 3. End Crystal & Respawn Anchor PvP
+    // 3. End Crystal & Respawn Anchor PvP (legacy TNT Minecart / rail-cart combos deprecated)
     if (this.burst && this.burst.tick(target)) {
-      if (this.combat) this.combat.resetTransientState();
-      return;
-    }
-
-    // 3b. Optional Cart PvP (0 CPU when config.cart.enabled !== true)
-    if (this.cart && this.cart.tick(target)) {
       if (this.combat) this.combat.resetTransientState();
       return;
     }

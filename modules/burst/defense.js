@@ -88,6 +88,24 @@ const burstDefenseMethods = {
     ) {
       this.activePlan.spawnedCrystal = entity;
       this.stepDelayTicks = 0;
+
+      // Spawn-Tick Crystal Pop: attack our newly placed End Crystal on its exact spawn tick
+      // so Hit-Crystal & Open-Field combos detonate while opponent's feet are airborne!
+      const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
+      if (
+        eyePos.distanceTo(entity.position.offset(0, 0.5, 0)) <= 4.6 &&
+        typeof this.bot.attack === 'function' &&
+        !this.activePlan.spawnPopFired
+      ) {
+        this.activePlan.spawnPopFired = true;
+        if (this.aimer) {
+          this.aimer.stepTowardsPoint(entity.position.offset(0, 0.5, 0), { speedMultiplier: 2.4, toleranceRad: 0.35 });
+        }
+        try {
+          this.bot.attack(entity);
+          this.lastCrystalTime = Date.now();
+        } catch (_) {}
+      }
       return;
     }
 

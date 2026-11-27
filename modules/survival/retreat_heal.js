@@ -26,6 +26,9 @@ const FULL_FAN_OFFSETS = [
  */
 const retreatHealMethods = {
   findLosBuildingBlock() {
+    // Prioritize blast-resistant Obsidian cover first for CPvP <= 9 HP resets
+    const obs = findItemByPredicate(this.bot, (item) => item && item.name === 'obsidian');
+    if (obs) return obs.item;
     const found = findItemByPredicate(this.bot, (item) => item && LOS_BLOCK_NAMES.has(item.name));
     return found ? found.item : null;
   },

@@ -42,6 +42,7 @@ const CHESTPLATE_PRIORITY = [
  */
 const BLAST_SHIELD_BLOCK_PRIORITY = [
   'obsidian',
+  'glowstone',
   'crying_obsidian',
   'respawn_anchor',
   'ancient_debris',

@@ -106,11 +106,8 @@ const cpvpFootworkMethods = {
   },
 
   _getEffectiveMinBurstHealth() {
-    const base = this.burstCfg.minBurstHealth !== undefined ? this.burstCfg.minBurstHealth : 9;
-    if (this._isHoldingOffhandTotem()) {
-      return this._isInTotemPunishWindow() ? Math.min(base, 5) : Math.min(base, 6);
-    }
-    return base;
+    // Strictly enforce Critical HP Reset (<= 9 HP -> retreat behind Obsidian cover & Gapple / Pearl out)
+    return this.burstCfg.minBurstHealth !== undefined ? this.burstCfg.minBurstHealth : 9;
   },
 
   _handleEntityStatus(entity, status) {

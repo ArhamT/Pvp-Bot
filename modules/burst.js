@@ -290,6 +290,11 @@ class BurstModule {
     }
 
     if (!target || !target.isValid) return false;
+    // Priority #1 Override: replenish Off-Hand Totem before executing any new explosive placement!
+    if (!this._isHoldingOffhandTotem() && this._findItem('totem_of_undying')) {
+      return false;
+    }
+    // Priority #2 Override: Critical HP Reset (<= 9 HP -> step back behind Obsidian cover & Gapple / Pearl)
     if (this.bot.health <= minBurstHealth) return false;
 
     const predictedFeet = this._getPredictedTargetFeet(target, 2);
@@ -314,15 +319,26 @@ class BurstModule {
       }
     }
 
-    // 1. Evaluate BOTH Anchor (including already-placed charged anchors on the field!) & Crystal candidates
+    // Priority #3: Close-Quarters Respawn Anchor Combo (Overworld / The End only, <= 3.6b)
+    // Blast Shield -> Anchor -> 1x Glowstone -> Mandatory Non-Glowstone Swap -> Detonate -> Crystal Chain
+    const anchorRange = this.burstCfg.anchorMaxRange !== undefined ? this.burstCfg.anchorMaxRange : 3.6;
     let bestAnchor = null;
-    if (
-      this._canUseRespawnAnchor() &&
-      targetDist <= (this.burstCfg.anchorMaxRange || 4.0)
-    ) {
+    if (this._canUseRespawnAnchor() && targetDist <= anchorRange) {
       bestAnchor = this._findBestAnchorPlacement(target, predictedFeet);
     }
 
+    if (bestAnchor) {
+      this.activePlan = bestAnchor;
+      this.stepDelayTicks = 0;
+      this._enterState(
+        bestAnchor.coverSpot
+          ? 'ANCHOR_COVER'
+          : (bestAnchor.needsPlace ? 'ANCHOR_PLACE' : (bestAnchor.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE'))
+      );
+      return this._tickAnchorState(target);
+    }
+
+    // Priority #4: End Crystal PvP (<= 4.5b) — Hit-Crystal (<= 3.2b), Surround Head-Height Pressure, & Place-and-Pop
     let bestCrystal = null;
     let hitCrystalPlan = null;
     const targetSurrounded = this.burstCfg.surroundPressureEnabled !== false && isTargetInSurround(this.bot, target);
@@ -343,12 +359,8 @@ class BurstModule {
       }
     }
 
-    // 1b. HT1 Surround "City" Mining
-    if (
-      targetSurrounded &&
-      (!bestAnchor || bestAnchor.targetDmg < 7.0) &&
-      (!bestCrystal || bestCrystal.targetDmg < 5.0)
-    ) {
+    // Surround "City" Mining when opponent is boxed and head-height crystals deal low damage
+    if (targetSurrounded && (!bestCrystal || bestCrystal.targetDmg < 5.0)) {
       const city = this._findSurroundCityBlock(target);
       if (city) {
         this.activePlan = { kind: 'city_mine', cityPos: city.pos.clone() };
@@ -358,21 +370,7 @@ class BurstModule {
       }
     }
 
-    const anchorScore = bestAnchor ? this._scoreBurstPlan(bestAnchor, target) : -Infinity;
-    const crystalScore = bestCrystal ? this._scoreBurstPlan(bestCrystal, target) : -Infinity;
-
-    if (bestAnchor && anchorScore >= crystalScore && !hitCrystalPlan) {
-      this.activePlan = bestAnchor;
-      this.stepDelayTicks = 0;
-      this._enterState(
-        bestAnchor.coverSpot
-          ? 'ANCHOR_COVER'
-          : (bestAnchor.needsPlace ? 'ANCHOR_PLACE' : (bestAnchor.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE'))
-      );
-      return this._tickAnchorState(target);
-    }
-
-    if (hitCrystalPlan && (!bestAnchor || anchorScore < 12.0)) {
+    if (hitCrystalPlan) {
       this.activePlan = { kind: 'crystal', isHitCrystal: true, cachedTrajectory: hitCrystalPlan };
       this._enterState('CRYSTAL_HIT_LAUNCH');
       this.stepDelayTicks = 0;
@@ -388,17 +386,6 @@ class BurstModule {
           : (bestCrystal.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL')
       );
       return this._tickCrystalState(target);
-    }
-
-    if (bestAnchor) {
-      this.activePlan = bestAnchor;
-      this.stepDelayTicks = 0;
-      this._enterState(
-        bestAnchor.coverSpot
-          ? 'ANCHOR_COVER'
-          : (bestAnchor.needsPlace ? 'ANCHOR_PLACE' : (bestAnchor.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE'))
-      );
-      return this._tickAnchorState(target);
     }
 
     if (this._tickCpvpMobility(target)) {

@@ -144,7 +144,7 @@ const hitCrystalMethods = {
     const swordRecord = this._findBestSword();
     if (!swordRecord) return null;
 
-    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.4;
+    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
     const reachDist = this._getReachDistanceToEntity(target);
     if (reachDist > maxHitRange) return null;
 
@@ -163,7 +163,7 @@ const hitCrystalMethods = {
       return false;
     }
 
-    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.4;
+    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
     const reachDist = this._getReachDistanceToEntity(target);
     if (reachDist > maxHitRange + 0.35) {
       this._resetOffensiveState(true);
