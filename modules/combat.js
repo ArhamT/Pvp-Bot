@@ -1261,8 +1261,8 @@ class CombatModule {
 
     const lanes = [
       { side: 0, lateral: 0 },
-      { side: -1, lateral: -0.35 },
-      { side: 1, lateral: 0.35 }
+      { side: -1, lateral: -0.29 },
+      { side: 1, lateral: 0.29 }
     ];
 
     for (const lane of lanes) {
@@ -1293,7 +1293,8 @@ class CombatModule {
       if (overheadCobweb) break;
     }
 
-    if (!needLedgeJump && this.bot.entity.isCollidedHorizontally) {
+    // Only jump on horizontal collision when NOT sliding past a 2-high corner edge (prevents in-place jump stutter!)
+    if (!needLedgeJump && !leftBlocked2High && !rightBlocked2High && this.bot.entity.isCollidedHorizontally) {
       const centerCol = inspectColumnStep(this.bot, pos.x + fx * 0.7, pos.y, pos.z + fz * 0.7);
       if (!centerCol.blocked) {
         needLedgeJump = true;
@@ -1321,14 +1322,21 @@ class CombatModule {
     const yaw = this.bot.entity.yaw;
     const { needLedgeJump, leftBlocked2High, rightBlocked2High, overheadCobweb } = this._inspectForwardAndShoulders(yaw);
 
-    // Slide cleanly away from a snagged 2-high corner edge (even when chasing from >4.5b away)
+    // Slide cleanly away from a snagged 2-high corner edge with 4-tick hysteresis (eliminates 20-Hz A/D jitter!)
     let edgeSlideDir = 0;
     if (leftBlocked2High && !rightBlocked2High) {
       this.strafeDirection = 1;
+      this._edgeSlideDir = 1;
+      this._edgeSlideHoldTicks = 4;
       edgeSlideDir = 1;
     } else if (rightBlocked2High && !leftBlocked2High) {
       this.strafeDirection = -1;
+      this._edgeSlideDir = -1;
+      this._edgeSlideHoldTicks = 4;
       edgeSlideDir = -1;
+    } else if (this._edgeSlideHoldTicks > 0) {
+      this._edgeSlideHoldTicks--;
+      edgeSlideDir = this._edgeSlideDir || 0;
     }
 
     const allowJump = !overheadCobweb || inWater;

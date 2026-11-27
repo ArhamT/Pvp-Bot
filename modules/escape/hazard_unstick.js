@@ -570,15 +570,15 @@ const hazardUnstickMethods = {
       const dx = pos.x - this.lastCheckPos.x;
       const dz = pos.z - this.lastCheckPos.z;
       if (Math.sqrt(dx * dx + dz * dz) < 0.04) {
-        this.stallTicks += this.bot.entity.isCollidedHorizontally ? 2 : 1;
+        this.stallTicks += 1;
       } else {
         this.stallTicks = 0;
       }
     }
     this.lastCheckPos = pos.clone();
 
-    const threshold = this.escapeCfg.stallTicksThreshold || 10;
-    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 1200) {
+    const threshold = this.escapeCfg.stallTicksThreshold || 14;
+    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 2200) {
       return false;
     }
 
