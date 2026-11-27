@@ -18,7 +18,11 @@ const {
   hasSlowFalling,
   detectEnemyDiveBomb
 } = require('./mace_elytra');
-const { AERIAL_MODES } = require('./aerial/constants');
+const {
+  AERIAL_MODES,
+  resolveStartFallFlyingActionId,
+  sendStartElytraFlying
+} = require('./aerial/constants');
 
 /**
  * Advanced aerial PvP module implementing:
@@ -33,7 +37,8 @@ const { AERIAL_MODES } = require('./aerial/constants');
 const { pearlCatchMethods } = require('./aerial/pearl_catch');
 const { maceComboMethods } = require('./aerial/mace_combos');
 const { spearMaceMethods } = require('./aerial/spear_mace');
-const { elytraSkillMethods } = require('./aerial/elytra_skills');
+const { elytraMaceMethods } = require('./aerial/elytra_mace');
+const { elytraSpearMethods } = require('./aerial/elytra_spear');
 const { defenseClutchMethods } = require('./aerial/defense_clutch');
 
 class AerialModule {
@@ -576,6 +581,14 @@ class AerialModule {
     return Boolean(this._findChestplate(this.savedChestplateName));
   }
 
+  _resolveStartFallFlyingActionId() {
+    return resolveStartFallFlyingActionId(this.bot);
+  }
+
+  _sendStartElytraFlying() {
+    return sendStartElytraFlying(this.bot);
+  }
+
   _hasElytraAvailable() {
     if (this._isWearingElytra()) return true;
     return Boolean(this._findItemByName('elytra'));
@@ -960,7 +973,8 @@ Object.assign(
   pearlCatchMethods,
   maceComboMethods,
   spearMaceMethods,
-  elytraSkillMethods,
+  elytraMaceMethods,
+  elytraSpearMethods,
   defenseClutchMethods
 );
 

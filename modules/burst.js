@@ -29,6 +29,7 @@ const { crystalSkillMethods } = require('./burst/crystal_skill');
 const { anchorSkillMethods } = require('./burst/anchor_skill');
 const { windChargeSkillMethods } = require('./burst/wind_charge_skill');
 const { cpvpMobilityMethods } = require('./burst/cpvp_mobility');
+const { ht1TacticsMethods } = require('./burst/ht1_tactics');
 
 class BurstModule {
   constructor(bot, config, aimer, prediction = null, combat = null) {
@@ -65,6 +66,9 @@ class BurstModule {
     this.lastCpvpPos = null;
     this.cpvpDigging = false;
     this.cpvpDigStartedAt = 0;
+    this.lastTargetId = null;
+    this.totemPopPunishUntil = 0;
+    this.targetTotemPopCount = 0;
 
     // Offensive shield/sneak state (used during anchor detonation)
     this.anchorShieldRaised = false;
@@ -89,12 +93,14 @@ class BurstModule {
     this.windPeakY = 0;
     this.clutchFired = false;
 
-    // Bind world/entity event listeners
+    // Bind world/entity event listeners (including entityStatus=35 Totem-Pop detection)
     this._onBlockUpdate = this._handleBlockUpdate.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
+    this._onEntityStatus = this._handleEntityStatus.bind(this);
     if (this.bot && typeof this.bot.on === 'function') {
       this.bot.on('blockUpdate', this._onBlockUpdate);
       this.bot.on('entitySpawn', this._onEntitySpawn);
+      this.bot.on('entityStatus', this._onEntityStatus);
     }
   }
 
@@ -105,6 +111,7 @@ class BurstModule {
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('blockUpdate', this._onBlockUpdate);
       this.bot.removeListener('entitySpawn', this._onEntitySpawn);
+      this.bot.removeListener('entityStatus', this._onEntityStatus);
     }
     this._clearDefenseState();
     this._resetOffensiveState(true);
@@ -650,7 +657,10 @@ class BurstModule {
       return false;
     }
 
-    const minBurstHealth = this.burstCfg.minBurstHealth !== undefined ? this.burstCfg.minBurstHealth : 9;
+    const minBurstHealth = this._getEffectiveMinBurstHealth();
+    if (target && target.id !== undefined) {
+      this.lastTargetId = target.id;
+    }
 
     // Continue an active offensive sequence
     if (this.state !== 'IDLE') {
@@ -659,6 +669,9 @@ class BurstModule {
         return this.state === 'WIND_CLUTCH';
       }
 
+      if (this.state === 'CPVP_CITY_MINE') {
+        return this._tickCpvpCityMine(target);
+      }
       if (this.state.startsWith('CPVP_')) {
         return this._tickCpvpMobility(target);
       }
@@ -677,7 +690,7 @@ class BurstModule {
     if (!target || !target.isValid) return false;
     if (this.bot.health <= minBurstHealth) return false;
 
-    const predictedFeet = this._getPredictedTargetFeet(target, 3);
+    const predictedFeet = this._getPredictedTargetFeet(target, 2);
     const targetDist = this.bot.entity.position.distanceTo(target.position);
 
     // 0. Instant CPvP pop on any existing End Crystal that favors us (with feet blast-shield if needed)
@@ -690,7 +703,8 @@ class BurstModule {
           spawnedCrystal: popPlan.entity,
           basePos: popPlan.entity.position.floored().offset(0, -1, 0),
           blastPos: popPlan.entity.position.clone(),
-          coverSpot: popPlan.coverSpot
+          coverSpot: popPlan.coverSpot,
+          chainCount: 0
         };
         this.state = popPlan.coverSpot ? 'CRYSTAL_COVER' : 'CRYSTAL_DETONATE';
         this.stateTicks = 0;
@@ -699,68 +713,105 @@ class BurstModule {
       }
     }
 
-    // Priority 3: Dimension-guarded Respawn Anchor combo at <= 3.6b (Blast Shield -> Anchor -> 1x Glowstone -> Swap -> Detonate)
+    // 1. Evaluate BOTH Anchor & Crystal candidates and pick the highest HT1 DPS-per-tick option!
+    let bestAnchor = null;
     if (
       this._canUseRespawnAnchor() &&
       this._findItem('respawn_anchor') &&
       this._findItem('glowstone') &&
-      targetDist <= (this.burstCfg.anchorMaxRange || 3.6)
+      targetDist <= (this.burstCfg.anchorMaxRange || 4.0)
     ) {
-      const bestAnchor = this._findBestAnchorPlacement(target, predictedFeet);
-      if (bestAnchor) {
-        this.activePlan = bestAnchor;
-        this.stateTicks = 0;
-        this.stepDelayTicks = 0;
-        if (bestAnchor.coverSpot) {
-          this.state = 'ANCHOR_COVER';
-        } else if (bestAnchor.needsPlace) {
-          this.state = 'ANCHOR_PLACE';
-        } else if (bestAnchor.alreadyCharged) {
-          this.state = 'ANCHOR_SWITCH_SLOT';
-        } else {
-          this.state = 'ANCHOR_CHARGE';
-        }
-        return this._tickAnchorState(target);
-      }
+      bestAnchor = this._findBestAnchorPlacement(target, predictedFeet);
     }
 
-    // Priority 4: End Crystal combo at <= 4.5b (Surround Pressure -> Hit-Crystal -> Place-and-Pop)
+    let bestCrystal = null;
+    let wantHitCrystal = false;
+    const targetSurrounded = this.burstCfg.surroundPressureEnabled !== false && isTargetInSurround(this.bot, target);
+
     if (
       this.burstCfg.crystalEnabled !== false &&
       this._findItem('end_crystal') &&
       targetDist <= (this.burstCfg.crystalMaxRange || 4.5)
     ) {
-      let crystalPlan = null;
-
-      if (this.burstCfg.surroundPressureEnabled !== false && isTargetInSurround(this.bot, target)) {
-        crystalPlan = planSurroundPressurePlacement(this, target, predictedFeet);
+      if (targetSurrounded) {
+        bestCrystal = planSurroundPressurePlacement(this, target, predictedFeet);
       }
+      if (!bestCrystal) {
+        bestCrystal = this._findBestCrystalPlacement(target, predictedFeet);
+      }
+      // Hit-Crystal launch shines when opponent is grounded & no instant 2-tick existing-obsidian lethal crystal exists
+      if ((!bestCrystal || bestCrystal.needsObsidian) && !targetSurrounded && this._canStartHitCrystal(target)) {
+        wantHitCrystal = true;
+      }
+    }
 
-      if (!crystalPlan && this._canStartHitCrystal(target)) {
-        this.activePlan = { kind: 'crystal', isHitCrystal: true };
-        this.state = 'CRYSTAL_HIT_LAUNCH';
+    // 1b. HT1 Surround "City" Mining: if opponent is camped in a 1x1 surround and neither Anchor nor Rim Crystal
+    //     deals heavy damage, mine 1 surround block open so the next crystal hits their exposed feet!
+    if (
+      targetSurrounded &&
+      (!bestAnchor || bestAnchor.targetDmg < 7.0) &&
+      (!bestCrystal || bestCrystal.targetDmg < 5.0)
+    ) {
+      const city = this._findSurroundCityBlock(target);
+      if (city) {
+        this.activePlan = { kind: 'city_mine', cityPos: city.pos.clone() };
+        this.state = 'CPVP_CITY_MINE';
         this.stateTicks = 0;
         this.stepDelayTicks = 0;
-        return this._tickCrystalState(target);
+        return this._tickCpvpCityMine(target);
       }
+    }
 
-      if (!crystalPlan) {
-        crystalPlan = this._findBestCrystalPlacement(target, predictedFeet);
-      }
+    const anchorScore = bestAnchor ? this._scoreBurstPlan(bestAnchor, target) : -Infinity;
+    const crystalScore = bestCrystal ? this._scoreBurstPlan(bestCrystal, target) : -Infinity;
 
-      if (crystalPlan) {
-        this.activePlan = crystalPlan;
-        this.stateTicks = 0;
-        this.stepDelayTicks = 0;
-        if (crystalPlan.coverSpot) {
-          this.state = 'CRYSTAL_COVER';
-        } else if (crystalPlan.needsObsidian) {
-          this.state = 'CRYSTAL_PLACE_OBSIDIAN';
-        } else {
-          this.state = 'CRYSTAL_PLACE_CRYSTAL';
-        }
-        return this._tickCrystalState(target);
+    // Pick Anchor if it beats Crystal (and isn't outclassed by an instant 2-tick existing-obsidian crystal)
+    if (bestAnchor && anchorScore >= crystalScore && !wantHitCrystal) {
+      this.activePlan = bestAnchor;
+      this.stateTicks = 0;
+      this.stepDelayTicks = 0;
+      if (bestAnchor.coverSpot) {
+        this.state = 'ANCHOR_COVER';
+      } else if (bestAnchor.needsPlace) {
+        this.state = 'ANCHOR_PLACE';
+      } else if (bestAnchor.alreadyCharged) {
+        this.state = 'ANCHOR_SWITCH_SLOT';
+      } else {
+        this.state = 'ANCHOR_CHARGE';
       }
+      return this._tickAnchorState(target);
+    }
+
+    if (wantHitCrystal && (!bestAnchor || anchorScore < 12.0)) {
+      this.activePlan = { kind: 'crystal', isHitCrystal: true };
+      this.state = 'CRYSTAL_HIT_LAUNCH';
+      this.stateTicks = 0;
+      this.stepDelayTicks = 0;
+      return this._tickCrystalState(target);
+    }
+
+    if (bestCrystal) {
+      this.activePlan = bestCrystal;
+      this.stateTicks = 0;
+      this.stepDelayTicks = 0;
+      if (bestCrystal.coverSpot) {
+        this.state = 'CRYSTAL_COVER';
+      } else if (bestCrystal.needsObsidian) {
+        this.state = 'CRYSTAL_PLACE_OBSIDIAN';
+      } else {
+        this.state = 'CRYSTAL_PLACE_CRYSTAL';
+      }
+      return this._tickCrystalState(target);
+    }
+
+    if (bestAnchor) {
+      this.activePlan = bestAnchor;
+      this.stateTicks = 0;
+      this.stepDelayTicks = 0;
+      this.state = bestAnchor.coverSpot
+        ? 'ANCHOR_COVER'
+        : (bestAnchor.needsPlace ? 'ANCHOR_PLACE' : (bestAnchor.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE'));
+      return this._tickAnchorState(target);
     }
 
     // CPvP mobility & unstick: when stuck/stopped trying to reach opponent with Crystal/Anchor kit,
@@ -788,7 +839,8 @@ Object.assign(
   crystalSkillMethods,
   anchorSkillMethods,
   windChargeSkillMethods,
-  cpvpMobilityMethods
+  cpvpMobilityMethods,
+  ht1TacticsMethods
 );
 
 module.exports = {

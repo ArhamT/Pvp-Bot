@@ -65,13 +65,13 @@ const anchorSkillMethods = {
     if (!this.bot || typeof this.bot.blockAt !== 'function') return null;
 
     const botPos = this.bot.entity.position;
-    const maxAnchorRange = this.burstCfg.anchorMaxRange || 3.6;
+    const maxAnchorRange = this.burstCfg.anchorMaxRange || 4.0;
     if (botPos.distanceTo(target.position) > maxAnchorRange) return null;
 
     const scanRadius = this.burstCfg.scanRadius || 4.5;
     const rInt = Math.ceil(scanRadius);
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
-    const minSafeHp = 6;
+    const minSafeHp = this._isHoldingOffhandTotem() ? 4 : 6;
 
     const cx = Math.floor(predictedFeet.x);
     const cy = Math.floor(predictedFeet.y);
@@ -173,11 +173,8 @@ const anchorSkillMethods = {
       return false;
     }
 
-    this.bot.setControlState('sprint', false);
-    if (typeof this.bot.setControlState === 'function') {
-      this.bot.setControlState('sneak', false);
-    }
-    const anchorAim = plan.anchorPos.offset(0.5, 0.5, 0.5);
+    // Maintain HT1 CPvP spacing & cover footwork; never hold sneak while placing/charging/detonating anchors
+    this._applyCpvpFootwork(target, plan.blastPos, plan.coverSpot ? plan.coverSpot.placePos : null);
 
     // Step 0: Feet Blast-Shield Cover Placement before Anchor combo
     if (this.state === 'ANCHOR_COVER') {
@@ -191,8 +188,9 @@ const anchorSkillMethods = {
       }
 
       const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, {
-        speedMultiplier: 1.35,
-        toleranceRad: 0.18
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2,
+        force: true
       });
       const equipRes = this._ensureItemHeld(cover.blockRecord);
       if (!equipRes.found) {
@@ -236,8 +234,9 @@ const anchorSkillMethods = {
       }
 
       const aimStatus = this.aimer.stepTowardsPoint(plan.anchorRef.aimPos, {
-        speedMultiplier: 1.35,
-        toleranceRad: 0.16
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2,
+        force: true
       });
       const equipRes = this._ensureItemHeld(anchorItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -315,8 +314,9 @@ const anchorSkillMethods = {
       }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
-        speedMultiplier: 1.35,
-        toleranceRad: 0.16
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2,
+        force: true
       });
       const equipRes = this._ensureItemHeld(glowstoneItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -432,8 +432,9 @@ const anchorSkillMethods = {
       }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
-        speedMultiplier: 1.4,
-        toleranceRad: 0.18
+        speedMultiplier: 2.0,
+        toleranceRad: 0.22,
+        force: true
       });
 
       if (this.stepDelayTicks > 0 || !aimStatus.aligned) {
@@ -454,10 +455,22 @@ const anchorSkillMethods = {
         plan.detonateAttempted = true;
       }
 
-      // If synchronous mock already popped the anchor, finish cleanly
+      // If anchor already popped, chain straight into HT1 Crystal follow-up or finish cleanly
       const afterBlock = this.bot.blockAt(plan.anchorPos);
       if (!afterBlock || afterBlock.name !== 'respawn_anchor') {
         this.lastAnchorTime = Date.now();
+        if (this.burstCfg.crystalEnabled !== false && this._findItem('end_crystal') && target && target.isValid) {
+          const followCrystal = this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 1));
+          if (followCrystal) {
+            this.activePlan = followCrystal;
+            this.stateTicks = 0;
+            this.stepDelayTicks = this.placeDelayTicks;
+            this.state = followCrystal.coverSpot
+              ? 'CRYSTAL_COVER'
+              : (followCrystal.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL');
+            return true;
+          }
+        }
         this._resetOffensiveState(true);
       }
       return true;

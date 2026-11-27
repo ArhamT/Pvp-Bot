@@ -93,35 +93,54 @@ const arenaDetectorMethods = {
     const hasKit = this._hasCombatKit();
     const pos = this.bot.entity.position;
     const botInRedWool = Boolean(this.redWoolZone && pos && this.redWoolZone.isPositionInSafeZone(pos));
-    const recentRedWool = Boolean(this.redWoolZone && this.redWoolZone.wasRecentlyInZone(180000));
+    const knownRedWool = Boolean(
+      this.redWoolZone && (
+        typeof this.redWoolZone.hasKnownZone === 'function'
+          ? this.redWoolZone.hasKnownZone()
+          : (typeof this.redWoolZone.wasRecentlyInZone === 'function' && this.redWoolZone.wasRecentlyInZone(180000))
+      )
+    );
 
-    if (this.inFfaArena || (hasKit && (botInRedWool || recentRedWool))) {
+    if (this.inFfaArena || (hasKit && (botInRedWool || knownRedWool))) {
       return 'FFA';
     }
 
     const recentlyEndedDuel = (Date.now() - this.duelEndedAt) < 10000;
     if (hasKit && !recentlyEndedDuel) {
-      const nearbyCount = this._listNearbyPlayers().length;
-      if (nearbyCount >= 3) return 'FFA';
-      if (nearbyCount >= 1) return 'DUELS';
+      const nearby = this._listNearbyPlayers();
+      if (nearby.length >= 3) return 'FFA';
+      // Even with 1–2 players in an FFA arena, if any player is inside a red_wool safe zone -> FFA!
+      if (this.redWoolZone && nearby.some((p) => this.redWoolZone.isPositionInSafeZone(p.entity.position))) {
+        this.inFfaArena = true;
+        return 'FFA';
+      }
+      if (nearby.length >= 1) return 'DUELS';
     }
 
     return 'LOBBY';
   },
 
+  /**
+   * Returns true if `playerEntity` is currently inside the FFA `red_wool` safe-zone radius
+   * and MUST be ignored (never ignored in 1v1 Duels arenas).
+   */
+  _isPlayerInFfaSafeZone(playerEntity, arenaMode = null) {
+    if (!playerEntity || !playerEntity.position || !this.redWoolZone) return false;
+    if (this.inDuelArena || this.pendingDuelReady || arenaMode === 'DUELS') return false;
+    if (this.redWoolZone.isPositionInSafeZone(playerEntity.position)) {
+      if (this._hasCombatKit()) {
+        this.inFfaArena = true;
+      }
+      return true;
+    }
+    return false;
+  },
+
   _pickEngageableTarget(arenaMode, maxRange) {
-    const respectRedWool = Boolean(
-      this.redWoolZone &&
-      (
-        arenaMode === 'FFA' ||
-        this.inFfaArena ||
-        (this.autoFight && arenaMode !== 'DUELS' && this.redWoolZone.wasRecentlyInZone(180000))
-      )
-    );
     const nearby = this._listNearbyPlayers();
     for (const candidate of nearby) {
       if (candidate.dist > maxRange) break;
-      if (respectRedWool && this.redWoolZone.isPositionInSafeZone(candidate.entity.position)) {
+      if (this._isPlayerInFfaSafeZone(candidate.entity, arenaMode)) {
         continue;
       }
       return candidate;

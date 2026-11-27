@@ -1149,8 +1149,11 @@ class PvPBotController {
       }
     }
 
-    if (nearby.length > 0 && nearby[0].dist <= 14.0) {
-      return this._engageTarget(nearby[0].entity, `auto-retaliate (${reason})`);
+    const arenaMode = this._detectArenaMode();
+    for (const cand of nearby) {
+      if (cand.dist > 14.0) break;
+      if (this._isPlayerInFfaSafeZone(cand.entity, arenaMode)) continue;
+      return this._engageTarget(cand.entity, `auto-retaliate (${reason})`);
     }
     return false;
   }
@@ -1557,10 +1560,7 @@ class PvPBotController {
       if (this.activeTargetName) {
         const reacquired = this._findPlayerEntity(this.activeTargetName);
         const reacquiredInSafeZone = Boolean(
-          reacquired &&
-          (arenaMode === 'FFA' || this.inFfaArena) &&
-          this.redWoolZone &&
-          this.redWoolZone.isPositionInSafeZone(reacquired.position)
+          reacquired && this._isPlayerInFfaSafeZone(reacquired, arenaMode)
         );
         if (reacquired && !reacquiredInSafeZone) {
           this.activeTargetEntityId = reacquired.id;
@@ -1606,8 +1606,14 @@ class PvPBotController {
             return;
           }
         }
+        const lastPosInSafeZone = Boolean(
+          !this.inDuelArena &&
+          !this.pendingDuelReady &&
+          this.redWoolZone &&
+          this.redWoolZone.isPositionInSafeZone(this.targetLastSeenPos)
+        );
         const distToLast = this.bot.entity.position.distanceTo(this.targetLastSeenPos);
-        if (distToLast > 2.0) {
+        if (!lastPosInSafeZone && distToLast > 2.0) {
           const aimStatus = this.aimer.stepTowardsPoint(this.targetLastSeenPos.offset(0, 1.0, 0), {
             speedMultiplier: 1.3
           });
@@ -1640,12 +1646,8 @@ class PvPBotController {
     }
 
     const arenaMode = this._detectArenaMode();
-    if (
-      (arenaMode === 'FFA' || this.inFfaArena) &&
-      this.redWoolZone &&
-      this.redWoolZone.isPositionInSafeZone(target.position)
-    ) {
-      // Opponent retreated inside the FFA red_wool safe zone -> switch to an outside target or disengage
+    if (this._isPlayerInFfaSafeZone(target, arenaMode)) {
+      // Opponent retreated inside the FFA red_wool safe zone -> immediately switch to an outside target or disengage
       const alt = this._pickEngageableTarget('FFA', this.config.combat.engageRange || 96.0);
       if (alt && alt.entity.id !== target.id) {
         this._engageTarget(alt.entity, 'target entered red_wool safe zone, switching');

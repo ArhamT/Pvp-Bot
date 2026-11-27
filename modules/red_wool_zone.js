@@ -51,14 +51,32 @@ class RedWoolZoneModule {
     this.lastExitCompletedAt = 0;
     this.lastSeenZoneAt = 0;
     this.lastCheckedAt = 0;
+    this.cachedZone = null; // { centerX, centerZ, baseY, radius }
   }
 
   /**
-   * Returns true if `pos` (bot or enemy player) lies on `red_wool` or inside a `red_wool` perimeter ring.
+   * Returns true if `pos` (bot or enemy player) lies on `red_wool` or inside a `red_wool` perimeter ring,
+   * including cached FFA safe-zone radius checks for players jumping or flying over the safe arena.
    */
   isPositionInSafeZone(pos) {
     if (!pos) return false;
+    if (this.cachedZone) {
+      const dx = pos.x - this.cachedZone.centerX;
+      const dz = pos.z - this.cachedZone.centerZ;
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      const dy = pos.y - this.cachedZone.baseY;
+      if (horizDist <= this.cachedZone.radius + 0.5 && dy >= -6 && dy <= 24) {
+        return true;
+      }
+    }
     return Boolean(this.inspectPosition(pos).inZone);
+  }
+
+  /**
+   * Returns true if a `red_wool` safe zone has been detected in this world/session.
+   */
+  hasKnownZone() {
+    return Boolean(this.cachedZone || this.lastSeenZoneAt > 0 || this.lastExitCompletedAt > 0);
   }
 
   /**
@@ -72,6 +90,7 @@ class RedWoolZoneModule {
   resetHistory() {
     this.lastExitCompletedAt = 0;
     this.lastSeenZoneAt = 0;
+    this.cachedZone = null;
   }
 
   isBusy() {
@@ -97,7 +116,7 @@ class RedWoolZoneModule {
     const bx = Math.floor(x);
     const by = Math.floor(baseY);
     const bz = Math.floor(z);
-    for (const dy of [-2, -1, 0, 1]) {
+    for (const dy of [-4, -3, -2, -1, 0, 1, 2]) {
       const b = this.bot.blockAt(new Vec3(bx, by + dy, bz));
       if (isRedWoolBlock(b, this.blockNames)) {
         return true;
@@ -119,7 +138,7 @@ class RedWoolZoneModule {
     const bz = Math.floor(pos.z);
 
     let onRedWool = false;
-    for (const dy of [-2, -1, 0]) {
+    for (const dy of [-4, -3, -2, -1, 0]) {
       const b = this.bot.blockAt(new Vec3(bx, by + dy, bz));
       if (isRedWoolBlock(b, this.blockNames)) {
         onRedWool = true;
@@ -127,7 +146,7 @@ class RedWoolZoneModule {
       }
     }
 
-    const scanRadius = this.cfg.ringScanRadius !== undefined ? this.cfg.ringScanRadius : 14;
+    const scanRadius = this.cfg.ringScanRadius !== undefined ? this.cfg.ringScanRadius : 22;
     const rays = [];
     let cardinalHits = 0;
     let totalHits = 0;
@@ -151,6 +170,25 @@ class RedWoolZoneModule {
     }
 
     const enclosedInRing = cardinalHits >= 3 || totalHits >= 5;
+
+    // Cache detected ring center + radius so jumping/flying players inside the safe arena are
+    // instantly recognized even from far away across the FFA arena!
+    if (enclosedInRing && cardinalHits === 4) {
+      const north = rays[0].lastHitDist; // dz = -1
+      const east = rays[2].lastHitDist;  // dx = +1
+      const south = rays[4].lastHitDist; // dz = +1
+      const west = rays[6].lastHitDist;  // dx = -1
+      if (north > 0 && south > 0 && east > 0 && west > 0) {
+        const centerX = pos.x + (east - west) * 0.5;
+        const centerZ = pos.z + (south - north) * 0.5;
+        const radius = Math.max((east + west) * 0.5, (north + south) * 0.5);
+        if (radius >= 2 && radius <= scanRadius + 2) {
+          this.cachedZone = { centerX, centerZ, baseY: pos.y, radius };
+          this.lastSeenZoneAt = Date.now();
+        }
+      }
+    }
+
     return {
       inZone: onRedWool || enclosedInRing,
       onRedWool,

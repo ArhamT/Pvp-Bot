@@ -68,7 +68,7 @@ const crystalSkillMethods = {
     const scanRadius = this.burstCfg.scanRadius || 4.5;
     const rInt = Math.ceil(scanRadius);
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
-    const minSafeHp = 6;
+    const minSafeHp = this._isHoldingOffhandTotem() ? 4 : 6;
 
     const cx = Math.floor(predictedFeet.x);
     const cy = Math.floor(predictedFeet.y);
@@ -234,7 +234,7 @@ const crystalSkillMethods = {
       }
 
       const torsoPos = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
-      const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 1.5, toleranceRad: 0.2 });
+      const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 2.0, toleranceRad: 0.22, force: true });
       const equipRes = this._ensureItemHeld(swordRecord);
 
       if (typeof this.bot.setControlState === 'function') {
@@ -274,7 +274,7 @@ const crystalSkillMethods = {
       return true;
     }
 
-    this.bot.setControlState('sprint', false);
+    this._applyCpvpFootwork(target, plan.blastPos, plan.coverSpot ? plan.coverSpot.placePos : null);
 
     // Optional Feet Blast-Shield Cover Placement before crystal
     if (this.state === 'CRYSTAL_COVER') {
@@ -286,7 +286,7 @@ const crystalSkillMethods = {
         this.state = nextState;
         return true;
       }
-      const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 1.35, toleranceRad: 0.16 });
+      const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 2.0, toleranceRad: 0.2, force: true });
       const equipRes = this._ensureItemHeld(cover.blockRecord);
       if (!equipRes.found) {
         this.state = nextState;
@@ -328,8 +328,9 @@ const crystalSkillMethods = {
       }
 
       const aimStatus = this.aimer.stepTowardsPoint(plan.obsidianRef.aimPos, {
-        speedMultiplier: 1.35,
-        toleranceRad: 0.16
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2,
+        force: true
       });
       const equipRes = this._ensureItemHeld(obsItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -380,8 +381,9 @@ const crystalSkillMethods = {
 
       const topFaceAim = topVis.aimPos;
       const aimStatus = this.aimer.stepTowardsPoint(topFaceAim, {
-        speedMultiplier: 1.35,
-        toleranceRad: 0.16
+        speedMultiplier: 2.0,
+        toleranceRad: 0.2,
+        force: true
       });
       const equipRes = this._ensureItemHeld(crystalItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -407,15 +409,16 @@ const crystalSkillMethods = {
       return true;
     }
 
-    // Step 3: Spawn-Tick Crystal Detonation
+    // Step 3: Spawn-Tick Crystal Detonation + Instant HT1 Double-Pop / Triple-Pop Chain!
     if (this.state === 'CRYSTAL_DETONATE') {
       const crystalEntity = (plan.spawnedCrystal && plan.spawnedCrystal.isValid)
         ? plan.spawnedCrystal
         : this._findCrystalEntityNear(plan.blastPos, 2.5);
       const aimPos = crystalEntity ? crystalEntity.position.offset(0, 0.5, 0) : plan.blastPos.offset(0, 0.5, 0);
       const aimStatus = this.aimer.stepTowardsPoint(aimPos, {
-        speedMultiplier: 1.65,
-        toleranceRad: 0.28
+        speedMultiplier: 2.0,
+        toleranceRad: 0.3,
+        force: true
       });
 
       if (!crystalEntity || (this.stepDelayTicks > 0 && !plan.spawnedCrystal) || !aimStatus.aligned) {
@@ -426,6 +429,27 @@ const crystalSkillMethods = {
         this.bot.attack(crystalEntity);
       }
       this.lastCrystalTime = Date.now();
+
+      // HT1 Double-Pop / Triple-Pop: immediately chain another crystal onto the same obsidian block
+      // on the very next tick while the opponent is airborne / popped (zero re-scan delay!)
+      const nextChain = (plan.chainCount || 0) + 1;
+      if (plan.basePos && this._canContinueDoublePop(target, plan.basePos, nextChain)) {
+        this.activePlan = {
+          kind: 'crystal',
+          basePos: plan.basePos,
+          blastPos: plan.basePos.offset(0.5, 1.0, 0.5),
+          needsObsidian: false,
+          obsidianRef: null,
+          coverSpot: null,
+          spawnedCrystal: null,
+          chainCount: nextChain
+        };
+        this.state = 'CRYSTAL_PLACE_CRYSTAL';
+        this.stateTicks = 0;
+        this.stepDelayTicks = this.placeDelayTicks;
+        return true;
+      }
+
       this._resetOffensiveState(true);
       return true;
     }
