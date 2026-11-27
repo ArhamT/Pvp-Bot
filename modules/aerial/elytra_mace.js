@@ -330,10 +330,10 @@ const elytraMaceMethods = {
           this.lastRocketTime = Date.now();
         }
       } else {
-        // Pre-equip Density Mace DURING glide so zero hotbar-swap ticks are wasted at impact!
+        // Pre-equip Sword (for 625ms Attribute Swap) or Density Mace DURING glide so it is 100% charged at impact!
         const densityMace = this._findDensityMace();
         if (densityMace && !this.swappedThisTick) {
-          this._equipHand(densityMace);
+          this._prepareMaceWeapon(densityMace);
         }
       }
 
@@ -388,14 +388,14 @@ const elytraMaceMethods = {
       this._aimAtTarget(target, 1, { speedMultiplier: 1.8, toleranceRad: 0.34, force: true });
       const maceSel = this._findDensityMace();
       if (maceSel) {
-        this._equipHand(maceSel);
+        this._prepareMaceWeapon(maceSel);
       }
       this.stage = 'STRIKE_SMASH';
       return true;
     }
 
     // -----------------------------------------------------------------------
-    // Stage 5c: STRIKE_SMASH — HT1 Density Mace Smash (<= 3.35b) + Shield Stun-Slam + Instant Re-Loop
+    // Stage 5c: STRIKE_SMASH — HT1 Density Mace Smash (<= 3.35b) + Full Charge / Attribute Swap + Instant Re-Loop
     // -----------------------------------------------------------------------
     if (this.stage === 'STRIKE_SMASH') {
       if (onGround || inWater) {
@@ -410,18 +410,16 @@ const elytraMaceMethods = {
       }
 
       const maceSel = this._findDensityMace();
-      let holdingMace = maceSel ? this._isHoldingSelection(maceSel) : false;
-      if (!holdingMace && maceSel) {
-        const eq = this._equipHand(maceSel);
-        holdingMace = eq.ready && !eq.swapped;
-      }
+      const prep = maceSel ? this._prepareMaceWeapon(maceSel) : { ready: false, swapped: false };
 
-      if (holdingMace && reachDist <= reach + 0.35 && aimStatus.aligned) {
-        if (typeof this.bot.setControlState === 'function') {
-          this.bot.setControlState('sprint', false);
-        }
-        this.bot.attack(target);
-        this._resetFallAfterSmash();
+      if (
+        prep.ready &&
+        !prep.swapped &&
+        reachDist <= reach + 0.35 &&
+        aimStatus.aligned &&
+        this._isMaceChargeReady(target)
+      ) {
+        this._executeMaceSmash(target, maceSel);
 
         if (this.aerialCfg.windBurstChainEnabled !== false && maceSel && hasItemEnchant(maceSel.item, 'wind_burst')) {
           this.mode = AERIAL_MODES.MACE_LAUNCH;

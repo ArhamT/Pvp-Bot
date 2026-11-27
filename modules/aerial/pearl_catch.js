@@ -388,14 +388,15 @@ const pearlCatchMethods = {
 
       const maceSel = this._findDensityMace();
       if (maceSel) {
-        const eq = this._equipHand(maceSel);
+        const prep = this._prepareMaceWeapon(maceSel);
         const arrivedInReach = reachDist <= reach + 0.30 && (this.teleportedThisTick || aimStatus.aligned || aimStatus.yawErrorDeg < 35);
-        if (eq.ready && !eq.swapped && arrivedInReach) {
-          if (typeof this.bot.setControlState === 'function') {
-            this.bot.setControlState('sprint', false);
-          }
-          this.bot.attack(target);
-          this._resetFallAfterSmash();
+        if (
+          prep.ready &&
+          !prep.swapped &&
+          arrivedInReach &&
+          this._isMaceChargeReady(target, { urgent: this.teleportedThisTick })
+        ) {
+          this._executeMaceSmash(target, maceSel);
           this.windBurstChainCount++;
           this.mode = AERIAL_MODES.MACE_LAUNCH;
           this.stage = 'WIND_BURST_BOUNCE';
@@ -463,10 +464,10 @@ const pearlCatchMethods = {
         this.bot.setControlState('jump', false);
       }
 
-      // Pre-equip Density Mace while still gliding so smash fires with zero delay right after chestplate swap
+      // Pre-equip Sword (for 625ms Attribute Swap) or Density Mace while gliding for 100% charge at impact
       const densitySel = this._findDensityMace();
       if (densitySel && !this.swappedThisTick) {
-        this._equipHand(densitySel);
+        this._prepareMaceWeapon(densitySel);
       }
 
       // Speed-scaled Chestplate swap window right before impact
@@ -505,18 +506,16 @@ const pearlCatchMethods = {
       }
 
       const densitySel = this._findDensityMace();
-      let holdingMace = densitySel ? this._isHoldingSelection(densitySel) : false;
-      if (!holdingMace && densitySel) {
-        const eq = this._equipHand(densitySel);
-        holdingMace = eq.ready && !eq.swapped;
-      }
+      const prep = densitySel ? this._prepareMaceWeapon(densitySel) : { ready: false, swapped: false };
 
-      if (holdingMace && reachDist <= reach + 0.35 && (aimStatus.aligned || aimStatus.yawErrorDeg < 35)) {
-        if (typeof this.bot.setControlState === 'function') {
-          this.bot.setControlState('sprint', false);
-        }
-        this.bot.attack(target);
-        this._resetFallAfterSmash();
+      if (
+        prep.ready &&
+        !prep.swapped &&
+        reachDist <= reach + 0.35 &&
+        (aimStatus.aligned || aimStatus.yawErrorDeg < 35) &&
+        this._isMaceChargeReady(target)
+      ) {
+        this._executeMaceSmash(target, densitySel);
         this.windBurstChainCount++;
         this.mode = AERIAL_MODES.MACE_LAUNCH;
         this.stage = 'WIND_BURST_BOUNCE';

@@ -51,9 +51,14 @@ const defenseClutchMethods = {
 
     if (!this._findClutchTool()) return false;
 
-    if (!allowNearTargetMiss && target && target.isValid) {
+    if (target && target.isValid && this._findMace()) {
       const reach = this.combatCfg.reach || DEFAULT_REACH;
-      if (this._getReachDistance(target) <= reach && this._findMace()) {
+      const reachDist = this._getReachDistance(target);
+      if (!allowNearTargetMiss && reachDist <= reach) {
+        return false;
+      }
+      // Never abort an active Mace smash into CLUTCH while still on-target above urgent ground floor!
+      if (allowNearTargetMiss && reachDist <= reach + 0.35 && heightAboveGround > 2.1) {
         return false;
       }
     }

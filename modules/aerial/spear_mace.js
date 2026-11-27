@@ -261,21 +261,18 @@ const spearMaceMethods = {
           return this._tickStunSlam(target);
         }
 
-        // Branch B: Pre-equip optimal Mace & execute lethal aerial Mace Smash!
+        // Branch B: Pre-equip optimal Mace / Attribute Swap Sword & execute full-charge aerial Mace Smash!
         if (maceSel) {
-          const eq = this._equipHand(maceSel);
+          const prep = this._prepareMaceWeapon(maceSel);
           if (
-            eq.ready &&
-            !eq.swapped &&
+            prep.ready &&
+            !prep.swapped &&
             this.fallDistance > minFall &&
             reachDist <= reach + 0.3 &&
-            (aimStatus.aligned || aimStatus.yawErrorDeg < 35)
+            (aimStatus.aligned || aimStatus.yawErrorDeg < 35) &&
+            this._isMaceChargeReady(target)
           ) {
-            if (typeof this.bot.setControlState === 'function') {
-              this.bot.setControlState('sprint', false);
-            }
-            this.bot.attack(target);
-            this._resetFallAfterSmash();
+            this._executeMaceSmash(target, maceSel);
             this.lastSpearMaceTime = Date.now();
             this.windBurstChainCount++;
             this.stage = 'POST_SMASH_CHAIN';
@@ -290,9 +287,14 @@ const spearMaceMethods = {
           this._enterClutch();
           return this._tickClutch();
         }
-      } else if (maceSel && this.spearLaunchTicks >= 2 && !this.swappedThisTick) {
-        // Pre-equip Mace on the way up so zero swap ticks are spent during descent!
-        this._equipHand(maceSel);
+      } else if (
+        maceSel &&
+        this.spearLaunchTicks >= 1 &&
+        !this.swappedThisTick &&
+        this.aerialCfg.macePreEquipOnAscent !== false
+      ) {
+        // Pre-equip Sword (for 625ms Attribute Swap) or Mace on tick 1 of ascent for 100% charge at impact!
+        this._prepareMaceWeapon(maceSel);
       }
 
       return true;

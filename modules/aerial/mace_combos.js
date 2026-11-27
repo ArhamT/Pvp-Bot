@@ -223,29 +223,26 @@ const maceComboMethods = {
       const minFall = this.aerialCfg.stunSlamMinFallDistance !== undefined
         ? this.aerialCfg.stunSlamMinFallDistance
         : 1.8;
+      const preferWb = this.aerialCfg.windBurstChainEnabled !== false;
+      const maceSel = this._findMace(preferWb);
 
       if (velY < -0.05) {
         if (this._tryEnterStunSlam(target, minFall)) {
           return this._tickStunSlam(target);
         }
 
-        // Branch B: 7-Block Mace Rule (Density > 7b, Breach <= 7b) & SMASH on impact (incl. BACKSTAB bypass)
-        const preferWb = this.aerialCfg.windBurstChainEnabled !== false;
-        const maceSel = this._findMace(preferWb);
+        // Branch B: Density (>=5b) / Breach (<5b) Mace Smash with full recharge + HT1 Attribute Swap
         if (maceSel) {
-          const eq = this._equipHand(maceSel);
+          const prep = this._prepareMaceWeapon(maceSel);
           if (
-            eq.ready &&
-            !eq.swapped &&
+            prep.ready &&
+            !prep.swapped &&
             this.fallDistance >= minFall &&
             reachDist <= reach + 0.15 &&
-            (aimStatus.aligned || aimStatus.yawErrorDeg < 30)
+            (aimStatus.aligned || aimStatus.yawErrorDeg < 30) &&
+            this._isMaceChargeReady(target)
           ) {
-            if (typeof this.bot.setControlState === 'function') {
-              this.bot.setControlState('sprint', false);
-            }
-            this.bot.attack(target);
-            this._resetFallAfterSmash();
+            this._executeMaceSmash(target, maceSel);
             this.windBurstChainCount++;
             this.stage = 'WIND_BURST_BOUNCE';
             this.stageTicks = 0;
@@ -258,6 +255,14 @@ const maceComboMethods = {
           this._enterClutch();
           return this._tickClutch();
         }
+      } else if (
+        maceSel &&
+        this.spearLaunchTicks >= 1 &&
+        !this.swappedThisTick &&
+        this.aerialCfg.macePreEquipOnAscent !== false
+      ) {
+        // Pre-equip Sword (for 625ms Attribute Swap) or Mace IMMEDIATELY on ascent so it is 100% charged at impact!
+        this._prepareMaceWeapon(maceSel);
       }
 
       return true;
@@ -369,11 +374,7 @@ const maceComboMethods = {
 
       const eq = this._equipHand(maceSel);
       if (eq.ready && !eq.swapped && reachDist <= reach + 0.15 && (aimStatus.aligned || aimStatus.yawErrorDeg < 30)) {
-        if (typeof this.bot.setControlState === 'function') {
-          this.bot.setControlState('sprint', false);
-        }
-        this.bot.attack(target);
-        this._resetFallAfterSmash();
+        this._executeMaceSmash(target, maceSel, { allowAttributeSwap: false });
         if (this.aerialCfg.windBurstChainEnabled !== false && maceSel.isWindBurst) {
           this.windBurstChainCount++;
           this.mode = AERIAL_MODES.MACE_LAUNCH;

@@ -21,7 +21,8 @@ const {
   selectMaceForFall,
   buildTargetState,
   hasSlowFalling,
-  detectEnemyDiveBomb
+  detectEnemyDiveBomb,
+  executeAttributeSwapAttack
 } = require('./mace_elytra');
 const { AERIAL_MODES } = require('./aerial/constants');
 const { elytraFlightMethods } = require('./aerial/elytra_flight');
@@ -67,6 +68,7 @@ class AerialModule {
     // Inventory / async equip guards (cached weapon enchantments with dirty flag!)
     this.equipBusy = false;
     this.swappedThisTick = false;
+    this.lastAerialCooldownResetTime = 0;
     this._weaponEnchantDirty = true;
     this.weaponEnchantments = scanWeaponEnchantments(bot);
 
@@ -467,8 +469,153 @@ class AerialModule {
     const eq = ensureItemHeld(this.bot, { item: selection.item, quickBarSlot: selection.hotbarIndex });
     if (eq.swapped) {
       this.swappedThisTick = true;
+      const now = Date.now();
+      this.lastAerialCooldownResetTime = now;
+      if (this.combat) {
+        this.combat.cooldownResetTime = now;
+      }
     }
     return { ready: eq.held, swapped: eq.swapped };
+  }
+
+  /**
+   * Returns current 1.9+ attack cooldown progress in [0.0, 1.0].
+   * Uses `combat.getCooldownProgress()` when attached, with exact per-weapon fallback.
+   */
+  _getAttackChargeProgress() {
+    if (this.combat && typeof this.combat.getCooldownProgress === 'function') {
+      return this.combat.getCooldownProgress();
+    }
+    const heldName = (this.bot && this.bot.heldItem && this.bot.heldItem.name) || '';
+    let cooldownMs = 625;
+    if (heldName === 'mace') cooldownMs = 1000 / 0.6;
+    else if (heldName.endsWith('_axe')) cooldownMs = 1000;
+    else if (heldName.endsWith('_sword')) cooldownMs = 625;
+    const elapsed = Date.now() - (this.lastAerialCooldownResetTime || 0);
+    return clamp(elapsed / cooldownMs, 0, 1);
+  }
+
+  /**
+   * Determines whether HT1 Same-Tick Attribute Swap (charged Sword -> Mace -> attack)
+   * should be used for an aerial Mace smash.
+   */
+  _shouldUseMaceAttributeSwap(maceSel) {
+    if (
+      !maceSel ||
+      typeof maceSel.hotbarIndex !== 'number' ||
+      maceSel.hotbarIndex < 0 ||
+      this.aerialCfg.maceAttributeSwap === false ||
+      this.combatCfg.sameTickAttributeSwap === false ||
+      this.combatCfg.durabilityDrainMode === true
+    ) {
+      return { enabled: false, swordSel: null };
+    }
+    const swordSel = this._findSword();
+    if (!swordSel || typeof swordSel.hotbarIndex !== 'number' || swordSel.hotbarIndex < 0) {
+      return { enabled: false, swordSel: null };
+    }
+    if (swordSel.hotbarIndex === maceSel.hotbarIndex) {
+      return { enabled: false, swordSel: null };
+    }
+    return { enabled: true, swordSel };
+  }
+
+  /**
+   * Pre-equips the optimal weapon during aerial ascent/glide/descent so attack cooldown
+   * reaches >=88–100% BEFORE impact:
+   * - With Attribute Swap enabled: holds Sword (625ms full charge — 2.7x faster than Mace!)
+   *   unless Mace is already held and fully charged.
+   * - Without Attribute Swap: pre-equips the target Mace early during ascent.
+   */
+  _prepareMaceWeapon(maceSel) {
+    if (!maceSel || !maceSel.item) {
+      return { ready: false, swapped: false, useAttributeSwap: false, swordSel: null };
+    }
+    const minCharge = this.aerialCfg.maceMinChargeRatio !== undefined
+      ? this.aerialCfg.maceMinChargeRatio
+      : 0.88;
+    const swapInfo = this._shouldUseMaceAttributeSwap(maceSel);
+
+    if (swapInfo.enabled) {
+      // If we are already holding the exact Mace and it is already fully charged, keep it!
+      if (this._isHoldingSelection(maceSel) && this._getAttackChargeProgress() >= minCharge) {
+        return { ready: true, swapped: false, useAttributeSwap: false, swordSel: swapInfo.swordSel };
+      }
+      const eq = this._equipHand(swapInfo.swordSel);
+      return {
+        ready: eq.ready,
+        swapped: eq.swapped,
+        useAttributeSwap: true,
+        swordSel: swapInfo.swordSel
+      };
+    }
+
+    const eq = this._equipHand(maceSel);
+    return {
+      ready: eq.ready,
+      swapped: eq.swapped,
+      useAttributeSwap: false,
+      swordSel: null
+    };
+  }
+
+  /**
+   * Gates aerial Mace smashes until attack cooldown is charged (>= maceMinChargeRatio),
+   * while allowing immediate urgent smashes right before ground impact so we NEVER miss a hit!
+   */
+  _isMaceChargeReady(target, options = {}) {
+    if (options.urgent) return true;
+    const minCharge = this.aerialCfg.maceMinChargeRatio !== undefined
+      ? this.aerialCfg.maceMinChargeRatio
+      : 0.88;
+    const charge = this._getAttackChargeProgress();
+    if (charge >= minCharge) return true;
+
+    // Ground-proximity urgency override: never land on the ground without delivering the smash!
+    const heightAboveGround = this._getHeightAboveGround(8);
+    const velY = (this.bot && this.bot.entity && this.bot.entity.velocity)
+      ? this.bot.entity.velocity.y
+      : 0;
+    const reachDist = target ? this._getReachDistance(target) : Infinity;
+
+    if (heightAboveGround <= 2.3) return true;
+    if (velY < -0.45 && heightAboveGround <= 3.1) return true;
+    if (velY < -0.35 && reachDist <= 2.45) return true;
+
+    return false;
+  }
+
+  /**
+   * Executes an aerial Mace smash: drops sprint, performs either same-tick Attribute Swap
+   * (charged Sword -> Density/Breach Mace -> attack) or direct charged Mace attack,
+   * synchronizes combat cooldown timers, and resets tracked fallDistance.
+   */
+  _executeMaceSmash(target, maceSel, options = {}) {
+    if (!this.bot || !target) return false;
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('sprint', false);
+    }
+
+    const swapInfo = options.allowAttributeSwap === false
+      ? { enabled: false, swordSel: null }
+      : this._shouldUseMaceAttributeSwap(maceSel);
+
+    if (swapInfo.enabled && maceSel && !this._isHoldingSelection(maceSel)) {
+      executeAttributeSwapAttack(this.bot, target, swapInfo.swordSel, maceSel, {
+        durabilityDrainMode: Boolean(this.combatCfg.durabilityDrainMode)
+      });
+    } else if (typeof this.bot.attack === 'function') {
+      this.bot.attack(target);
+    }
+
+    const now = Date.now();
+    this.lastAerialCooldownResetTime = now;
+    if (this.combat) {
+      this.combat.lastSwingTime = now;
+      this.combat.cooldownResetTime = now;
+    }
+    this._resetFallAfterSmash();
+    return true;
   }
 
   _getReachDistance(target) {
