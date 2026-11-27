@@ -931,10 +931,107 @@ class RangedModule {
   }
 
   /**
-   * Evaluates non-escape Ender Pearl triggers (combo-break agro-cancel or necessary chase).
+   * High-Ground / Mountain Climb Ender Pearl:
+   * Solves the "opponent climbs a mountain/cliff while bot sits at the bottom" weakpoint.
+   * - Triggers when opponent is >= enderPearlHighGroundMinDy (default 3.5b) above bot,
+   *   even at close horizontal distance (dist >= 3.8b, <= 48b).
+   * - Does NOT require straight-line LOS to the opponent's feet (cliff lips block straight lines!),
+   *   instead tests parabolic lob arcs (+0°, +10°, +20°) aimed at feet/head/ridge and verifies via
+   *   swept `_simulatePearlFlight()` that the pearl clears the cliff lip and lands safely on top
+   *   of the mountain right next to the opponent!
+   */
+  tryHighGroundPearl(target) {
+    if (!this.rangedCfg.enabled || this.pendingAction || this.isDrawing) return false;
+    if (!target || !target.isValid || !this.bot.entity) return false;
+
+    // 1. Respect pearl reserve count so emergency escapes always keep pearls
+    const reserveCount = this._getPearlReserveCount();
+    if (this.getPearlCount() <= reserveCount) return false;
+
+    const now = Date.now();
+    const cooldownMs = this.rangedCfg.enderPearlHighGroundCooldownMs !== undefined
+      ? this.rangedCfg.enderPearlHighGroundCooldownMs
+      : 2800;
+    if ((now - this.lastPearlTime) < cooldownMs) return false;
+
+    const minHp = this.rangedCfg.enderPearlHighGroundMinHp !== undefined
+      ? this.rangedCfg.enderPearlHighGroundMinHp
+      : 11;
+    if (this.bot.health < minHp) return false;
+
+    const pos = this.bot.entity.position;
+    const tPos = target.position;
+    const dx = tPos.x - pos.x;
+    const dy = tPos.y - pos.y;
+    const dz = tPos.z - pos.z;
+    const minDy = this.rangedCfg.enderPearlHighGroundMinDy !== undefined
+      ? this.rangedCfg.enderPearlHighGroundMinDy
+      : 3.5;
+
+    if (dy < minDy) return false;
+
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist < 3.8 || dist > 48.0) return false;
+
+    const pearl = this._findItem('ender_pearl');
+    if (!pearl) return false;
+
+    const eye = this.aimer.getEyePosition();
+    const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+    // Get target velocity for mild lead on moving climbers
+    let vel = target.velocity || new Vec3(0, 0, 0);
+    if (this.prediction && typeof this.prediction.getTargetKinematics === 'function') {
+      const kin = this.prediction.getTargetKinematics(target);
+      if (kin && kin.velocity) vel = kin.velocity;
+    }
+
+    const aimPoints = [tPos.offset(0, 0.5, 0)];
+    const hSpeed = Math.hypot(vel.x || 0, vel.z || 0);
+    if (hSpeed > 0.04) {
+      aimPoints.push(tPos.offset((vel.x / hSpeed) * 1.5, 0.5, (vel.z / hSpeed) * 1.5));
+    }
+
+    const maxLandingErr = Math.max(4.5, Math.min(7.5, horizDist * 0.45));
+    let best = null;
+
+    // Sweep full lob pitch range (10°..82° @0.5°): steep arcs clear the cliff lip and drop onto the summit
+    for (const aimPoint of aimPoints) {
+      const yaw = Math.atan2(-(aimPoint.x - eye.x), -(aimPoint.z - eye.z));
+      for (let deg = 10; deg <= 82; deg += 0.5) {
+        const testPitch = deg * DEG_TO_RAD;
+        const sim = this._simulatePearlFlight(eye, yaw, testPitch, 100);
+        if (!sim || !sim.hit || !sim.landingPos) continue;
+        if (sim.landingPos.y < tPos.y - 0.6) continue;
+
+        const errToTarget = sim.landingPos.distanceTo(tPos);
+        if (errToTarget > maxLandingErr) continue;
+
+        if (!this._isEscapeLandingSafe(sim.landingPos)) continue;
+
+        // Prefer closest landing to opponent; slight preference for flatter (faster) arcs
+        const score = -errToTarget - deg * 0.02;
+        if (!best || score > best.score) {
+          best = { yaw, pitch: testPitch, landingTarget: sim.landingPos, score };
+        }
+      }
+    }
+
+    if (!best) return false;
+
+    return this._queuePearl(
+      pearl,
+      'high_ground',
+      { yaw: best.yaw, pitch: best.pitch },
+      { landingTarget: best.landingTarget }
+    );
+  }
+
+  /**
+   * Evaluates non-escape Ender Pearl triggers (combo-break agro-cancel, mountain high-ground climb, or chase).
    */
   tryAggressivePearl(target) {
-    return this.tryAgroCancelPearl(target) || this.tryChasePearl(target);
+    return this.tryAgroCancelPearl(target) || this.tryHighGroundPearl(target) || this.tryChasePearl(target);
   }
 
   /**
