@@ -144,13 +144,43 @@ class EscapeModule {
     return Boolean(this.lavaWaterState !== 'IDLE' || this.cobwebWaterState !== 'IDLE' || this.fireWaterState !== 'IDLE');
   }
 
-  hasFireResistance() {
+  hasFireResistance(context = {}) {
+    if (context && context.hasFireRes) return true;
     if (!this.bot || !this.bot.entity || !this.bot.entity.effects) return false;
     const effects = this.bot.entity.effects;
+
+    // Resolve exact FireResistance effect ID from bot.registry (id 11 in minecraft-data 1.20.4–1.21.11+)
+    let regFireResId = null;
+    if (this.bot.registry && this.bot.registry.effectsByName) {
+      const regEntry = this.bot.registry.effectsByName.FireResistance || this.bot.registry.effectsByName.fire_resistance;
+      if (regEntry && typeof regEntry.id === 'number') {
+        regFireResId = regEntry.id;
+      }
+    }
+    if (regFireResId !== null && (effects[regFireResId] || effects[String(regFireResId)])) {
+      return true;
+    }
+
+    // Fallback when registry is absent: MC 1.20.5–1.21.11 uses 0-based id 11; older 1-based uses id 12
+    const ver = String(this.bot.version || '');
+    const isModern0Based = !ver || /^1\.(20\.[5-9]|21|2[2-9])/.test(ver);
+    if (isModern0Based && (effects[11] || effects['11'])) return true;
     if (effects[12] || effects['12']) return true;
-    for (const eff of Object.values(effects)) {
-      if (eff && (eff.id === 12 || String(eff.name || '').toLowerCase().includes('fire_resistance'))) {
+
+    for (const [key, eff] of Object.entries(effects)) {
+      if (!eff) continue;
+      if (regFireResId !== null && Number(eff.id) === regFireResId) return true;
+      if (isModern0Based && Number(eff.id) === 11) return true;
+      if (Number(eff.id) === 12) return true;
+      const effName = String(eff.name || eff.displayName || '').toLowerCase();
+      if (effName.includes('fireresistance') || effName.includes('fire_resistance') || effName.includes('fire resistance')) {
         return true;
+      }
+      if (this.bot.registry && this.bot.registry.effects) {
+        const reg = this.bot.registry.effects[Number(eff.id !== undefined ? eff.id : key)];
+        if (reg && /fire.?res/i.test(String(reg.name || reg.displayName || ''))) {
+          return true;
+        }
       }
     }
     return false;
@@ -206,8 +236,8 @@ class EscapeModule {
       return this._tickLavaEscape(target);
     }
 
-    if (this.fireWaterState !== 'IDLE' || (this.isOnFire() && !this.hasFireResistance())) {
-      if (this._tickFireExtinguish()) {
+    if (this.fireWaterState !== 'IDLE' || (this.isOnFire() && !this.hasFireResistance(context))) {
+      if (this._tickFireExtinguish(context)) {
         return true;
       }
     }

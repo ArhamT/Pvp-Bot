@@ -135,7 +135,7 @@ const liquidEscapeMethods = {
    * 1-tick Water Bucket self-extinguish when taking fire damage (Fire Aspect, Flame bow, flint & steel, fire blocks).
    * Skips when Fire Resistance is active, in the Nether, or high in mid-air without ground beneath.
    */
-  _tickFireExtinguish() {
+  _tickFireExtinguish(context = {}) {
     const now = Date.now();
     if (!this.bot || !this.bot.entity || !this.bot.entity.position) {
       this.fireWaterState = 'IDLE';
@@ -201,7 +201,7 @@ const liquidEscapeMethods = {
     }
 
     // Entry gate: must be on fire, without Fire Resistance, off cooldown, with water_bucket and ground beneath
-    if (!this.isOnFire() || this.hasFireResistance() || this.isInWater()) {
+    if (!this.isOnFire() || this.hasFireResistance(context) || this.isInWater()) {
       return false;
     }
     const cooldown = this.escapeCfg.fireWaterCooldownMs || 2500;

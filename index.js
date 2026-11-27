@@ -1391,7 +1391,8 @@ class PvPBotController {
       !totemSwapActive &&
       this.escape &&
       this.escape.tick(target, {
-        canTrackStall: (this.state === STATES.ENGAGING || this.state === STATES.RETREATING) && !isStationaryAction
+        canTrackStall: (this.state === STATES.ENGAGING || this.state === STATES.RETREATING) && !isStationaryAction,
+        hasFireRes: Boolean(this.survival && typeof this.survival.isBuffActive === 'function' && this.survival.isBuffActive('fire_res'))
       })
     ) {
       if (this.burst && this.burst.state !== 'IDLE' && this.burst.state !== 'WIND_CLUTCH') {
