@@ -12,6 +12,7 @@ const {
   findVisiblePlacementRef,
   findVisibleBlockFace
 } = require('./placement_los');
+const { BlockMiner } = require('./mining');
 const {
   isTargetInSurround,
   planSurroundPressurePlacement
@@ -37,6 +38,7 @@ class BurstModule {
     this.aimer = aimer;
     this.prediction = prediction;
     this.combat = combat;
+    this.miner = new BlockMiner(bot, aimer);
 
     const tickRateMs = (config && config.physics && config.physics.tickRateMs) || 50;
     const placeDelayMs = this.burstCfg.crystalPlaceDelayMs !== undefined ? this.burstCfg.crystalPlaceDelayMs : 50;
@@ -124,6 +126,7 @@ class BurstModule {
    * Preserves active anti-explosive defense and lethal fall clutches.
    */
   cancel() {
+    if (this.miner) this.miner.cancel();
     if (this.state === 'IDLE' || this.state === 'WIND_CLUTCH') {
       return;
     }

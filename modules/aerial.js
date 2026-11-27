@@ -96,6 +96,9 @@ class AerialModule {
     this.elytraFlightTicks = 0;
     this.elytraGlideRetrySent = false;
     this.elytraSpearCharging = false;
+    this.elytraSpearChargeTicks = 0;
+    this.elytraSpearHitTarget = false;
+    this.elytraSpearTargetId = null;
     this.elytraSpearAttackNextTick = false;
     this.elytraPullUpYaw = 0;
 
@@ -111,9 +114,19 @@ class AerialModule {
     this.bHopTicks = 0;
     this.lastDiveDodgeTime = 0;
 
-    // Bind death/respawn cleanup, inventory enchant rescan, & enemy Ender Pearl projectile tracking safely
+    // Bind death/respawn cleanup, inventory enchant rescan, target hurt confirmation, & enemy Ender Pearl tracking
     this._onDeath = this._handleDeathOrRespawn.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
+    this._onEntityHurt = (entity) => {
+      if (
+        this.mode === AERIAL_MODES.ELYTRA_SPEAR &&
+        entity &&
+        this.elytraSpearTargetId !== null &&
+        entity.id === this.elytraSpearTargetId
+      ) {
+        this.elytraSpearHitTarget = true;
+      }
+    };
     this._onUpdateSlot = () => {
       this.weaponEnchantments = scanWeaponEnchantments(this.bot);
     };
@@ -124,6 +137,7 @@ class AerialModule {
       this.bot.on('death', this._onDeath);
       this.bot.on('respawn', this._onDeath);
       this.bot.on('entitySpawn', this._onEntitySpawn);
+      this.bot.on('entityHurt', this._onEntityHurt);
     }
   }
 
@@ -152,6 +166,7 @@ class AerialModule {
       this.bot.removeListener('death', this._onDeath);
       this.bot.removeListener('respawn', this._onDeath);
       this.bot.removeListener('entitySpawn', this._onEntitySpawn);
+      this.bot.removeListener('entityHurt', this._onEntityHurt);
     }
     this.cancel();
     this.fallDistance = 0;
@@ -240,6 +255,9 @@ class AerialModule {
     this.elytraFlightTicks = 0;
     this.elytraGlideRetrySent = false;
     this.elytraSpearCharging = false;
+    this.elytraSpearChargeTicks = 0;
+    this.elytraSpearHitTarget = false;
+    this.elytraSpearTargetId = null;
     this.elytraSpearAttackNextTick = false;
     this.clutchItemName = null;
     this.clutchActivated = false;

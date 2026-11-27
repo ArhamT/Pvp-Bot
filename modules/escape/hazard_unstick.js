@@ -1,12 +1,10 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { SWORD_PRIORITY, AXE_PRIORITY, clearMovementControls, posKey, inspectColumnStep } = require('../constants');
+const { clearMovementControls, posKey, inspectColumnStep } = require('../constants');
+const { UNBREAKABLE_BLOCKS, canMineBlock, pickBestToolForBlock } = require('../mining');
 
 const RAIL_BLOCK_NAMES = new Set(['rail', 'powered_rail', 'detector_rail', 'activator_rail']);
-const UNBREAKABLE_BLOCKS = new Set(['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'reinforced_deepslate']);
-const PICKAXE_PRIORITY = ['netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe', 'golden_pickaxe'];
-const SHOVEL_PRIORITY = ['netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'wooden_shovel', 'golden_shovel'];
 
 function isTntCartEntity(entity) {
   if (!entity || !entity.isValid) return false;
@@ -192,33 +190,7 @@ const hazardUnstickMethods = {
   },
 
   _pickToolForBlock(block) {
-    if (!block || !block.name) return null;
-    const name = block.name;
-    if (name === 'cobweb') {
-      return this._findItem([...SWORD_PRIORITY, 'shears']);
-    }
-    if (name.includes('wool') || name.includes('leaves') || name === 'vine' || name === 'glow_lichen') {
-      return this._findItem(['shears', ...SWORD_PRIORITY]);
-    }
-    if (
-      name.includes('dirt') || name.includes('sand') || name.includes('gravel') ||
-      name.includes('soul_') || name.includes('snow') || name.includes('clay') ||
-      name.includes('mud') || name.includes('grass_block') || name.includes('mycelium') ||
-      name.includes('podzol') || name.includes('concrete_powder') || name === 'farmland'
-    ) {
-      return this._findItem(SHOVEL_PRIORITY);
-    }
-    if (
-      name.includes('planks') || name.includes('log') || name.includes('wood') ||
-      name.includes('stem') || name.includes('hyphae') || name.includes('bamboo') ||
-      name.includes('fence') || name.includes('gate') || name.includes('door') ||
-      name.includes('chest') || name.includes('barrel') || name.includes('bookshelf') ||
-      name.includes('sign') || name === 'crafting_table' || name === 'melon' ||
-      name === 'pumpkin' || name === 'scaffolding' || name === 'ladder'
-    ) {
-      return this._findItem(AXE_PRIORITY);
-    }
-    return this._findItem(PICKAXE_PRIORITY);
+    return pickBestToolForBlock(this.bot, block);
   },
 
   _estimateBlockBreakCost(block) {
@@ -362,9 +334,7 @@ const hazardUnstickMethods = {
         target && target.isValid && target.position &&
         this.bot.entity.position.distanceTo(target.position) <= 4.0
       ) {
-        if (this.diggingInProgress && typeof this.bot.stopDigging === 'function') {
-          try { this.bot.stopDigging(); } catch (_) {}
-        }
+        if (this.miner) this.miner.cancel();
         this.diggingInProgress = false;
         this.boxMinePlan = null;
         this.activeMode = 'IDLE';
@@ -372,17 +342,12 @@ const hazardUnstickMethods = {
       }
 
       this.boxMinePlan.ticks++;
-      if (this.boxMinePlan.ticks > 140) {
+      if (this.boxMinePlan.ticks > 360) {
+        if (this.miner) this.miner.cancel();
+        this.diggingInProgress = false;
         this.boxMinePlan = null;
         this.activeMode = 'IDLE';
         return false;
-      }
-
-      if (this.diggingInProgress) {
-        if ((now - this.digStartedAt) > 6000) {
-          this.diggingInProgress = false;
-        }
-        return true;
       }
 
       const { dir, originFeet } = this.boxMinePlan;
@@ -393,6 +358,8 @@ const hazardUnstickMethods = {
         : ((feetBlock && feetBlock.boundingBox === 'block' && this._canDigBlock(feetBlock)) ? feetBlock : null);
 
       if (!nextToDig) {
+        if (this.miner) this.miner.cancel();
+        this.diggingInProgress = false;
         // Doorway is open! Walk cleanly out through the mined exit
         const exitYaw = Math.atan2(-dir.dx, -dir.dz);
         this.aimer.stepTowardsAngles(exitYaw, 0.0, { speedMultiplier: 1.6, force: true });
@@ -412,30 +379,15 @@ const hazardUnstickMethods = {
         return true;
       }
 
-      clearMovementControls(this.bot);
-      const tool = this._pickToolForBlock(nextToDig);
-      if (tool) {
-        const eq = this._ensureItemHeld(tool);
-        if (eq.swapped) {
-          this.digSettleTicks = 1;
-          return true;
-        }
+      const digRes = this.miner.mineBlockTick(nextToDig, { allowEmbedded: true });
+      this.diggingInProgress = this.miner.digging;
+      if (digRes.status === 'unreachable' || digRes.status === 'unbreakable' || digRes.status === 'failed') {
+        this.miner.cancel();
+        this.diggingInProgress = false;
+        this.boxMinePlan = null;
+        this.activeMode = 'IDLE';
+        return false;
       }
-      if (this.digSettleTicks > 0) {
-        this.digSettleTicks--;
-        return true;
-      }
-      this.aimer.stepTowardsPoint(nextToDig.position.offset(0.5, 0.5, 0.5), {
-        speedMultiplier: 1.6,
-        force: true
-      });
-      this.diggingInProgress = true;
-      this.digStartedAt = now;
-      Promise.resolve(this.bot.dig(nextToDig, true))
-        .catch(() => {})
-        .finally(() => {
-          this.diggingInProgress = false;
-        });
       return true;
     }
 
@@ -463,26 +415,14 @@ const hazardUnstickMethods = {
   },
 
   _canDigBlock(block) {
-    if (!block || !block.name || UNBREAKABLE_BLOCKS.has(block.name)) return false;
-    if (block.name === 'obsidian' || block.name === 'crying_obsidian' || block.name === 'respawn_anchor') {
-      return Boolean(this._findItem(['netherite_pickaxe', 'diamond_pickaxe']));
-    }
-    return true;
+    return canMineBlock(this.bot, block);
   },
 
   _tickBlockStuckEscape(obstructingBlock, isCobweb) {
-    const now = Date.now();
     this.activeMode = 'BLOCK_STUCK';
     this.modeTicks++;
 
-    if (this.diggingInProgress) {
-      if ((now - this.digStartedAt) > 4000) {
-        this.diggingInProgress = false;
-      }
-      return true;
-    }
-
-    if (!isCobweb && this.modeTicks <= 3) {
+    if (!isCobweb && !this.miner.digging && this.modeTicks <= 3) {
       const openExit = this._findBestEscapeYaw(null, true);
       if (openExit && !openExit.hasLava) {
         this.aimer.stepTowardsAngles(openExit.yaw, 0.0, { speedMultiplier: 1.4 });
@@ -501,31 +441,11 @@ const hazardUnstickMethods = {
       this._canDigBlock(obstructingBlock) &&
       typeof this.bot.dig === 'function'
     ) {
-      clearMovementControls(this.bot);
-      const tool = this._pickToolForBlock(obstructingBlock);
-      if (tool) {
-        const eq = this._ensureItemHeld(tool);
-        if (eq.swapped) {
-          this.digSettleTicks = 1;
-          return true;
-        }
-      }
-      if (this.digSettleTicks > 0) {
-        this.digSettleTicks--;
+      const digRes = this.miner.mineBlockTick(obstructingBlock, { allowEmbedded: true });
+      this.diggingInProgress = this.miner.digging;
+      if (digRes.status === 'preparing' || digRes.status === 'digging' || digRes.status === 'done') {
         return true;
       }
-      this.aimer.stepTowardsPoint(obstructingBlock.position.offset(0.5, 0.5, 0.5), {
-        speedMultiplier: 1.5,
-        force: true
-      });
-      this.diggingInProgress = true;
-      this.digStartedAt = now;
-      Promise.resolve(this.bot.dig(obstructingBlock, true))
-        .catch(() => {})
-        .finally(() => {
-          this.diggingInProgress = false;
-        });
-      return true;
     }
 
     const pearl = this._findItem('ender_pearl');

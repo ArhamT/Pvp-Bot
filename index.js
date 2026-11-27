@@ -6,8 +6,10 @@ const readline = require('readline');
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
+const { Vec3 } = require('vec3');
 
 const { SmoothAimer } = require('./modules/aim');
+const { BlockMiner } = require('./modules/mining');
 const { PredictionModule } = require('./modules/prediction');
 const { CombatModule } = require('./modules/combat');
 const { SurvivalModule } = require('./modules/survival');
@@ -232,6 +234,7 @@ class PvPBotController {
         this.burst = new BurstModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.aerial = new AerialModule(bot, this.config, this.aimer, this.prediction, this.combat);
         this.escape = new EscapeModule(bot, this.config, this.aimer);
+        this.miner = new BlockMiner(bot, this.aimer);
         this.liquidDeny = new LiquidDenyModule(bot, this.config, this.aimer);
         this.redWoolZone = new RedWoolZoneModule(bot, this.config, this.aimer);
 
@@ -791,7 +794,7 @@ class PvPBotController {
   executeBotCommand(command, args = [], caller = 'console', reply = (msg) => this.log(msg)) {
     if (command === 'help') {
       reply(
-        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !roam | !ads | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
+        'Commands: /<any server cmd> | <chat> | !duel [player] | !auto | !roam | !ads | !mine <block|x y z|stop> [count] | !stop | !kit [name] | !sort | !players | !status | !debug | !login | !quit'
       );
       return;
     }
@@ -943,11 +946,35 @@ class PvPBotController {
       return;
     }
 
+    if (command === 'mine') {
+      if (!this.miner) {
+        reply('Mining module not initialized yet.');
+        return;
+      }
+      if (!args[0] || args[0].toLowerCase() === 'stop') {
+        this.miner.cancel(true);
+        reply('Stopped manual mining.');
+        return;
+      }
+      if (args.length >= 3 && !Number.isNaN(Number(args[0])) && !Number.isNaN(Number(args[1])) && !Number.isNaN(Number(args[2]))) {
+        const pos = new Vec3(Math.floor(Number(args[0])), Math.floor(Number(args[1])), Math.floor(Number(args[2])));
+        this.miner.startManualTask({ pos, count: 1 }, reply);
+        reply(`Mining block at (${pos.x}, ${pos.y}, ${pos.z})...`);
+        return;
+      }
+      const blockName = String(args[0]).toLowerCase();
+      const count = Math.max(1, Math.min(64, parseInt(args[1], 10) || 1));
+      this.miner.startManualTask({ blockName, count }, reply);
+      reply(`Mining up to ${count}x ${blockName}...`);
+      return;
+    }
+
     if (command === 'stop') {
+      if (this.miner) this.miner.cancel(true);
       this._clearTargetState(true);
       this.autoFight = false;
       this.transitionState(STATES.IDLE, '!stop command');
-      reply('Stopped combat, disabled !auto, and returned to IDLE.');
+      reply('Stopped combat/mining, disabled !auto, and returned to IDLE.');
       return;
     }
 
@@ -1085,6 +1112,7 @@ class PvPBotController {
 
   _engageTarget(target, reason = 'engage', reply = null) {
     if (!target || !target.isValid) return false;
+    if (this.miner) this.miner.cancel(true);
     this.activeTargetName = target.username || `entity#${target.id}`;
     this.activeTargetEntityId = target.id !== undefined ? target.id : null;
     this.targetLastSeenPos = target.position ? target.position.clone() : null;
@@ -1504,6 +1532,10 @@ class PvPBotController {
         this._engageTarget(autoTarget.entity, this.autoFight ? '!auto nearest target' : 'arena auto-start');
         return;
       }
+    }
+
+    if (this.miner && this.miner.manualTask && this.miner.tickManualTask()) {
+      return;
     }
 
     this._tickSpawnRoam();

@@ -666,6 +666,9 @@ const elytraSkillMethods = {
     this.elytraSpearStuckTicks = 0;
     this.elytraGlideRetrySent = false;
     this.elytraSpearCharging = false;
+    this.elytraSpearChargeTicks = 0;
+    this.elytraSpearHitTarget = false;
+    this.elytraSpearTargetId = null;
     this.elytraSpearAttackNextTick = false;
   },
 
@@ -697,6 +700,7 @@ const elytraSkillMethods = {
   _releaseSpearChargeIfActive() {
     if (this.elytraSpearCharging) {
       this.elytraSpearCharging = false;
+      this.elytraSpearChargeTicks = 0;
       if (this.bot && typeof this.bot.deactivateItem === 'function') {
         try {
           this.bot.deactivateItem();
@@ -932,11 +936,16 @@ const elytraSkillMethods = {
         return false;
       }
 
+      this.elytraSpearTargetId = target.id !== undefined ? target.id : null;
+
       const rawDist = pos.distanceTo(target.position);
-      const leadTicks = clamp(Math.round(rawDist / 6), 2, 5);
-      const predPos = this._getPredictedPosition(target, leadTicks);
-      const eyePos = this.aimer ? this.aimer.getEyePosition() : pos.offset(0, 1.2, 0);
-      const aimPoint = predPos.offset(0, (target.height || 1.8) * 0.6, 0);
+      // Zero-lead live hitbox lock inside 5.5b so high-speed strikes hit dead-center (never lead off hitbox!)
+      const leadTicks = rawDist <= 5.5
+        ? 0
+        : (rawDist <= 10.0 ? 1 : clamp(Math.round(rawDist / 7), 2, 4));
+      const predPos = leadTicks === 0 ? target.position : this._getPredictedPosition(target, leadTicks);
+      const eyePos = this.aimer ? this.aimer.getEyePosition() : pos.offset(0, 0.4, 0);
+      const aimPoint = predPos.offset(0, (target.height || 1.8) * 0.55, 0);
 
       const dx = aimPoint.x - eyePos.x;
       const dy = aimPoint.y - eyePos.y;
@@ -947,12 +956,13 @@ const elytraSkillMethods = {
       let yawToPred = Math.atan2(-dx, -dz);
       let desiredPitch = Math.atan2(dy, Math.max(0.1, horizDist));
 
-      // Terrain clearance protection: never nosedive into the floor when closing from > 7.5b away
+      // Terrain clearance protection: only pull level when skimming floor far from opponent
       const heightAboveGround = this._getHeightAboveGround();
-      if (heightAboveGround < 2.2 && dist3D > 7.5 && desiredPitch < 8 * DEG_TO_RAD) {
+      if (heightAboveGround < 1.6 && dist3D > 8.5 && desiredPitch < 6 * DEG_TO_RAD) {
         desiredPitch = 14 * DEG_TO_RAD;
       }
-      desiredPitch = clamp(desiredPitch, -55 * DEG_TO_RAD, 55 * DEG_TO_RAD);
+      // Allow steep dive pitch down to -82° so bot dives INTO grounded opponents instead of flying over them
+      desiredPitch = clamp(desiredPitch, -82 * DEG_TO_RAD, 60 * DEG_TO_RAD);
 
       // 3D obstacle avoidance: if a solid block/wall is ahead on flight path, climb & bank around it!
       const obstacleAhead = this._hasFlightObstacleAhead(yawToPred, desiredPitch, Math.min(4.5, Math.max(2.0, dist3D - 1.0)));
@@ -967,10 +977,11 @@ const elytraSkillMethods = {
         desiredPitch = 38 * DEG_TO_RAD;
       }
 
+      // Crisp 20-TPS tracking (force: true inside 18b) so crosshair stays locked on target at 1.5+ b/tick!
       const aimStatus = this.aimer.stepTowardsAngles(yawToPred, desiredPitch, {
-        speedMultiplier: 1.85,
+        speedMultiplier: 2.0,
         toleranceRad: 0.24,
-        force: obstacleAhead
+        force: obstacleAhead || dist3D <= 18.0
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -980,11 +991,21 @@ const elytraSkillMethods = {
         this.bot.setControlState('jump', false);
       }
 
-      // 4a. Execute deferred Spear jab on the tick immediately after releasing Spear couch/charge
+      // Radial closing velocity (> 0 means closing in on opponent, < 0 means flying past them)
+      const radial = (vel.x * dx + vel.z * dz) / Math.max(0.1, horizDist);
+
+      // 4a. Execute deferred Spear jab on the tick immediately after releasing a non-connecting charge
       const spearSel = this._findSpear();
       if (this.elytraSpearAttackNextTick) {
         this.elytraSpearAttackNextTick = false;
-        if (spearSel && this._isHoldingSelection(spearSel) && reachDist <= spearReach + 0.6 && aimStatus.yawErrorDeg < 45) {
+        if (
+          spearSel &&
+          this._isHoldingSelection(spearSel) &&
+          reachDist <= spearReach + 0.45 &&
+          typeof this.bot.attack === 'function'
+        ) {
+          // Snap aim directly onto live target center right before jab so fly-by hit connects cleanly
+          this._aimAtTarget(target, 0, { speedMultiplier: 2.0, toleranceRad: 0.35, force: true, heightOffset: (target.height || 1.8) * 0.55 });
           this.bot.attack(target);
         }
         this.elytraPullUpYaw = this.bot.entity.yaw;
@@ -993,14 +1014,14 @@ const elytraSkillMethods = {
         return true;
       }
 
-      // 4b. Mid-flight Rocket Boost when distant, slow, or below target (NEVER fire rocket into a wall!)
+      // 4b. Mid-flight Rocket Boost when distant or stalling (keep Spear in hand inside 11.5b!)
       const rocketSel = this._findItemByName('firework_rocket');
       const wantsBoost = Boolean(
         !obstacleAhead &&
         rocketSel &&
-        dist3D > 7.5 &&
+        !this.elytraSpearCharging &&
         (now - this.lastRocketTime) >= rocketCooldownMs &&
-        (speed < 0.78 || pos.y < target.position.y + 1.0 || dist3D > 15.0)
+        (dist3D > 11.5 && (speed < 0.82 || pos.y < target.position.y + 1.0 || dist3D > 16.0) || (dist3D > 8.5 && speed < 0.52))
       );
 
       if (wantsBoost) {
@@ -1015,7 +1036,7 @@ const elytraSkillMethods = {
         return true;
       }
 
-      // 4c. Spear equip, kinetic couch/charge (for *_spear items), & high-speed fly-by strike!
+      // 4c. Spear equip, 1.21.11 Kinetic Spear Charge (held THROUGH impact!), & guaranteed Left-Click Jab!
       if (spearSel) {
         const eq = this._equipHand(spearSel);
         const holdingSpear = eq.ready && !eq.swapped;
@@ -1023,32 +1044,67 @@ const elytraSkillMethods = {
         const isNativeSpear = spearName.includes('spear') && !spearName.includes('trident');
 
         if (holdingSpear) {
-          // Optional kinetic Spear couch/charge when closing at high velocity (1.21 Spear mechanic)
-          if (
-            isNativeSpear &&
-            this.aerialCfg.elytraSpearChargeEnabled !== false &&
-            !this.elytraSpearCharging &&
-            dist3D <= 8.5 &&
-            dist3D > spearReach + 0.2 &&
-            speed >= 0.55 &&
-            aimStatus.yawErrorDeg < 26
-          ) {
-            if (typeof this.bot.activateItem === 'function') {
-              this.bot.activateItem(false);
-              this.elytraSpearCharging = true;
-            }
-            return true;
-          }
+          if (this.elytraSpearCharging) {
+            this.elytraSpearChargeTicks = (this.elytraSpearChargeTicks || 0) + 1;
 
-          // Strike window: inside spear reach & aligned
-          if (reachDist <= spearReach && aimStatus.yawErrorDeg < 38) {
-            if (this.elytraSpearCharging) {
-              // Release charge this tick and land melee jab next tick (prevents UseItem+Attack flag!)
+            // Confirmed kinetic charge hit via entityHurt -> release cleanly and pull up for next pass!
+            if (this.elytraSpearHitTarget) {
+              this._releaseSpearChargeIfActive();
+              this.elytraSpearHitTarget = false;
+              this.elytraPullUpYaw = this.bot.entity.yaw;
+              this.stage = 'PULL_UP';
+              this.stageTicks = 0;
+              return true;
+            }
+
+            // Refresh exhausted spear charge if still far from target (> 6b) after ~2.4s holding
+            if (this.elytraSpearChargeTicks > 48 && dist3D > 6.0) {
+              this._releaseSpearChargeIfActive();
+              return true;
+            }
+
+            // While still closing into the opponent with a charge that is armed (or arming before pass-through),
+            // KEEP HOLDING right-click through impact so vanilla 1.21.11 velocity-scaled kinetic joust lands!
+            const chargeWillArm = this.elytraSpearChargeTicks >= 5;
+            if (reachDist <= spearReach + 0.15) {
+              if (chargeWillArm && radial > 0.15 && reachDist > 1.8) {
+                // Stay locked dead-center on target torso while kinetic spear sweeps through!
+                return true;
+              }
+              // Either started way too late (< 5 ticks) OR already passing past target without kinetic hurt
+              // -> release charge this tick and land guaranteed left-click Spear Jab on next tick!
               this._releaseSpearChargeIfActive();
               this.elytraSpearAttackNextTick = true;
               return true;
             }
-            this.bot.attack(target);
+            return true;
+          }
+
+          // Start 1.21.11 Kinetic Spear Charge EARLY (6.5b–18b) so 10-tick engage delay finishes BEFORE impact!
+          if (
+            isNativeSpear &&
+            this.aerialCfg.elytraSpearChargeEnabled !== false &&
+            !obstacleAhead &&
+            dist3D <= 18.0 &&
+            dist3D >= 6.5 &&
+            speed >= 0.40 &&
+            aimStatus.yawErrorDeg < 40
+          ) {
+            if (typeof this.bot.activateItem === 'function') {
+              this.bot.activateItem(false);
+              this.elytraSpearCharging = true;
+              this.elytraSpearChargeTicks = 0;
+              this.elytraSpearHitTarget = false;
+            }
+            return true;
+          }
+
+          // Direct Left-Click Spear Jab (Trident, short-range dive < 6.5b, or charge disabled):
+          // Strikes IMMEDIATELY on the exact tick inside Spear reach — zero deferred miss!
+          if (reachDist <= spearReach + 0.2 && aimStatus.yawErrorDeg < 48) {
+            if (typeof this.bot.attack === 'function') {
+              this.bot.attack(target);
+            }
             this.elytraPullUpYaw = this.bot.entity.yaw;
             this.stage = 'PULL_UP';
             this.stageTicks = 0;
@@ -1058,15 +1114,21 @@ const elytraSkillMethods = {
       }
 
       // If we flew right past the target and are now moving away at close range, pull up cleanly!
-      if (dist3D < 3.0) {
-        const radial = (vel.x * dx + vel.z * dz) / Math.max(0.1, horizDist);
-        if (radial < -0.1) {
-          this._releaseSpearChargeIfActive();
-          this.elytraPullUpYaw = this.bot.entity.yaw;
-          this.stage = 'PULL_UP';
-          this.stageTicks = 0;
-          return true;
+      if (dist3D < 2.8 && radial < -0.15) {
+        if (
+          !this.elytraSpearCharging &&
+          spearSel &&
+          this._isHoldingSelection(spearSel) &&
+          reachDist <= spearReach + 0.2 &&
+          typeof this.bot.attack === 'function'
+        ) {
+          this.bot.attack(target);
         }
+        this._releaseSpearChargeIfActive();
+        this.elytraPullUpYaw = this.bot.entity.yaw;
+        this.stage = 'PULL_UP';
+        this.stageTicks = 0;
+        return true;
       }
 
       return true;

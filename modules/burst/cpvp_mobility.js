@@ -3,18 +3,12 @@
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('../aim');
 const {
-  SWORD_PRIORITY,
-  AXE_PRIORITY,
   PEARL_SPEED,
   PEARL_GRAVITY,
   PEARL_DRAG,
-  clearMovementControls,
   inspectColumnStep
 } = require('../constants');
-
-const PICKAXE_PRIORITY = ['netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe', 'golden_pickaxe'];
-const SHOVEL_PRIORITY = ['netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'wooden_shovel', 'golden_shovel'];
-const UNBREAKABLE_BLOCKS = new Set(['bedrock', 'barrier', 'command_block', 'end_portal_frame', 'reinforced_deepslate']);
+const { canMineBlock, pickBestToolForBlock } = require('../mining');
 
 /**
  * CPvP Mobility & Unstick Mixin (`modules/burst/cpvp_mobility.js`):
@@ -31,33 +25,11 @@ const cpvpMobilityMethods = {
   },
 
   _canMineCpvpBlock(block) {
-    if (!block || block.boundingBox !== 'block' || !block.name) return false;
-    if (UNBREAKABLE_BLOCKS.has(block.name)) return false;
-    if (block.name === 'obsidian' || block.name === 'crying_obsidian' || block.name === 'respawn_anchor') {
-      return Boolean(this._findItem('netherite_pickaxe') || this._findItem('diamond_pickaxe'));
-    }
-    return true;
+    return Boolean(block && block.boundingBox === 'block' && canMineBlock(this.bot, block));
   },
 
   _pickCpvpMiningTool(block) {
-    if (!block || !block.name) return null;
-    const name = block.name;
-    const findFirst = (list) => {
-      for (const n of list) {
-        const found = this._findItem(n);
-        if (found) return found;
-      }
-      return null;
-    };
-    if (name === 'cobweb') return findFirst([...SWORD_PRIORITY, 'shears']);
-    if (name.includes('wool') || name.includes('leaves')) return findFirst(['shears', ...SWORD_PRIORITY]);
-    if (name.includes('dirt') || name.includes('sand') || name.includes('gravel') || name.includes('soul_') || name.includes('snow') || name.includes('clay')) {
-      return findFirst(SHOVEL_PRIORITY);
-    }
-    if (name.includes('planks') || name.includes('log') || name.includes('wood') || name.includes('fence') || name.includes('door')) {
-      return findFirst(AXE_PRIORITY);
-    }
-    return findFirst(PICKAXE_PRIORITY);
+    return pickBestToolForBlock(this.bot, block);
   },
 
   _inspectPathTowardTarget(target) {
@@ -185,16 +157,11 @@ const cpvpMobilityMethods = {
     if (this.state === 'CPVP_MINE_THROUGH') {
       const plan = this.activePlan;
       this.stateTicks++;
-      if (!plan || this.stateTicks > 120) {
+      if (!plan || this.stateTicks > 360) {
+        if (this.miner) this.miner.cancel();
         this.cpvpDigging = false;
         this._resetOffensiveState(true);
         return false;
-      }
-      if (this.cpvpDigging) {
-        if ((now - this.cpvpDigStartedAt) > 6000) {
-          this.cpvpDigging = false;
-        }
-        return true;
       }
 
       const headBlock = this.bot.blockAt(plan.originFeet.offset(plan.dir.dx, 1, plan.dir.dz));
@@ -204,6 +171,8 @@ const cpvpMobilityMethods = {
         : ((feetBlock && feetBlock.boundingBox === 'block' && this._canMineCpvpBlock(feetBlock)) ? feetBlock : null);
 
       if (!nextToDig) {
+        if (this.miner) this.miner.cancel();
+        this.cpvpDigging = false;
         // Wall cleared -> immediately walk-jump through toward opponent!
         const walkYaw = Math.atan2(-plan.dir.dx, -plan.dir.dz);
         this.aimer.stepTowardsAngles(walkYaw, 0, { speedMultiplier: 1.7, force: true });
@@ -218,28 +187,14 @@ const cpvpMobilityMethods = {
         return true;
       }
 
-      clearMovementControls(this.bot);
-      const tool = this._pickCpvpMiningTool(nextToDig);
-      if (tool) {
-        const equipRes = this._ensureItemHeld(tool);
-        if (equipRes.swappedThisTick || !equipRes.held) {
-          this.stepDelayTicks = 1;
-          return true;
-        }
+      const digRes = this.miner.mineBlockTick(nextToDig);
+      this.cpvpDigging = this.miner.digging;
+      if (digRes.status === 'unreachable' || digRes.status === 'unbreakable' || digRes.status === 'failed') {
+        this.miner.cancel();
+        this.cpvpDigging = false;
+        this._resetOffensiveState(true);
+        return false;
       }
-      if (this.stepDelayTicks > 0) return true;
-
-      this.aimer.stepTowardsPoint(nextToDig.position.offset(0.5, 0.5, 0.5), {
-        speedMultiplier: 1.7,
-        force: true
-      });
-      this.cpvpDigging = true;
-      this.cpvpDigStartedAt = now;
-      Promise.resolve(this.bot.dig(nextToDig, true))
-        .catch(() => {})
-        .finally(() => {
-          this.cpvpDigging = false;
-        });
       return true;
     }
 

@@ -63,6 +63,12 @@ class SmoothAimer {
    */
   getEyePosition() {
     const pos = this.bot.entity.position;
+    if (this.bot.entity.elytraFlying || this.bot.entity.pose === 1) {
+      return pos.offset(0, 0.4, 0);
+    }
+    if (this.bot.entity.isSneaking) {
+      return pos.offset(0, 1.27, 0);
+    }
     const eyeHeight = this.bot.entity.height ? this.bot.entity.height * 0.9 : 1.62;
     return pos.offset(0, eyeHeight, 0);
   }

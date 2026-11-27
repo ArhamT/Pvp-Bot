@@ -2,6 +2,7 @@
 
 const { posKey, findOverlappingBlock, isPlayerEmbeddedInBlock } = require('./constants');
 const { findInventoryItem, ensureItemHeld } = require('./inventory_utils');
+const { BlockMiner } = require('./mining');
 const { cobwebEscapeMethods } = require('./escape/cobweb_escape');
 const { liquidEscapeMethods } = require('./escape/liquid_escape');
 const { blockEscapeMethods } = require('./escape/block_escape');
@@ -31,6 +32,7 @@ class EscapeModule {
     this.diggingInProgress = false;
     this.digStartedAt = 0;
     this.digSettleTicks = 0;
+    this.miner = new BlockMiner(bot, aimer);
 
     this.lavaWaterState = 'IDLE';
     this.lastLavaWaterAt = 0;
@@ -90,6 +92,7 @@ class EscapeModule {
     this.modeTicks = 0;
     this.diggingInProgress = false;
     this.digSettleTicks = 0;
+    if (this.miner) this.miner.cancel();
     this.lavaWaterState = 'IDLE';
     this.lavaWaterTicks = 0;
     this.fireWaterState = 'IDLE';
@@ -252,7 +255,7 @@ class EscapeModule {
     }
 
     const embedded = this.isEmbeddedInSolidBlock();
-    if (embedded || this.diggingInProgress) {
+    if (embedded || (this.activeMode === 'BLOCK_STUCK' && this.diggingInProgress)) {
       return this._tickBlockStuckEscape(embedded, false);
     }
 
