@@ -58,8 +58,8 @@ class SmoothAimer {
     this.smoothing = clamp(cfg.aimSmoothing !== undefined ? Math.max(0.62, cfg.aimSmoothing) : 0.72, 0.1, 0.92);
     this.jitterRad = (cfg.aimJitterDeg !== undefined ? Math.min(0.25, cfg.aimJitterDeg) : 0.2) * DEG_TO_RAD;
     this.toleranceRad = (cfg.aimToleranceDeg || 8) * DEG_TO_RAD;
-    // Keep normal tracking smooth; only instant-snap when caller explicitly passes `{ force: true }`
-    this.combatForceLook = false;
+    // Instant combat aim snap when enabled (zero lag on 20-TPS strafers; pass { force: false } for slow roam)
+    this.combatForceLook = cfg.combatForceLook !== undefined ? Boolean(cfg.combatForceLook) : true;
   }
 
   /**
@@ -131,7 +131,7 @@ class SmoothAimer {
     }
 
     const clampedPitch = clamp(targetPitch, -Math.PI / 2, Math.PI / 2);
-    const useForce = options.force === true;
+    const useForce = options.force !== undefined ? Boolean(options.force) : this.combatForceLook;
     if (useForce) {
       const nextYaw = normalizeAngle(targetYaw);
       if (typeof this.bot.look === 'function') {

@@ -1,24 +1,10 @@
 'use strict';
 
 const { OFFHAND_SLOT, HOTBAR_START } = require('./constants');
-const { potionClassifierMethods } = require('./survival/potion_classifier');
-const { autoTotemMethods } = require('./survival/auto_totem');
-const { shieldSkillMethods } = require('./survival/shield_skill');
-const { potionSkillMethods } = require('./survival/potion_skill');
-const { foodMendingMethods } = require('./survival/food_mending');
-const { retreatHealMethods } = require('./survival/retreat_heal');
-const { armorHotbarMethods } = require('./survival/armor_hotbar');
+const { totemShieldMethods } = require('./survival/totem_shield');
+const { potionsFoodMethods } = require('./survival/potions_food');
+const { kitManagerMethods } = require('./survival/kit_manager');
 
-/**
- * Modular Survival Coordinator combining 7 focused high-tier skills:
- * - `survival/potion_classifier.js` — WeakMap-cached potion & effect resolver
- * - `survival/auto_totem.js`        — Deduplicated AutoTotem + Double-Hand emergency hold
- * - `survival/shield_skill.js`      — Smart Shield + Axe-stun cooldown tracking + unified `requestShield`
- * - `survival/potion_skill.js`      — Velocity-lead Splash Pots + Buffs + safe hotbar refill
- * - `survival/food_mending.js`      — Gapple/Food + Mending-verified XP repair + spare armor swap
- * - `survival/retreat_heal.js`      — Evasive Retreat/Heal + hitbox-safe LOS cover blocks
- * - `survival/armor_hotbar.js`      — Enchant/durability armor equipper + multi-kit hotbar sorter
- */
 class SurvivalModule {
   constructor(bot, config, aimer) {
     this.bot = bot;
@@ -32,7 +18,7 @@ class SurvivalModule {
     this.totemEquipInFlight = false;
     this.totemSwapPending = false;
     this.totemPopReplenishPending = false;
-    this._lastTotemPopEventAt = 0;
+    this.totemPoppedAt = 0;
     this._totemMovementPaused = false;
     this.totemDelayTimer = null;
     this._totemDelayResolve = null;
@@ -46,23 +32,20 @@ class SurvivalModule {
     this.equipBusy = false;
     this.sortingInProgress = false;
 
-    // Shield state (with Axe-stun cooldown tracking)
+    // Shield state
     this.isShielding = false;
-    this.shieldHand = 'off-hand';
+    this.shieldHand = 'off-hand'; // 'off-hand' | 'main-hand'
     this.shieldingForMace = false;
-    this.shieldingForExternal = null;
     this.prevShieldHotbarSlot = -1;
     this.pendingMainhandShieldSlot = -1;
     this.shieldTicksRemaining = 0;
     this.shieldHoldTicks = 0;
     this.lastShieldEndTime = 0;
     this.lastMaceShieldEndTime = 0;
-    this.shieldDisabledUntil = 0;
     this.maceAntiStunActive = false;
     this.maceShieldThreat = null;
 
     // Consumption, potion & XP armor mending state
-    this._consumeToken = 0;
     this.isConsuming = false;
     this.isDrinkingPotion = false;
     this.consumeStartTime = 0;
@@ -75,14 +58,12 @@ class SurvivalModule {
     this.pendingSplashCreatedAt = 0;
     this.pendingSplashSettleTicks = 0;
     this.pendingSplashEquipStarted = false;
-    this.pendingWeaponRestoreTicks = 0;
     this.pendingPotRefillTime = 0;
     this.activePotChainUntil = 0;
     this.justAteGappleAt = 0;
     this.activeBuffUntil = new Map();
     this.isXpMending = false;
     this.lastXpThrowTime = 0;
-    this._lastSpareArmorCheckAt = 0;
 
     // Retreat, evasive heal-walk & LOS block placement state
     this.retreatStrafeDir = Math.random() < 0.5 ? -1 : 1;
@@ -93,13 +74,12 @@ class SurvivalModule {
     this.lastLosBlockTime = 0;
     this.pendingLosBlock = null;
 
-    // Event bindings
+    // Bind event listeners for human-paced Totem of Undying re-equip & accurate buff tracking
     this._onUpdateSlot = this._handleUpdateSlot.bind(this);
     this._onHealth = this._handleHealth.bind(this);
     this._onEntityEffect = this._handleEntityEffect.bind(this);
     this._onEntityEffectEnd = this._handleEntityEffectEnd.bind(this);
     this._onClearBuffs = this._handleClearBuffs.bind(this);
-
     this._onClientEntityStatus = (packet) => {
       if (!packet || !this.bot || !this.bot.entity || packet.entityId !== this.bot.entity.id) return;
       if (packet.entityStatus === 35) {
@@ -108,7 +88,6 @@ class SurvivalModule {
         this._handleShieldDisabledEvent(5000);
       }
     };
-
     this._onBotEntityStatus = (entity, status) => {
       if (!entity || !this.bot || !this.bot.entity || entity.id !== this.bot.entity.id) return;
       if (status === 35) {
@@ -118,28 +97,11 @@ class SurvivalModule {
       }
     };
 
-    this._onSetCooldown = (packet) => {
-      if (!packet || !this.bot) return;
-      const ticks = Number(packet.cooldownTicks || 0);
-      if (ticks <= 0) return;
-      const shieldId = this.bot.registry && this.bot.registry.itemsByName && this.bot.registry.itemsByName.shield
-        ? this.bot.registry.itemsByName.shield.id
-        : null;
-      const itemKey = String(packet.itemGroup || packet.cooldownGroup || '').toLowerCase();
-      if (
-        (shieldId !== null && packet.itemID === shieldId) ||
-        itemKey.includes('shield')
-      ) {
-        this._handleShieldDisabledEvent(ticks * 50);
-      }
-    };
-
     if (this.bot.inventory && typeof this.bot.inventory.on === 'function') {
       this.bot.inventory.on('updateSlot', this._onUpdateSlot);
     }
     if (this.bot._client && typeof this.bot._client.on === 'function') {
       this.bot._client.on('entity_status', this._onClientEntityStatus);
-      this.bot._client.on('set_cooldown', this._onSetCooldown);
     }
     if (typeof this.bot.on === 'function') {
       this.bot.on('health', this._onHealth);
@@ -151,6 +113,9 @@ class SurvivalModule {
     }
   }
 
+  /**
+   * Unbinds inventory, health, and effect listeners and cancels pending timers cleanly on disconnect.
+   */
   dispose() {
     this._disposed = true;
     this.activeInCombat = false;
@@ -164,7 +129,6 @@ class SurvivalModule {
     }
     if (this.bot && this.bot._client && typeof this.bot._client.removeListener === 'function') {
       this.bot._client.removeListener('entity_status', this._onClientEntityStatus);
-      this.bot._client.removeListener('set_cooldown', this._onSetCooldown);
     }
     if (this.bot && typeof this.bot.removeListener === 'function') {
       this.bot.removeListener('health', this._onHealth);
@@ -178,6 +142,10 @@ class SurvivalModule {
     this.stopConsumption();
   }
 
+  /**
+   * Enables or disables automatic inventory/offhand management.
+   * Disabled in IDLE lobbies so locked lobby selector items never trigger click-packet storms.
+   */
   setCombatActive(active) {
     this.activeInCombat = Boolean(active);
     if (active) {
@@ -188,6 +156,9 @@ class SurvivalModule {
     }
   }
 
+  /**
+   * Configures mineflayer-auto-eat v5 according to config.json.
+   */
   configureAutoEat() {
     if (!this.bot.autoEat) return;
     this.bot.autoEat.setOpts({
@@ -209,6 +180,9 @@ class SurvivalModule {
     });
   }
 
+  /**
+   * Enables/disables background auto-eat (disabled during active combat to prevent NoSlow flags).
+   */
   setAutoEatEnabled(enabled) {
     if (!this.bot.autoEat) return;
     if (enabled && !this.bot.autoEat.enabled) {
@@ -221,6 +195,10 @@ class SurvivalModule {
     }
   }
 
+  /**
+   * Critical HP Reset trigger (Priority 2): returns true at <= retreatHealthThreshold (default 5 HP)
+   * ONLY when the bot still has healing supplies left; if out of healing, stay in ENGAGING and fight to the death.
+   */
   needsRetreat() {
     if (!this.bot.entity) return false;
     if (!this.hasHealingSupplies()) return false;
@@ -228,15 +206,22 @@ class SurvivalModule {
     return this.bot.health <= retreatHp;
   }
 
+  /**
+   * Returns true when bot needs a brief Golden Apple / food heal (no instant splash pots available).
+   * When splash healing potions ARE available, tickInlineCombatHeal() splashes them in-fight without running away.
+   */
   needsHealing() {
     if (!this.bot.entity) return false;
+    // Don't re-enter HEALING right after finishing a gapple (let absorption/regen work while fighting!)
     if ((Date.now() - this.justAteGappleAt) < 2500 && this.bot.health > 5) return false;
 
+    // Intelligent Golden Apple healing: wait until active Regeneration runs out unless HP is critical
     const criticalHp = this.survCfg.criticalHealthThreshold !== undefined ? this.survCfg.criticalHealthThreshold : 5;
     if (this.isBuffActive('regen') && this.bot.health > criticalHp) {
       return false;
     }
 
+    // If we have a splash healing potion ready, stay in ENGAGING and quick-pot inline!
     const retreatHp = this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 5;
     if (this.findHealingPotion() && this.bot.health > retreatHp) {
       return false;
@@ -248,6 +233,9 @@ class SurvivalModule {
     return (lowHealth || lowFood) && Boolean(this.findBestHealFood());
   }
 
+  /**
+   * Returns true when health and hunger are safely restored to re-engage combat.
+   */
   isRecovered() {
     if (!this.bot.entity) return true;
     const safeHp = this.survCfg.safeHealthThreshold || 15;
@@ -264,9 +252,8 @@ class SurvivalModule {
   }
 
   stopConsumption() {
-    this._consumeToken++;
     if (this.isConsuming) {
-      try { if (typeof this.bot.deactivateItem === 'function') this.bot.deactivateItem(); } catch (_) {}
+      try { this.bot.deactivateItem(); } catch (_) {}
       this.isConsuming = false;
       this.isDrinkingPotion = false;
     }
@@ -277,7 +264,6 @@ class SurvivalModule {
     this.pendingSplashCreatedAt = 0;
     this.pendingSplashSettleTicks = 0;
     this.pendingSplashEquipStarted = false;
-    this.pendingWeaponRestoreTicks = 0;
     this.activePotChainUntil = 0;
     this.retreatGapTicks = 0;
     this.pendingLosBlock = null;
@@ -287,13 +273,9 @@ class SurvivalModule {
 
 Object.assign(
   SurvivalModule.prototype,
-  potionClassifierMethods,
-  autoTotemMethods,
-  shieldSkillMethods,
-  potionSkillMethods,
-  foodMendingMethods,
-  retreatHealMethods,
-  armorHotbarMethods
+  totemShieldMethods,
+  potionsFoodMethods,
+  kitManagerMethods
 );
 
 module.exports = { SurvivalModule, OFFHAND_SLOT, HOTBAR_START };

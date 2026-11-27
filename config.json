@@ -63,7 +63,7 @@
     "aimSmoothing": 0.72,
     "aimJitterDeg": 0.2,
     "aimToleranceDeg": 8,
-    "combatForceLook": false
+    "combatForceLook": true
   },
   "prediction": {
     "historyTicks": 5,
