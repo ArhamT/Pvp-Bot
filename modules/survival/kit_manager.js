@@ -10,6 +10,7 @@ const {
   clearMovementControls,
   inspectColumnStep
 } = require('../constants');
+const { canSeeBlockFace } = require('../placement_los');
 const {
   parseItemEnchantments,
   validateArmorInventory
@@ -113,6 +114,10 @@ const kitManagerMethods = {
     if (!refBlock || refBlock.boundingBox !== 'block' || !targetAir || targetAir.name !== 'air') {
       return false;
     }
+    const vis = canSeeBlockFace(this.bot, refBlock.position, new Vec3(0, 1, 0), { aimer: this.aimer });
+    if (!vis) {
+      return false;
+    }
 
     let swappedThisTick = false;
     if (this._isHotbarSlot(blockItem.slot) && typeof this.bot.setQuickBarSlot === 'function') {
@@ -183,7 +188,11 @@ const kitManagerMethods = {
       const held = this.bot.heldItem;
       if (!held || held.name !== action.item.name) return;
       const refBlock = this.bot.blockAt(action.refPos);
-      if (refBlock && refBlock.boundingBox === 'block') {
+      if (
+        refBlock &&
+        refBlock.boundingBox === 'block' &&
+        canSeeBlockFace(this.bot, refBlock.position, new Vec3(0, 1, 0), { aimer: this.aimer })
+      ) {
         await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
         this.lastLosBlockTime = Date.now();
       }

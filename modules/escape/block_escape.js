@@ -2,6 +2,7 @@
 
 const { Vec3 } = require('vec3');
 const { isAirLike, inspectColumnStep } = require('../constants');
+const { canSeeBlockFace, findVisiblePlacementRef } = require('../placement_los');
 
 const ESCAPE_BLOCK_PRIORITY = [
   'cobblestone', 'cobbled_deepslate', 'obsidian', 'stone', 'deepslate',
@@ -101,12 +102,20 @@ const blockEscapeMethods = {
       if (solidWithin2) return null;
     }
 
+    // Only place onto a face with strict line-of-sight (e.g., top of floor under lava,
+    // visible neighbor face, or edge side face once eye has crossed the ledge). Never click behind blocks!
+    const visRef = findVisiblePlacementRef(this.bot, bridgePos, {
+      aimer: this.aimer,
+      maxReach: 4.5
+    });
+    if (!visRef) return null;
+
     return {
       kind: 'BRIDGE_STEP',
-      refPos: underFeet,
-      face: new Vec3(dir.dx, 0, dir.dz),
+      refPos: visRef.refPos,
+      face: visRef.face,
       placePos: bridgePos,
-      aimPos: underFeet.offset(0.5 + dir.dx * 0.5, 0.5, 0.5 + dir.dz * 0.5),
+      aimPos: visRef.aimPos,
       dir
     };
   },
@@ -135,13 +144,15 @@ const blockEscapeMethods = {
     const refPos = placePos.offset(0, -1, 0);
     const refBlock = this.bot.blockAt(refPos);
     if (!refBlock || refBlock.boundingBox !== 'block') return null;
+    const vis = canSeeBlockFace(this.bot, refPos, new Vec3(0, 1, 0), { aimer: this.aimer, maxReach: 4.5 });
+    if (!vis) return null;
 
     return {
       kind: 'ANTI_COMBO_WALL',
       refPos,
       face: new Vec3(0, 1, 0),
       placePos,
-      aimPos: refPos.offset(0.5, 1.0, 0.5),
+      aimPos: vis.aimPos,
       dir
     };
   },
@@ -196,7 +207,11 @@ const blockEscapeMethods = {
       }
 
       const refBlock = this.bot.blockAt(plan.refPos);
-      if (refBlock && refBlock.boundingBox === 'block') {
+      if (
+        refBlock &&
+        refBlock.boundingBox === 'block' &&
+        canSeeBlockFace(this.bot, refBlock.position, plan.face, { aimer: this.aimer, maxReach: 4.5 })
+      ) {
         Promise.resolve(this.bot.placeBlock(refBlock, plan.face)).catch(() => {});
       }
       if (typeof this.bot.setControlState === 'function') {

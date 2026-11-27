@@ -3,6 +3,7 @@
 const { Vec3 } = require('vec3');
 const { posKey, isLiquidSource } = require('./constants');
 const { findInventoryItem, ensureItemHeld, findNearestLiquidSource } = require('./inventory_utils');
+const { canSeeBlockFace, findVisiblePlacementRef, hasClearRaySegment } = require('./placement_los');
 
 const SOLID_DENY_BLOCKS = [
   'cobblestone',
@@ -16,15 +17,6 @@ const SOLID_DENY_BLOCKS = [
   'end_stone',
   'deepslate',
   'obsidian'
-];
-
-const PLACEMENT_OFFSETS = [
-  { offset: new Vec3(0, -1, 0), face: new Vec3(0, 1, 0) },
-  { offset: new Vec3(1, 0, 0), face: new Vec3(-1, 0, 0) },
-  { offset: new Vec3(-1, 0, 0), face: new Vec3(1, 0, 0) },
-  { offset: new Vec3(0, 0, 1), face: new Vec3(0, 0, -1) },
-  { offset: new Vec3(0, 0, -1), face: new Vec3(0, 0, 1) },
-  { offset: new Vec3(0, 1, 0), face: new Vec3(0, -1, 0) }
 ];
 
 /**
@@ -143,15 +135,13 @@ class LiquidDenyModule {
   }
 
   _findPlacementRef(targetPos) {
-    if (typeof this.bot.blockAt !== 'function') return null;
-    for (const { offset, face } of PLACEMENT_OFFSETS) {
-      const refPos = targetPos.plus(offset);
-      const refBlock = this.bot.blockAt(refPos);
-      if (refBlock && refBlock.boundingBox === 'block') {
-        return { refBlock, faceVec: face.clone() };
-      }
-    }
-    return null;
+    const maxRange = this.cfg.maxRange !== undefined ? this.cfg.maxRange : 4.5;
+    const vis = findVisiblePlacementRef(this.bot, targetPos, {
+      aimer: this.aimer,
+      maxReach: maxRange
+    });
+    if (!vis) return null;
+    return { refBlock: vis.refBlock, faceVec: vis.face, aimPos: vis.aimPos };
   }
 
   tick(target = null, options = {}) {
@@ -206,7 +196,8 @@ class LiquidDenyModule {
     }
 
     const center = pos.offset(0.5, 0.5, 0.5);
-    if (this._getEyePos().distanceTo(center) > maxRange) {
+    const eyePos = this._getEyePos();
+    if (eyePos.distanceTo(center) > maxRange) {
       this.activeThreat = null;
       return false;
     }
@@ -216,8 +207,8 @@ class LiquidDenyModule {
       return false;
     }
 
-    // Priority 1: Empty bucket -> scoop the water/lava source cleanly (with 1-tick settle + 1 retry if server didn't register)
-    if (emptyBucket) {
+    // Priority 1: Empty bucket -> scoop the water/lava source cleanly (only with clear LOS!)
+    if (emptyBucket && hasClearRaySegment(this.bot, eyePos, center)) {
       const aimTarget = this.activeThreat.scoopAttempts > 0 ? pos.offset(0.5, 0.25, 0.5) : center;
       if (this.aimer) {
         this.aimer.stepTowardsPoint(aimTarget, { force: true });
@@ -261,7 +252,7 @@ class LiquidDenyModule {
       return false;
     }
 
-    const faceCenter = ref.refBlock.position.offset(
+    const faceCenter = ref.aimPos || ref.refBlock.position.offset(
       0.5 + ref.faceVec.x * 0.5,
       0.5 + ref.faceVec.y * 0.5,
       0.5 + ref.faceVec.z * 0.5
@@ -279,7 +270,10 @@ class LiquidDenyModule {
       this.bot.setControlState('sneak', false);
     }
 
-    if (typeof this.bot.placeBlock === 'function') {
+    if (
+      typeof this.bot.placeBlock === 'function' &&
+      canSeeBlockFace(this.bot, ref.refBlock.position, ref.faceVec, { aimer: this.aimer, maxReach: maxRange })
+    ) {
       this.inFlight = true;
       const doneKey = this.activeThreat.key;
       this.handledSources.set(doneKey, now + 2500);

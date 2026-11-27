@@ -3,6 +3,7 @@
 const { Vec3 } = require('vec3');
 const { isAirLike } = require('../constants');
 const { findNearestLiquidSource } = require('../inventory_utils');
+const { canSeeBlockFace } = require('../placement_los');
 
 const PILLAR_BLOCK_PRIORITY = [
   'obsidian', 'cobbled_deepslate', 'cobblestone', 'stone', 'deepslate',
@@ -326,7 +327,12 @@ const liquidEscapeMethods = {
     const belowPos = pos.floored().offset(0, -1, 0);
     const refBlock = this.bot.blockAt(belowPos);
     const feetPos = pos.floored();
-    if (refBlock && refBlock.boundingBox === 'block' && isAirLike(this.bot.blockAt(feetPos))) {
+    if (
+      refBlock &&
+      refBlock.boundingBox === 'block' &&
+      isAirLike(this.bot.blockAt(feetPos)) &&
+      canSeeBlockFace(this.bot, belowPos, new Vec3(0, 1, 0), { aimer: this.aimer, maxReach: 4.5 })
+    ) {
       Promise.resolve(this.bot.placeBlock(refBlock, new Vec3(0, 1, 0))).catch(() => {});
     }
     this.pillarActive = false;

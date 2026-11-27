@@ -3,6 +3,7 @@
 const { Vec3 } = require('vec3');
 const { clamp } = require('../aim');
 const { getItemMetadataText } = require('../constants');
+const { canSeeBlockFace } = require('../placement_los');
 const {
   CRYSTAL_POWER,
   DEFENSE_BLOCK_PRIORITY,
@@ -507,7 +508,12 @@ const burstDefenseMethods = {
 
       const refBlock = this.bot.blockAt(plan.refPos);
       const targetAir = this.bot.blockAt(plan.placePos);
-      if (refBlock && refBlock.boundingBox === 'block' && isAirLike(targetAir)) {
+      if (
+        refBlock &&
+        refBlock.boundingBox === 'block' &&
+        isAirLike(targetAir) &&
+        canSeeBlockFace(this.bot, refBlock.position, plan.face, { aimer: this.aimer })
+      ) {
         this._markOwnPlacement(plan.placePos);
         if (typeof this.bot.placeBlock === 'function') {
           Promise.resolve(this.bot.placeBlock(refBlock, plan.face)).catch(() => {});

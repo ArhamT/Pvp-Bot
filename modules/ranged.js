@@ -12,6 +12,7 @@ const {
   findOverlappingBlock,
   inspectColumnStep
 } = require('./constants');
+const { canSeeBlockFace } = require('./placement_los');
 
 const ARROW_SPEED = 3.0;
 const CROSSBOW_SPEED = 3.15;
@@ -1185,7 +1186,14 @@ class RangedModule {
       const belowBlock = this.bot.blockAt(feetPos.offset(0, -1, 0));
       const feetBlock = this.bot.blockAt(feetPos);
 
-      if (cobweb && belowBlock && belowBlock.boundingBox === 'block' && feetBlock && feetBlock.name === 'air') {
+      if (
+        cobweb &&
+        belowBlock &&
+        belowBlock.boundingBox === 'block' &&
+        feetBlock &&
+        feetBlock.name === 'air' &&
+        canSeeBlockFace(this.bot, belowBlock.position, new Vec3(0, 1, 0), { aimer: this.aimer })
+      ) {
         this.pendingAction = {
           type: 'cobweb',
           item: cobweb,
@@ -1364,7 +1372,11 @@ class RangedModule {
 
       if (action.type === 'cobweb') {
         const refBlock = this.bot.blockAt(action.refBlockPos);
-        if (refBlock && refBlock.boundingBox === 'block') {
+        if (
+          refBlock &&
+          refBlock.boundingBox === 'block' &&
+          canSeeBlockFace(this.bot, refBlock.position, new Vec3(0, 1, 0), { aimer: this.aimer })
+        ) {
           await this.bot.placeBlock(refBlock, new Vec3(0, 1, 0));
           this.lastCobwebTime = now;
         }

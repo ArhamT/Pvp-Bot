@@ -1,6 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
+const { canSeeBlockFace } = require('../placement_los');
 const { findFeetBlastShieldSpot } = require('../cpvp_tactics');
 const {
   ANCHOR_POWER,
@@ -96,6 +97,7 @@ const anchorSkillMethods = {
           let alreadyCharged = false;
 
           if (existing.name === 'respawn_anchor') {
+            if (!this._findVisibleBlockFace(anchorPos)) continue;
             needsPlace = false;
             alreadyCharged = this._getAnchorCharges(existing) >= 1;
           } else if (isAirLike(existing)) {
@@ -202,7 +204,12 @@ const anchorSkillMethods = {
       }
 
       const refBlock = this.bot.blockAt(cover.refPos);
-      if (refBlock && refBlock.boundingBox === 'block' && isAirLike(this.bot.blockAt(cover.placePos))) {
+      if (
+        refBlock &&
+        refBlock.boundingBox === 'block' &&
+        isAirLike(this.bot.blockAt(cover.placePos)) &&
+        canSeeBlockFace(this.bot, refBlock.position, cover.face, { aimer: this.aimer })
+      ) {
         this._markOwnPlacement(cover.placePos);
         if (typeof this.bot.placeBlock === 'function') {
           Promise.resolve(this.bot.placeBlock(refBlock, cover.face)).catch(() => {});
@@ -238,7 +245,11 @@ const anchorSkillMethods = {
       }
 
       const refBlock = this.bot.blockAt(plan.anchorRef.refPos);
-      if (!refBlock || refBlock.boundingBox !== 'block') {
+      if (
+        !refBlock ||
+        refBlock.boundingBox !== 'block' ||
+        !canSeeBlockFace(this.bot, refBlock.position, plan.anchorRef.face, { aimer: this.aimer })
+      ) {
         this._resetOffensiveState(true);
         return false;
       }
@@ -298,6 +309,10 @@ const anchorSkillMethods = {
       }
 
       const face = this._findVisibleBlockFace(plan.anchorPos);
+      if (!face) {
+        this._resetOffensiveState(true);
+        return false;
+      }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 1.35,
@@ -339,6 +354,10 @@ const anchorSkillMethods = {
     // Step 3: Mandatory Hotbar Swap to non-glowstone slot (Totem, Sword, Axe, Empty) before detonating
     if (this.state === 'ANCHOR_SWITCH_SLOT') {
       const face = this._findVisibleBlockFace(plan.anchorPos);
+      if (!face) {
+        this._resetOffensiveState(true);
+        return false;
+      }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       this.aimer.stepTowardsPoint(faceAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
       if (this.stepDelayTicks > 0) return true;
@@ -407,6 +426,10 @@ const anchorSkillMethods = {
       }
 
       const face = this._findVisibleBlockFace(plan.anchorPos);
+      if (!face) {
+        this._resetOffensiveState(true);
+        return false;
+      }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 1.4,

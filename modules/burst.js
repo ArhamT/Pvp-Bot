@@ -9,13 +9,16 @@ const {
   hasItemEnchant
 } = require('./constants');
 const {
+  findVisiblePlacementRef,
+  findVisibleBlockFace
+} = require('./placement_los');
+const {
   isTargetInSurround,
   planSurroundPressurePlacement
 } = require('./cpvp_tactics');
 const {
   CRYSTAL_POWER,
   ANCHOR_POWER,
-  PLACEMENT_FACES,
   posKey,
   isAirLike,
   isCrystalEntity
@@ -438,39 +441,11 @@ class BurstModule {
   }
 
   _findVisibleBlockFace(blockPos) {
-    if (!this.bot || !this.bot.entity || typeof this.bot.blockAt !== 'function' || !blockPos) {
-      return new Vec3(0, 1, 0);
-    }
-    const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
-    const center = blockPos.offset(0.5, 0.5, 0.5);
-    const toEye = eyePos.minus(center);
-
-    const above = this.bot.blockAt(blockPos.offset(0, 1, 0));
-    if (isAirLike(above) && eyePos.y > blockPos.y + 0.5) {
-      return new Vec3(0, 1, 0);
-    }
-
-    const candidates = [
-      new Vec3(0, 1, 0),
-      new Vec3(1, 0, 0),
-      new Vec3(-1, 0, 0),
-      new Vec3(0, 0, 1),
-      new Vec3(0, 0, -1),
-      new Vec3(0, -1, 0)
-    ];
-
-    let bestFace = null;
-    let bestDot = -Infinity;
-    for (const face of candidates) {
-      const neighbor = this.bot.blockAt(blockPos.plus(face));
-      if (!isAirLike(neighbor)) continue;
-      const dot = face.x * toEye.x + face.y * toEye.y + face.z * toEye.z;
-      if (dot > bestDot) {
-        bestDot = dot;
-        bestFace = face;
-      }
-    }
-    return bestFace || new Vec3(0, 1, 0);
+    const vis = findVisibleBlockFace(this.bot, blockPos, {
+      aimer: this.aimer,
+      maxReach: 4.5
+    });
+    return vis ? vis.face : null;
   }
 
   /**
@@ -566,20 +541,10 @@ class BurstModule {
   }
 
   _findPlacementRef(airPos) {
-    if (!this.bot || typeof this.bot.blockAt !== 'function') return null;
-    for (const candidate of PLACEMENT_FACES) {
-      const refPos = airPos.plus(candidate.offset);
-      const refBlock = this.bot.blockAt(refPos);
-      if (refBlock && refBlock.boundingBox === 'block') {
-        const aimPos = refPos.offset(
-          0.5 + candidate.face.x * 0.5,
-          0.5 + candidate.face.y * 0.5,
-          0.5 + candidate.face.z * 0.5
-        );
-        return { refPos, refBlock, face: candidate.face, aimPos };
-      }
-    }
-    return null;
+    return findVisiblePlacementRef(this.bot, airPos, {
+      aimer: this.aimer,
+      maxReach: 4.5
+    });
   }
 
   _intersectsEntityHitbox(blockPos, entityPos, height = 1.8) {

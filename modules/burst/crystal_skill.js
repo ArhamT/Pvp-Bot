@@ -1,6 +1,7 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
+const { canSeeBlockFace } = require('../placement_los');
 const {
   hasExistingCrystalAt,
   findFeetBlastShieldSpot,
@@ -98,12 +99,14 @@ const crystalSkillMethods = {
           let obsidianRef = null;
 
           if (baseBlock.name === 'obsidian' || baseBlock.name === 'bedrock') {
+            if (!canSeeBlockFace(this.bot, basePos, new Vec3(0, 1, 0), { aimer: this.aimer })) continue;
             needsObsidian = false;
           } else if (isAirLike(baseBlock) && obsidianItem) {
             if (this._intersectsEntityHitbox(basePos, botPos)) continue;
             if (this._intersectsEntityHitbox(basePos, target.position, target.height || 1.8)) continue;
             obsidianRef = this._findPlacementRef(basePos);
             if (!obsidianRef) continue;
+            if (!canSeeBlockFace(this.bot, basePos, new Vec3(0, 1, 0), { aimer: this.aimer })) continue;
             needsObsidian = true;
           } else {
             continue;
@@ -294,7 +297,12 @@ const crystalSkillMethods = {
       }
 
       const refBlock = this.bot.blockAt(cover.refPos);
-      if (refBlock && refBlock.boundingBox === 'block' && isAirLike(this.bot.blockAt(cover.placePos))) {
+      if (
+        refBlock &&
+        refBlock.boundingBox === 'block' &&
+        isAirLike(this.bot.blockAt(cover.placePos)) &&
+        canSeeBlockFace(this.bot, refBlock.position, cover.face, { aimer: this.aimer })
+      ) {
         this._markOwnPlacement(cover.placePos);
         if (typeof this.bot.placeBlock === 'function') {
           Promise.resolve(this.bot.placeBlock(refBlock, cover.face)).catch(() => {});
@@ -329,7 +337,11 @@ const crystalSkillMethods = {
       }
 
       const refBlock = this.bot.blockAt(plan.obsidianRef.refPos);
-      if (!refBlock || refBlock.boundingBox !== 'block') {
+      if (
+        !refBlock ||
+        refBlock.boundingBox !== 'block' ||
+        !canSeeBlockFace(this.bot, refBlock.position, plan.obsidianRef.face, { aimer: this.aimer })
+      ) {
         this._resetOffensiveState(true);
         return false;
       }
@@ -360,7 +372,13 @@ const crystalSkillMethods = {
         return false;
       }
 
-      const topFaceAim = plan.basePos.offset(0.5, 1.0, 0.5);
+      const topVis = canSeeBlockFace(this.bot, plan.basePos, new Vec3(0, 1, 0), { aimer: this.aimer });
+      if (!topVis) {
+        this._resetOffensiveState(true);
+        return false;
+      }
+
+      const topFaceAim = topVis.aimPos;
       const aimStatus = this.aimer.stepTowardsPoint(topFaceAim, {
         speedMultiplier: 1.35,
         toleranceRad: 0.16

@@ -2,6 +2,7 @@
 
 const { Vec3 } = require('vec3');
 const { HOTBAR_START, SWORD_PRIORITY, AXE_PRIORITY, getItemMetadataText, hasItemEnchant } = require('./constants');
+const { canSeeBlockFace } = require('./placement_los');
 
 const RAIL_NAMES = ['rail', 'powered_rail', 'detector_rail', 'activator_rail'];
 const SHIELD_BLOCK_PRIORITY = ['obsidian', 'cobbled_deepslate', 'cobblestone', 'stone', 'deepslate'];
@@ -312,6 +313,7 @@ class CartModule {
     const block = this.bot.blockAt(cand);
     if (!block || block.name !== 'air') return null;
     if (!this._isSolid(cand.offset(0, -1, 0))) return null;
+    if (!canSeeBlockFace(this.bot, cand.offset(0, -1, 0), new Vec3(0, 1, 0), { aimer: this.aimer })) return null;
     return cand;
   }
 
@@ -345,6 +347,8 @@ class CartModule {
         const isExistingRail = b && RAIL_NAMES.includes(b.name);
         if (!b || (b.name !== 'air' && !isExistingRail)) continue;
         if (!this._isSolid(cand.offset(0, -1, 0))) continue;
+        const losTargetPos = isExistingRail ? cand : cand.offset(0, -1, 0);
+        if (!canSeeBlockFace(this.bot, losTargetPos, new Vec3(0, 1, 0), { aimer: this.aimer })) continue;
 
         const score = center.distanceTo(pred) - (isExistingRail ? 0.6 : 0);
         if (score < bestScore) {
@@ -556,12 +560,13 @@ class CartModule {
 
     const refPos = this.shieldPos.offset(0, -1, 0);
     const refBlock = typeof this.bot.blockAt === 'function' ? this.bot.blockAt(refPos) : null;
-    if (!refBlock || refBlock.boundingBox !== 'block') {
+    const vis = refBlock ? canSeeBlockFace(this.bot, refPos, new Vec3(0, 1, 0), { aimer: this.aimer }) : null;
+    if (!refBlock || refBlock.boundingBox !== 'block' || !vis) {
       this._resetState();
       return false;
     }
 
-    const aim = this.aimer.stepTowardsPoint(refPos.offset(0.5, 1.0, 0.5), { speedMultiplier: 1.85, toleranceRad: 0.25 });
+    const aim = this.aimer.stepTowardsPoint(vis.aimPos, { speedMultiplier: 1.85, toleranceRad: 0.25 });
     const eq = this._equipSequential(blockItem);
     if (eq.ready && aim.aligned && typeof this.bot.placeBlock === 'function') {
       Promise.resolve(this.bot.placeBlock(refBlock, new Vec3(0, 1, 0))).catch(() => {});
@@ -587,12 +592,13 @@ class CartModule {
     const railItem = this._findItem(RAIL_NAMES);
     const supportPos = this.railPos.offset(0, -1, 0);
     const supportBlock = typeof this.bot.blockAt === 'function' ? this.bot.blockAt(supportPos) : null;
-    if (!railItem || !supportBlock || supportBlock.boundingBox !== 'block') {
+    const vis = supportBlock ? canSeeBlockFace(this.bot, supportPos, new Vec3(0, 1, 0), { aimer: this.aimer }) : null;
+    if (!railItem || !supportBlock || supportBlock.boundingBox !== 'block' || !vis) {
       this._resetState();
       return false;
     }
 
-    const aim = this.aimer.stepTowardsPoint(supportPos.offset(0.5, 1.0, 0.5), { speedMultiplier: 1.85, toleranceRad: 0.25 });
+    const aim = this.aimer.stepTowardsPoint(vis.aimPos, { speedMultiplier: 1.85, toleranceRad: 0.25 });
     const eq = this._equipSequential(railItem);
     if (eq.ready && aim.aligned && typeof this.bot.placeBlock === 'function') {
       Promise.resolve(this.bot.placeBlock(supportBlock, new Vec3(0, 1, 0))).catch(() => {});
@@ -635,6 +641,12 @@ class CartModule {
         this._enterState(CART_STATES.DETONATE);
         return true;
       }
+      this._resetState();
+      return false;
+    }
+
+    const railVis = canSeeBlockFace(this.bot, this.railPos, new Vec3(0, 1, 0), { aimer: this.aimer });
+    if (!railVis) {
       this._resetState();
       return false;
     }
