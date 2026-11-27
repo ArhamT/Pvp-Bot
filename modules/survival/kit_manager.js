@@ -458,7 +458,7 @@ const kitManagerMethods = {
       this.healStrafeTicks = 6 + Math.floor(Math.random() * 5);
     }
 
-    const canStrafe = this._isYawWalkable(chosenYaw + (this.healStrafeDir * Math.PI) / 2);
+    const canStrafe = this._isYawWalkable(chosenYaw - (this.healStrafeDir * Math.PI) / 2);
 
     this.bot.setControlState('sprint', false);
     this.bot.setControlState('jump', false);

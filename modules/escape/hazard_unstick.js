@@ -137,7 +137,7 @@ const hazardUnstickMethods = {
         }
       }
 
-      for (const dist of [1.2, 2.2]) {
+      for (const dist of [0.6, 1.2, 2.2]) {
         const sample = base.offset(dx * dist, 0, dz * dist);
         const f = this.bot.blockAt(sample);
         const h = this.bot.blockAt(sample.offset(0, 1, 0));
@@ -301,12 +301,76 @@ const hazardUnstickMethods = {
     return blockedDirs === 4 ? bestPlan : null;
   },
 
+  /**
+   * Plans mining a 2-block-tall opening straight through a blocking wall/obstacle directly ahead
+   * ONLY when the opponent is not near (`> 4.5` blocks away) so the bot never mines in melee range.
+   */
+  _planForwardWallMine(target) {
+    if (
+      this.escapeCfg.allowBlockDig === false ||
+      !this.bot || !this.bot.entity || !this.bot.entity.position ||
+      typeof this.bot.blockAt !== 'function' || typeof this.bot.dig !== 'function'
+    ) {
+      return null;
+    }
+
+    const pos = this.bot.entity.position;
+    if (target && target.isValid && target.position && pos.distanceTo(target.position) <= 4.5) {
+      return null; // Opponent is near -> fight / go around, never stop to mine!
+    }
+
+    const yaw = (target && target.isValid && target.position)
+      ? Math.atan2(-(target.position.x - pos.x), -(target.position.z - pos.z))
+      : (this.bot.entity.yaw || 0);
+    const fx = -Math.sin(yaw);
+    const fz = -Math.cos(yaw);
+    const dir = Math.abs(fx) >= Math.abs(fz)
+      ? { dx: Math.sign(fx) || 1, dz: 0 }
+      : { dx: 0, dz: Math.sign(fz) || 1 };
+
+    const feet = pos.floored();
+    const bFeet = this.bot.blockAt(feet.offset(dir.dx, 0, dir.dz));
+    const bHead = this.bot.blockAt(feet.offset(dir.dx, 1, dir.dz));
+    const hasWall = (bFeet && bFeet.boundingBox === 'block') || (bHead && bHead.boundingBox === 'block');
+    if (!hasWall) return null;
+
+    const costFeet = this._estimateBlockBreakCost(bFeet);
+    const costHead = this._estimateBlockBreakCost(bHead);
+    if (!Number.isFinite(costFeet + costHead) || (costFeet + costHead) <= 0) return null;
+
+    const behind = this.bot.blockAt(feet.offset(dir.dx * 2, 0, dir.dz * 2));
+    if (behind && (behind.name.includes('lava') || behind.name.includes('fire'))) return null;
+
+    return {
+      dir,
+      originFeet: feet.clone(),
+      score: 0,
+      ticks: 0,
+      isForwardObstacle: true
+    };
+  },
+
   _tickBoxBreakout(target, context) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
     const now = Date.now();
 
     // Continue active 2-block-tall doorway mining until both head & feet blocks are cleared
     if (this.activeMode === 'BOX_MINE' && this.boxMinePlan) {
+      // Safety abort: if mining a forward obstacle (not fully boxed in) and opponent rushes within 4.0b, stop mining & fight!
+      if (
+        this.boxMinePlan.isForwardObstacle &&
+        target && target.isValid && target.position &&
+        this.bot.entity.position.distanceTo(target.position) <= 4.0
+      ) {
+        if (this.diggingInProgress && typeof this.bot.stopDigging === 'function') {
+          try { this.bot.stopDigging(); } catch (_) {}
+        }
+        this.diggingInProgress = false;
+        this.boxMinePlan = null;
+        this.activeMode = 'IDLE';
+        return false;
+      }
+
       this.boxMinePlan.ticks++;
       if (this.boxMinePlan.ticks > 140) {
         this.boxMinePlan = null;
@@ -577,20 +641,29 @@ const hazardUnstickMethods = {
     }
     this.lastCheckPos = pos.clone();
 
-    const threshold = this.escapeCfg.stallTicksThreshold || 14;
-    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 2200) {
+    const threshold = this.escapeCfg.stallTicksThreshold || 10;
+    if (this.stallTicks < threshold || (now - this.lastStallRecoveryAt) < 1800) {
       return false;
     }
 
     this.stallTicks = 0;
     this.lastStallRecoveryAt = now;
 
+    // Priority 1: If opponent is NOT near (>4.5b) and a breakable wall directly blocks our path,
+    //             prefer clean detour if available, else mine straight through with the appropriate tool!
     const exit = this._findBestEscapeYaw(null, true);
     if (exit && !exit.hasLava) {
       this.activeMode = 'STALL_UNSTICK';
       this.detourYaw = exit.yaw;
       this.detourTicks = 8;
       return this._tickStallUnstick(target, context);
+    }
+
+    const wallMinePlan = this._planForwardWallMine(target);
+    if (wallMinePlan) {
+      this.boxMinePlan = wallMinePlan;
+      this.activeMode = 'BOX_MINE';
+      return this._tickBoxBreakout(target, context);
     }
 
     if (this._tickPillarOut()) {

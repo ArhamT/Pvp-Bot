@@ -97,8 +97,6 @@ const spawnRoamMethods = {
     }
 
     const pos = this.bot.entity.position;
-    const stepX = pos.x - Math.sin(yaw) * 1.1;
-    const stepZ = pos.z - Math.cos(yaw) * 1.1;
     const baseY = Math.floor(pos.y);
 
     const feetBlock = this.bot.blockAt(new Vec3(pos.x, baseY, pos.z));
@@ -106,35 +104,46 @@ const spawnRoamMethods = {
       return { safe: false, shouldStepUp: false };
     }
 
-    const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
-    const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
-    const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
-    const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
+    // Sample both near (0.55b — catches walls the bot is currently touching!) and far (1.1b)
+    let shouldStepUp = false;
+    for (const dist of [0.55, 1.1]) {
+      const stepX = pos.x - Math.sin(yaw) * dist;
+      const stepZ = pos.z - Math.cos(yaw) * dist;
 
-    if (
-      (aheadFeet && ROAM_HAZARD_BLOCKS.has(aheadFeet.name)) ||
-      (aheadHead && ROAM_HAZARD_BLOCKS.has(aheadHead.name)) ||
-      (aheadFloor0 && ROAM_HAZARD_BLOCKS.has(aheadFloor0.name))
-    ) {
-      return { safe: false, shouldStepUp: false };
-    }
+      const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
+      const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
+      const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
+      const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
 
-    const col = inspectColumnStep(this.bot, stepX, pos.y, stepZ);
-    if (col.blocked) {
-      return { safe: false, shouldStepUp: false };
-    }
+      if (
+        (aheadFeet && ROAM_HAZARD_BLOCKS.has(aheadFeet.name)) ||
+        (aheadHead && ROAM_HAZARD_BLOCKS.has(aheadHead.name)) ||
+        (aheadFloor0 && ROAM_HAZARD_BLOCKS.has(aheadFloor0.name))
+      ) {
+        return { safe: false, shouldStepUp: false };
+      }
 
-    const hasSupport =
-      col.hasFloor ||
-      Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
-      Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
-    if (!hasSupport) {
-      return { safe: false, shouldStepUp: false };
+      const col = inspectColumnStep(this.bot, stepX, pos.y, stepZ);
+      if (col.blocked) {
+        return { safe: false, shouldStepUp: false };
+      }
+
+      const hasSupport =
+        col.hasFloor ||
+        Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
+        Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
+      if (!hasSupport) {
+        return { safe: false, shouldStepUp: false };
+      }
+
+      if (col.needsJump) {
+        shouldStepUp = true;
+      }
     }
 
     return {
       safe: true,
-      shouldStepUp: col.needsJump && Boolean(this.bot.entity.onGround)
+      shouldStepUp: shouldStepUp && Boolean(this.bot.entity.onGround)
     };
   },
 
@@ -280,10 +289,17 @@ const spawnRoamMethods = {
     }
 
     const stepCheck = this._isRoamStepSafe(yawToDest);
-    if (!stepCheck.safe) {
+    if (this.bot.entity.isCollidedHorizontally && !stepCheck.shouldStepUp) {
+      this._roamCollideTicks = (this._roamCollideTicks || 0) + 1;
+    } else {
+      this._roamCollideTicks = 0;
+    }
+
+    if (!stepCheck.safe || this._roamCollideTicks >= 3) {
+      this._roamCollideTicks = 0;
       this._stopSpawnRoam();
       this.roamPhase = 'PAUSED';
-      this.roamPhaseUntil = now + this._randRange(500, 1200);
+      this.roamPhaseUntil = now + this._randRange(400, 900);
       return;
     }
 

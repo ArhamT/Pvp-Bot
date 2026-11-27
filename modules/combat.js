@@ -893,7 +893,8 @@ class CombatModule {
    */
   _isStrafeDirectionSafe(dir) {
     if (!this.bot.entity) return false;
-    const sideYaw = this.bot.entity.yaw + (dir * Math.PI) / 2;
+    // Mineflayer yaw: +PI/2 = LEFT (-X at yaw=0), -PI/2 = RIGHT (+X at yaw=0)
+    const sideYaw = this.bot.entity.yaw - (dir * Math.PI) / 2;
     if (this.hazardChecker && typeof this.hazardChecker.isDirectionSafe === 'function') {
       return this.hazardChecker.isDirectionSafe(sideYaw, 1.15);
     }
@@ -1055,9 +1056,9 @@ class CombatModule {
     //    axe shield-break swap / swap-back, or default hotbar Sword.
     this._updateWeaponForTarget(target);
 
-    // 2. Only hand off to pathfinder when target is far (>10b) AND a 2+ block wall actually blocks direct approach,
-    //    with a stuck fallback back to direct smooth-aim sprint-jumping so custom duel arena blocks never freeze the bot.
-    const pathfinderRange = 10.0;
+    // 2. Hand off to pathfinder when a 2+ block tall wall blocks direct approach to a target > 4.0b away
+    //    so the bot walks smoothly around walls/pillars instead of grinding against them (with 15-tick stuck fallback).
+    const pathfinderRange = 4.0;
     const nowMs = Date.now();
     const blockedByTallWall = this._isDirectApproachBlockedByWall(target);
 
@@ -1255,6 +1256,7 @@ class CombatModule {
     const rz = -Math.sin(yaw);
 
     let needLedgeJump = false;
+    let centerBlocked2High = false;
     let leftBlocked2High = false;
     let rightBlocked2High = false;
     let overheadCobweb = false;
@@ -1274,6 +1276,7 @@ class CombatModule {
         if (col.needsJump) {
           needLedgeJump = true;
         } else if (col.blocked) {
+          if (lane.side === 0) centerBlocked2High = true;
           if (lane.side < 0) leftBlocked2High = true;
           if (lane.side > 0) rightBlocked2High = true;
         }
@@ -1293,15 +1296,15 @@ class CombatModule {
       if (overheadCobweb) break;
     }
 
-    // Only jump on horizontal collision when NOT sliding past a 2-high corner edge (prevents in-place jump stutter!)
-    if (!needLedgeJump && !leftBlocked2High && !rightBlocked2High && this.bot.entity.isCollidedHorizontally) {
+    // Only jump on horizontal collision when NOT touching/sliding past a 2-high wall (prevents in-place jump stutter!)
+    if (!needLedgeJump && !centerBlocked2High && !leftBlocked2High && !rightBlocked2High && this.bot.entity.isCollidedHorizontally) {
       const centerCol = inspectColumnStep(this.bot, pos.x + fx * 0.7, pos.y, pos.z + fz * 0.7);
       if (!centerCol.blocked) {
         needLedgeJump = true;
       }
     }
 
-    return { needLedgeJump, leftBlocked2High, rightBlocked2High, overheadCobweb };
+    return { needLedgeJump, centerBlocked2High, leftBlocked2High, rightBlocked2High, overheadCobweb };
   }
 
   _updateDynamicSpacingAndStrafe(reachDist, aimStatus) {
@@ -1318,12 +1321,13 @@ class CombatModule {
     );
     const canSprint = facingTarget && this.bot.food > 6;
 
-    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips, 2-high block corners, or 3-high cobwebs)
+    // 3-ray shoulder & ledge check (prevents getting caught on 1-block lips, 2-high walls/corners, or 3-high cobwebs)
     const yaw = this.bot.entity.yaw;
-    const { needLedgeJump, leftBlocked2High, rightBlocked2High, overheadCobweb } = this._inspectForwardAndShoulders(yaw);
+    const { needLedgeJump, centerBlocked2High, leftBlocked2High, rightBlocked2High, overheadCobweb } = this._inspectForwardAndShoulders(yaw);
 
-    // Slide cleanly away from a snagged 2-high corner edge with 4-tick hysteresis (eliminates 20-Hz A/D jitter!)
+    // Slide cleanly away from a 2-high corner OR flat wall directly in front (with hysteresis to prevent 20-Hz jitter)
     let edgeSlideDir = 0;
+    const wallDirectlyAhead = centerBlocked2High || (leftBlocked2High && rightBlocked2High);
     if (leftBlocked2High && !rightBlocked2High) {
       this.strafeDirection = 1;
       this._edgeSlideDir = 1;
@@ -1334,6 +1338,20 @@ class CombatModule {
       this._edgeSlideDir = -1;
       this._edgeSlideHoldTicks = 4;
       edgeSlideDir = -1;
+    } else if (wallDirectlyAhead) {
+      // Touching/facing a flat wall head-on -> slide parallel along the open lateral side instead of grinding into the wall!
+      const rightOpen = this._isStrafeDirectionSafe(1);
+      const leftOpen = this._isStrafeDirectionSafe(-1);
+      if (rightOpen && !leftOpen) {
+        edgeSlideDir = 1;
+      } else if (leftOpen && !rightOpen) {
+        edgeSlideDir = -1;
+      } else {
+        edgeSlideDir = this._edgeSlideDir || this.strafeDirection || 1;
+      }
+      this.strafeDirection = edgeSlideDir;
+      this._edgeSlideDir = edgeSlideDir;
+      this._edgeSlideHoldTicks = 5;
     } else if (this._edgeSlideHoldTicks > 0) {
       this._edgeSlideHoldTicks--;
       edgeSlideDir = this._edgeSlideDir || 0;
@@ -1342,7 +1360,14 @@ class CombatModule {
     const allowJump = !overheadCobweb || inWater;
     const shouldClimbOrSwim = inWater || (allowJump && onGround && needLedgeJump);
 
-    if (reachDist > chaseDist) {
+    if (wallDirectlyAhead && !needLedgeJump) {
+      // Facing/touching a 2-high wall: slide smoothly around the open side (only release forward when flush/colliding)
+      const touchingWall = Boolean(this.bot.entity.isCollidedHorizontally);
+      this.bot.setControlState('forward', !touchingWall);
+      this.bot.setControlState('back', touchingWall && this._isBackpedalSafe());
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('jump', inWater);
+    } else if (reachDist > chaseDist) {
       // > 3.2 blocks: Sprint-jump chase toward target (always swim up in water; suppress jump under 3-high cobweb)
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);

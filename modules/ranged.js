@@ -1006,8 +1006,8 @@ class RangedModule {
     return {
       forwardSafe: this.isDirectionSafe(yaw, 1.1),
       backSafe: this.isDirectionSafe(yaw + Math.PI, 1.05),
-      leftSafe: this.isDirectionSafe(yaw - Math.PI / 2, 1.1),
-      rightSafe: this.isDirectionSafe(yaw + Math.PI / 2, 1.1),
+      leftSafe: this.isDirectionSafe(yaw + Math.PI / 2, 1.1),
+      rightSafe: this.isDirectionSafe(yaw - Math.PI / 2, 1.1),
       inCobweb: this.isInCobweb()
     };
   }
