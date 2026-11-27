@@ -593,7 +593,7 @@ class PvPBotController {
 
     // 1d. Anti-Crystal / Anti-Anchor Defense
     if (!totemSwapActive && this.burst && this.burst.tickDefense(target)) {
-      if (this.combat) this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
@@ -802,7 +802,12 @@ class PvPBotController {
     }
 
     if (this.survival.needsHealing()) {
-      this.transitionState(STATES.HEALING, `gapple heal (${this.bot.health.toFixed(1)} HP)`);
+      // If enemy is right in melee range (< 5.0b) and we need to eat a gapple/food, RETREAT first so we don't eat in their face!
+      if (dist < 5.0 && !this.survival.findHealingPotion()) {
+        this.transitionState(STATES.RETREATING, `creating gap before heal (${this.bot.health.toFixed(1)} HP)`);
+      } else {
+        this.transitionState(STATES.HEALING, `gapple heal (${this.bot.health.toFixed(1)} HP)`);
+      }
       return;
     }
 
@@ -814,7 +819,7 @@ class PvPBotController {
 
     // 0. Inline quick-potting, combat buffs, & armor XP mending
     if (this.survival.tickInlineCombatHeal(target)) {
-      if (this.combat) this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
@@ -822,11 +827,8 @@ class PvPBotController {
     const weaponCooldownProgress = this.combat.getCooldownProgress();
     const skipShieldForHazard = Boolean(this.escape && this.escape.hasNearbyRailOrHazard(target));
     if (!skipShieldForHazard && this.survival.tickShield(target, weaponCooldownProgress)) {
+      if (this.combat) this.combat.resetTransientState();
       if (this.survival.shieldingForMace) {
-        if (this.combat && this.combat.usingPathfinder && this.bot.pathfinder) {
-          this.bot.pathfinder.setGoal(null);
-          this.combat.usingPathfinder = false;
-        }
         this.bot.setControlState('forward', false);
         this.bot.setControlState('left', false);
         this.bot.setControlState('right', false);
@@ -834,13 +836,20 @@ class PvPBotController {
         this.bot.setControlState('jump', false);
         this.aimer.stepTowardsEntity(target, { heightOffset: 0.9 });
       } else {
-        this.combat.stopMovement();
-        this.aimer.stepTowardsEntity(target);
+        // Stay mobile while shielding (defensive strafe + micro-backpedal facing opponent, never stand like a statue!)
+        this.aimer.stepTowardsEntity(target, { speedMultiplier: 1.65 });
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('back', dist < 3.2);
+        this.bot.setControlState('left', this.combat ? this.combat.strafeDirection < 0 : false);
+        this.bot.setControlState('right', this.combat ? this.combat.strafeDirection >= 0 : false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
       }
       return;
     }
 
     if (!skipShieldForHazard && this.survival.maceAntiStunActive) {
+      if (this.combat) this.combat.resetTransientState();
       this.aimer.stepTowardsEntity(target, { heightOffset: 0.9 });
       this.bot.setControlState('forward', false);
       this.bot.setControlState('back', true);
@@ -854,24 +863,25 @@ class PvPBotController {
     // 1c. Red Wool Radius Exit
     if (this.redWoolZone && this.redWoolZone.tick(target, { allowSprint: true })) {
       if (this.burst && this.burst.state !== 'IDLE') this.burst.cancel();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
     // 2. Aerial Mace / Elytra-Rocket / Pearl-Catch / Spear-Mace PvP
     if (this.config.aerial && this.config.aerial.enabled !== false && this.aerial && this.aerial.tick(target)) {
-      this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
     // 3. End Crystal & Respawn Anchor PvP
     if (this.burst && this.burst.tick(target)) {
-      this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
     // 3b. Optional Cart PvP (0 CPU when config.cart.enabled !== true)
     if (this.cart && this.cart.tick(target)) {
-      this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 
@@ -880,7 +890,7 @@ class PvPBotController {
       this.ranged.tryEnderPearl(target, 'chase') || this.ranged.tryCloseUtility(target);
     }
     if (this.ranged.tick(target)) {
-      this.combat.releaseControl();
+      if (this.combat) this.combat.resetTransientState();
       return;
     }
 

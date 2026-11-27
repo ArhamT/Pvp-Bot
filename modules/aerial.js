@@ -557,8 +557,12 @@ class AerialModule {
     this.lastBotPos = curPos.clone();
     this.targetState = (target && target.isValid) ? buildTargetState(target) : null;
 
-    if (this.trackedEnemyPearl && Date.now() > this.trackedEnemyPearl.expiresAt) {
-      this.trackedEnemyPearl = null;
+    if (this.trackedEnemyPearl) {
+      if (Date.now() > this.trackedEnemyPearl.expiresAt) {
+        this.trackedEnemyPearl = null;
+      } else if (typeof this._updateTrackedEnemyPearl === 'function') {
+        this._updateTrackedEnemyPearl();
+      }
     }
 
     if (this.mode === AERIAL_MODES.IDLE && this.pendingChestplateRestore && this._isSafeToRestoreChestplate()) {
@@ -670,22 +674,39 @@ class AerialModule {
     return false;
   }
 
+  /**
+   * High-Tier PD Velocity-Compensated 360° Air-Steering:
+   * Actively steers W/A/S/D + sprint in mid-air to intercept moving targets cleanly on Mace descent,
+   * and applies air-braking when horizontal momentum would overshoot past the enemy's head!
+   */
   _steerAirborneToward(target, leadTicks = 2) {
     const aimStatus = this._aimAtTarget(target, leadTicks, {
-      speedMultiplier: 2.0,
+      speedMultiplier: 2.1,
       toleranceRad: 0.36
     });
 
     const pos = this.bot.entity.position;
+    const vel = this.bot.entity.velocity || new Vec3(0, 0, 0);
     const predPos = this._getPredictedPosition(target, leadTicks);
-    const dx = predPos.x - pos.x;
-    const dz = predPos.z - pos.z;
-    const horizDist = Math.sqrt(dx * dx + dz * dz);
+
+    // Estimate remaining fall ticks to target height for velocity-damped interception (prevents air overshoot!)
+    const dyAbove = Math.max(0, pos.y - predPos.y);
+    const estFallTicks = clamp(dyAbove / Math.max(0.35, Math.abs(vel.y || 0) + 0.25), 0.5, 6.0);
+    const driftScale = Math.min(estFallTicks, 3.2) * 0.42;
+
+    const rawDx = predPos.x - pos.x;
+    const rawDz = predPos.z - pos.z;
+    const horizDist = Math.hypot(rawDx, rawDz);
+
+    // Velocity-compensated desired horizontal correction vector
+    const errX = predPos.x - (pos.x + (vel.x || 0) * driftScale);
+    const errZ = predPos.z - (pos.z + (vel.z || 0) * driftScale);
+    const errDist = Math.hypot(errX, errZ);
 
     if (typeof this.bot.setControlState === 'function') {
-      if (horizDist > 0.65) {
-        const nx = dx / horizDist;
-        const nz = dz / horizDist;
+      if (errDist > 0.22) {
+        const nx = errX / errDist;
+        const nz = errZ / errDist;
         const yaw = this.bot.entity.yaw || 0;
         const fx = -Math.sin(yaw);
         const fz = -Math.cos(yaw);
@@ -695,18 +716,22 @@ class AerialModule {
         const fwdDot = nx * fx + nz * fz;
         const rightDot = nx * rx + nz * rz;
 
-        const moveFwd = fwdDot > 0.25;
+        const moveFwd = fwdDot > 0.16;
+        const moveBack = fwdDot < -0.20;
         this.bot.setControlState('forward', moveFwd);
-        this.bot.setControlState('back', fwdDot < -0.35);
-        this.bot.setControlState('right', rightDot > 0.25);
-        this.bot.setControlState('left', rightDot < -0.25);
-        this.bot.setControlState('sprint', moveFwd && horizDist > 1.35);
+        this.bot.setControlState('back', moveBack);
+        this.bot.setControlState('right', rightDot > 0.18);
+        this.bot.setControlState('left', rightDot < -0.18);
+        // Sprint in mid-air for stronger horizontal air acceleration when > 1.2b offset (mace_combos drops sprint on hit)
+        this.bot.setControlState('sprint', moveFwd && horizDist > 1.2 && !moveBack);
+        this.bot.setControlState('jump', false);
       } else {
         this.bot.setControlState('forward', false);
-        this.bot.setControlState('back', horizDist < 0.35);
+        this.bot.setControlState('back', false);
         this.bot.setControlState('left', false);
         this.bot.setControlState('right', false);
         this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
       }
     }
 

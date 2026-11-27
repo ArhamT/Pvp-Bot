@@ -115,26 +115,34 @@ class CombatModule {
     const weaponRole = this._updateWeaponForTarget(target, reachDist, true);
     const cooldown = this.getCooldownProgress();
 
-    // 2. Aim at predicted hitbox torso (3–5 tick MC physics lead when moving)
-    let aimPoint = target.position.offset(0, (target.height || 1.8) * 0.72, 0);
-    if (this.prediction && typeof this.prediction.predictIntersection === 'function' && reachDist > 2.2) {
-      const pred = this.prediction.predictIntersection(target);
-      if (pred && pred.torso) {
-        aimPoint = pred.torso;
+    // 2. Aim directly at closest reachable point on target's 3D hitbox (tight clamped lead in melee!)
+    let aimStatus = { aligned: true, yawErrorDeg: 0, pitchErrorDeg: 0 };
+    if (this.aimer) {
+      if (reachDist <= 4.2) {
+        aimStatus = this.aimer.stepTowardsEntity(target, {
+          leadTicks: reachDist <= 2.6 ? 0.55 : 0.9,
+          maxLeadBlocks: 0.28,
+          speedMultiplier: 1.7,
+          toleranceRad: 0.26
+        });
+      } else {
+        let aimPoint = target.position.offset(0, (target.height || 1.8) * 0.68, 0);
+        if (this.prediction && typeof this.prediction.predictIntersection === 'function') {
+          const pred = this.prediction.predictIntersection(target);
+          if (pred && pred.torso) aimPoint = pred.torso;
+        }
+        aimStatus = this.aimer.stepTowardsPoint(aimPoint, { speedMultiplier: 1.55, toleranceRad: 0.28 });
       }
     }
-    const aimStatus = this.aimer
-      ? this.aimer.stepTowardsPoint(aimPoint, { speedMultiplier: 1.45, toleranceRad: 0.22 })
-      : { aligned: true };
 
     // 3. Determine whether we are setting up a falling critical hit (drops sprint 1 tick early)
-    const preparingCrit = this._shouldPrepareFallingCrit(target, reachDist, cooldown);
+    const critPlan = this._shouldPrepareFallingCrit(target, reachDist, cooldown, weaponRole);
 
-    // 4. Execute dynamic spacing, reactive strafing, W/S-tap, and jump-reset
-    this._updateDynamicSpacingAndStrafe(target, reachDist, horizDist, targetYaw, preparingCrit);
+    // 4. Execute HT1 dynamic spacing, reactive circle-strafing, W/S-tap, crit-hop, and jump-reset
+    this._updateDynamicSpacingAndStrafe(target, reachDist, horizDist, targetYaw, critPlan, cooldown, weaponRole);
 
     // 5. Strike when aligned, in reach, LOS-clear, and cooldown-ready
-    this._updateAttackAndCrits(target, reachDist, weaponRole, aimStatus.aligned);
+    this._updateAttackAndCrits(target, reachDist, weaponRole, aimStatus.aligned || aimStatus.yawErrorDeg <= 18);
   }
 }
 

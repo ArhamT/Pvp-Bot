@@ -43,23 +43,27 @@ function calculateLookAngles(fromPos, toPos) {
 }
 
 /**
- * Smooth head-rotation controller designed to run once per 20-TPS (50ms) tick.
- * Uses exponential smoothing + per-tick angular velocity clamping + subtle human-like micro-jitter
- * so the bot never produces instant 180-degree head snaps.
+ * High-Tier Smooth Head-Rotation & AABB Hitbox Targeting Controller (20-TPS):
+ * - Computes optimal closest-point-on-hitbox aim points so melee tracking stays glued to strafing players
+ * - Uses adaptive responsive easing with per-tick angular caps (no sluggish lag behind fast strafers)
+ * - Routes all normal rotations cleanly via `bot.look(yaw, pitch, false)` (anti-cheat safe)
+ * - Eliminates micro-jitter once locked within 4° of target
  */
 class SmoothAimer {
   constructor(bot, physicsConfig) {
+    const cfg = physicsConfig || {};
     this.bot = bot;
-    this.maxYawStep = (physicsConfig.maxYawStepDeg || 16) * DEG_TO_RAD;
-    this.maxPitchStep = (physicsConfig.maxPitchStepDeg || 12) * DEG_TO_RAD;
-    this.smoothing = clamp(physicsConfig.aimSmoothing || 0.35, 0.05, 0.9);
-    this.jitterRad = (physicsConfig.aimJitterDeg || 0.35) * DEG_TO_RAD;
-    this.toleranceRad = (physicsConfig.aimToleranceDeg || 6) * DEG_TO_RAD;
-    this.combatForceLook = Boolean(physicsConfig && physicsConfig.combatForceLook);
+    this.maxYawStep = Math.max(36, cfg.maxYawStepDeg || 44) * DEG_TO_RAD;
+    this.maxPitchStep = Math.max(28, cfg.maxPitchStepDeg || 34) * DEG_TO_RAD;
+    this.smoothing = clamp(cfg.aimSmoothing !== undefined ? Math.max(0.62, cfg.aimSmoothing) : 0.72, 0.1, 0.92);
+    this.jitterRad = (cfg.aimJitterDeg !== undefined ? Math.min(0.25, cfg.aimJitterDeg) : 0.2) * DEG_TO_RAD;
+    this.toleranceRad = (cfg.aimToleranceDeg || 8) * DEG_TO_RAD;
+    // Keep normal tracking smooth; only instant-snap when caller explicitly passes `{ force: true }`
+    this.combatForceLook = false;
   }
 
   /**
-   * Returns the bot's eye position as a Vec3.
+   * Returns the bot's exact eye position as a Vec3 (handles elytra, sneaking, standing).
    */
   getEyePosition() {
     const pos = this.bot.entity.position;
@@ -74,61 +78,112 @@ class SmoothAimer {
   }
 
   /**
-   * Performs one smooth interpolation step toward target yaw/pitch (in radians).
-   * Returns { aligned: boolean, yawErrorDeg: number, pitchErrorDeg: number }.
+   * Computes the optimal reachable aim point on an entity's 3D AABB hitbox.
+   * Clamps eye coordinates into the inner hitbox volume `[±0.24, +0.25..height-0.14]`
+   * and optionally blends a tiny clamped velocity lead so melee crosshair NEVER drifts off-body.
+   */
+  getBestHitboxAimPoint(entity, options = {}) {
+    const pos = entity.position;
+    const height = entity.height || 1.8;
+
+    if (options.heightOffset !== undefined) {
+      const lead = options.leadTicks || 0;
+      const vel = entity.velocity || { x: 0, y: 0, z: 0 };
+      const maxLead = options.maxLeadBlocks !== undefined ? options.maxLeadBlocks : 0.35;
+      const lx = clamp((vel.x || 0) * lead, -maxLead, maxLead);
+      const ly = clamp((vel.y || 0) * lead * 0.5, -0.35, 0.35);
+      const lz = clamp((vel.z || 0) * lead, -maxLead, maxLead);
+      return new Vec3(pos.x + lx, pos.y + options.heightOffset + ly, pos.z + lz);
+    }
+
+    const eye = this.getEyePosition();
+    const lead = options.leadTicks !== undefined ? options.leadTicks : 0.65;
+    const maxLead = options.maxLeadBlocks !== undefined ? options.maxLeadBlocks : 0.28;
+    const vel = entity.velocity || { x: 0, y: 0, z: 0 };
+    const lx = clamp((vel.x || 0) * lead, -maxLead, maxLead);
+    const ly = clamp((vel.y || 0) * lead * 0.4, -0.25, 0.25);
+    const lz = clamp((vel.z || 0) * lead, -maxLead, maxLead);
+
+    const cx = pos.x + lx;
+    const cy = pos.y + ly;
+    const cz = pos.z + lz;
+
+    // Closest point inside inner hitbox (slightly biased toward upper chest for optimal reach & headshots)
+    const halfW = 0.22;
+    const minY = cy + 0.30;
+    const maxY = cy + Math.max(0.5, height - 0.16);
+    const preferredY = clamp(eye.y, minY, maxY);
+    const chestY = cy + height * 0.68;
+
+    const aimX = clamp(eye.x, cx - halfW, cx + halfW);
+    const aimY = preferredY * 0.65 + chestY * 0.35;
+    const aimZ = clamp(eye.z, cz - halfW, cz + halfW);
+    return new Vec3(aimX, aimY, aimZ);
+  }
+
+  /**
+   * Performs one responsive smooth rotation step toward target yaw/pitch (in radians).
+   * Returns `{ aligned, yawErrorDeg, pitchErrorDeg }`.
    */
   stepTowardsAngles(targetYaw, targetPitch, options = {}) {
-    if (!this.bot.entity) {
+    if (!this.bot || !this.bot.entity) {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
     }
 
-    const useForce = options.force !== undefined ? Boolean(options.force) : this.combatForceLook;
+    const clampedPitch = clamp(targetPitch, -Math.PI / 2, Math.PI / 2);
+    const useForce = options.force === true;
     if (useForce) {
       const nextYaw = normalizeAngle(targetYaw);
-      const nextPitch = clamp(targetPitch, -Math.PI / 2, Math.PI / 2);
       if (typeof this.bot.look === 'function') {
-        Promise.resolve(this.bot.look(nextYaw, nextPitch, true)).catch(() => {});
+        Promise.resolve(this.bot.look(nextYaw, clampedPitch, true)).catch(() => {});
       }
       return { aligned: true, yawErrorDeg: 0, pitchErrorDeg: 0 };
     }
 
-    const currentYaw = this.bot.entity.yaw;
-    const currentPitch = this.bot.entity.pitch;
+    const currentYaw = this.bot.entity.yaw || 0;
+    const currentPitch = this.bot.entity.pitch || 0;
 
     const yawDiff = normalizeAngle(targetYaw - currentYaw);
-    const pitchDiff = clamp(targetPitch, -Math.PI / 2, Math.PI / 2) - currentPitch;
+    const pitchDiff = clampedPitch - currentPitch;
 
     const speedMultiplier = options.speedMultiplier || 1.0;
     const maxYaw = this.maxYawStep * speedMultiplier;
     const maxPitch = this.maxPitchStep * speedMultiplier;
+    const gain = clamp(this.smoothing * Math.min(1.25, 0.85 + speedMultiplier * 0.2), 0.2, 0.92);
 
-    // Exponentially ease toward the target, clamped by per-tick angular velocity limits
-    let yawStep = clamp(yawDiff * this.smoothing, -maxYaw, maxYaw);
-    let pitchStep = clamp(pitchDiff * this.smoothing, -maxPitch, maxPitch);
+    let yawStep = clamp(yawDiff * gain, -maxYaw, maxYaw);
+    let pitchStep = clamp(pitchDiff * gain, -maxPitch, maxPitch);
 
-    // Ensure steady progress when far away so smoothing doesn't crawl on the final few degrees
-    if (Math.abs(yawDiff) > 0.01 && Math.abs(yawStep) < 0.008) {
-      yawStep = Math.sign(yawDiff) * Math.min(Math.abs(yawDiff), 0.012);
+    // Snap cleanly across tiny final deadzone (< 2.5°) so crosshair never crawls behind moving targets
+    if (Math.abs(yawDiff) <= 0.045) {
+      yawStep = yawDiff;
+    } else if (Math.abs(yawStep) < 0.018) {
+      yawStep = Math.sign(yawDiff) * Math.min(Math.abs(yawDiff), 0.024);
     }
-    if (Math.abs(pitchDiff) > 0.01 && Math.abs(pitchStep) < 0.008) {
-      pitchStep = Math.sign(pitchDiff) * Math.min(Math.abs(pitchDiff), 0.012);
+
+    if (Math.abs(pitchDiff) <= 0.045) {
+      pitchStep = pitchDiff;
+    } else if (Math.abs(pitchStep) < 0.015) {
+      pitchStep = Math.sign(pitchDiff) * Math.min(Math.abs(pitchDiff), 0.02);
     }
 
-    // Subtle micro-jitter when actively tracking (avoids robotic zero-variance rotation packets)
-    const addJitter = options.jitter !== false && (Math.abs(yawDiff) > 0.015 || Math.abs(pitchDiff) > 0.015);
+    // Subtle micro-jitter ONLY during larger sweeps (> 4°), zero jitter when locked on target
+    const addJitter = options.jitter !== false && (Math.abs(yawDiff) > 0.07 || Math.abs(pitchDiff) > 0.07);
     const jitterYaw = addJitter ? (Math.random() - 0.5) * this.jitterRad : 0;
-    const jitterPitch = addJitter ? (Math.random() - 0.5) * this.jitterRad * 0.6 : 0;
+    const jitterPitch = addJitter ? (Math.random() - 0.5) * this.jitterRad * 0.5 : 0;
 
     const nextYaw = normalizeAngle(currentYaw + yawStep + jitterYaw);
     const nextPitch = clamp(currentPitch + pitchStep + jitterPitch, -Math.PI / 2, Math.PI / 2);
 
-    // Skip redundant look updates when already aligned within ~0.45 deg (prevents unnecessary look packets)
-    if (Math.abs(normalizeAngle(nextYaw - currentYaw)) >= 0.008 || Math.abs(nextPitch - currentPitch) >= 0.008) {
-      this.bot.look(nextYaw, nextPitch, false).catch(() => {});
+    if (
+      typeof this.bot.look === 'function' &&
+      (Math.abs(normalizeAngle(nextYaw - currentYaw)) >= 0.004 || Math.abs(nextPitch - currentPitch) >= 0.004)
+    ) {
+      Promise.resolve(this.bot.look(nextYaw, nextPitch, false)).catch(() => {});
     }
 
     const remainingYaw = Math.abs(normalizeAngle(targetYaw - nextYaw));
-    const remainingPitch = Math.abs(targetPitch - nextPitch);
+    const remainingPitch = Math.abs(clampedPitch - nextPitch);
     const tolerance = options.toleranceRad !== undefined ? options.toleranceRad : this.toleranceRad;
 
     return {
@@ -142,7 +197,7 @@ class SmoothAimer {
    * Smoothly rotates one tick toward a world position (Vec3).
    */
   stepTowardsPoint(targetPos, options = {}) {
-    if (!this.bot.entity || !targetPos) {
+    if (!this.bot || !this.bot.entity || !targetPos) {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
     }
     const eyePos = this.getEyePosition();
@@ -151,26 +206,13 @@ class SmoothAimer {
   }
 
   /**
-   * Smoothly rotates one tick toward an entity's center/upper torso, with optional velocity lead.
+   * Smoothly rotates one tick toward the optimal reachable point on an entity's 3D hitbox.
    */
   stepTowardsEntity(entity, options = {}) {
-    if (!this.bot.entity || !entity || !entity.position) {
+    if (!this.bot || !this.bot.entity || !entity || !entity.position) {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
     }
-
-    const heightOffset = options.heightOffset !== undefined
-      ? options.heightOffset
-      : (entity.height ? entity.height * 0.72 : 1.3);
-
-    const leadTicks = options.leadTicks || 0;
-    const vel = entity.velocity || new Vec3(0, 0, 0);
-
-    const aimPoint = new Vec3(
-      entity.position.x + vel.x * leadTicks,
-      entity.position.y + heightOffset + vel.y * leadTicks * 0.5,
-      entity.position.z + vel.z * leadTicks
-    );
-
+    const aimPoint = this.getBestHitboxAimPoint(entity, options);
     return this.stepTowardsPoint(aimPoint, options);
   }
 
@@ -192,11 +234,11 @@ class SmoothAimer {
    * Returns angular error (in degrees) from the bot's current facing to a target point.
    */
   getAngleErrorToPoint(targetPos) {
-    if (!this.bot.entity || !targetPos) return 180;
+    if (!this.bot || !this.bot.entity || !targetPos) return 180;
     const eyePos = this.getEyePosition();
     const { yaw, pitch } = calculateLookAngles(eyePos, targetPos);
-    const dy = Math.abs(normalizeAngle(yaw - this.bot.entity.yaw));
-    const dp = Math.abs(pitch - this.bot.entity.pitch);
+    const dy = Math.abs(normalizeAngle(yaw - (this.bot.entity.yaw || 0)));
+    const dp = Math.abs(pitch - (this.bot.entity.pitch || 0));
     return Math.sqrt(dy * dy + dp * dp) * RAD_TO_DEG;
   }
 }

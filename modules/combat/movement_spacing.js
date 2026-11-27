@@ -8,12 +8,13 @@ const {
 const { normalizeAngle } = require('../aim');
 
 /**
- * High-tier Melee Spacing, Crosshair-Reactive Strafing, W/S-Tap & Jump-Reset
- * (`modules/combat/movement_spacing.js`):
- * - Opponent-crosshair-reactive strafing (strafes away from enemy's yaw sweep velocity)
- * - Cross-strafe-through instead of straight backpedaling at < tooCloseDistance
- * - Pre-emptive W-tap / distance-scaled S-tap sprint resets
- * - Knockback-verified Jump-Reset (protected from same-tick overwrite)
+ * High-Tier (HT1) Melee Spacing, Crosshair-Reactive Circle Strafing, W/S-Tap,
+ * Obstacle-Aware Chase, Crit-Hop Timing, & Jump-Reset (`modules/combat/movement_spacing.js`):
+ * - NEVER overwrites crit jumps or freezes in dead-zones at 2.0–2.65b
+ * - Axe-cooldown micro-kiting (steps to 2.9–3.3b while 1.0s Axe recharges, steps in at >=0.78)
+ * - Crosshair-reactive circle-strafing around opponent's blind side
+ * - Smart pillar/wall edge-sliding during chases
+ * - Exposes `resetTransientState()` so higher-priority modules never have their controls wiped!
  */
 const movementSpacingMethods = {
   _isDirectionYawSafe(yaw, dist = 1.2) {
@@ -32,19 +33,18 @@ const movementSpacingMethods = {
   },
 
   _scheduleNextStrafeSwitch() {
-    const minMs = this.combatCfg.strafeSwitchMinMs || 320;
-    const maxMs = this.combatCfg.strafeSwitchMaxMs || 750;
-    this.nextStrafeSwitchAt = Date.now() + minMs + Math.floor(Math.random() * Math.max(50, maxMs - minMs));
+    const minMs = this.combatCfg.strafeSwitchMinMs || 420;
+    const maxMs = this.combatCfg.strafeSwitchMaxMs || 900;
+    this.nextStrafeSwitchAt = Date.now() + minMs + Math.floor(Math.random() * Math.max(80, maxMs - minMs));
   },
 
   _updateReactiveStrafeDirection(target, targetYaw) {
     const now = Date.now();
-    // Track opponent crosshair angular velocity to dodge into their blind side
+    // React to opponent crosshair sweep velocity to dodge into their blind side
     if (target && typeof target.yaw === 'number') {
       if (this._enemyPrevYaw !== null) {
         const yawDelta = normalizeAngle(target.yaw - this._enemyPrevYaw);
-        if (Math.abs(yawDelta) > 0.14 && (now - this._lastReactiveFlipAt) > 220) {
-          // Strafe opposite to opponent's yaw sweep direction
+        if (Math.abs(yawDelta) > 0.16 && (now - this._lastReactiveFlipAt) > 260) {
           const desired = yawDelta > 0 ? -1 : 1;
           if (this._isStrafeDirectionSafe(targetYaw, desired)) {
             this.strafeDirection = desired;
@@ -75,7 +75,7 @@ const movementSpacingMethods = {
     if (this.combatCfg.wTapEnabled === false) return;
     const minT = this.combatCfg.wTapMinTicks || 1;
     const maxT = this.combatCfg.wTapMaxTicks || 2;
-    const sTapMax = this.combatCfg.sTapMaxDistance || 2.45;
+    const sTapMax = this.combatCfg.sTapMaxDistance || 2.35;
     this.wTapTicksRemaining = minT + (maxT > minT ? Math.floor(Math.random() * (maxT - minT + 1)) : 0);
     this.useSTap = dist < sTapMax;
   },
@@ -84,20 +84,23 @@ const movementSpacingMethods = {
     if (this.combatCfg.jumpResetEnabled === false || !this.bot || !this.bot.entity) return;
     if (!this.bot.entity.onGround) return;
     const horizKb = Math.sqrt(vx * vx + vz * vz);
-    // Real player-hit knockback has meaningful outward horizontal impulse (>0.16 b/t) + upward lift
-    if (horizKb >= 0.16 && vy >= 0.12) {
+    if (horizKb >= 0.15 && vy >= 0.11) {
       this.jumpResetTicksRemaining = 1;
     }
   },
 
-  _updateDynamicSpacingAndStrafe(target, reachDist, horizDist, targetYaw, preparingCrit = false) {
+  _updateDynamicSpacingAndStrafe(target, reachDist, horizDist, targetYaw, critPlan = null, cooldown = 1.0, weaponRole = 'sword') {
     if (!this.bot || !this.bot.entity || typeof this.bot.setControlState !== 'function') return;
 
     this._updateReactiveStrafeDirection(target, targetYaw);
 
-    const optMin = this.combatCfg.optimalReachMin || 2.65;
+    const preparingCrit = Boolean(critPlan && (critPlan === true || critPlan.preparingCrit));
+    const wantCritJump = Boolean(critPlan && critPlan.wantCritJump);
+    const onGround = Boolean(this.bot.entity.onGround);
+
+    const optMin = this.combatCfg.optimalReachMin || 2.55;
     const optMax = this.combatCfg.optimalReachMax || 2.95;
-    const tooClose = this.combatCfg.tooCloseDistance || 2.0;
+    const tooClose = this.combatCfg.tooCloseDistance || 1.85;
     const chaseDist = this.combatCfg.chaseDistance || 3.15;
 
     // 1. Knockback-verified Jump-Reset (protected for this tick!)
@@ -106,14 +109,14 @@ const movementSpacingMethods = {
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
       this.bot.setControlState('sprint', !preparingCrit && this.bot.food > 6);
-      this.bot.setControlState('jump', Boolean(this.bot.entity.onGround));
+      this.bot.setControlState('jump', onGround);
       this.bot.setControlState('left', this.strafeDirection < 0);
       this.bot.setControlState('right', this.strafeDirection > 0);
       return;
     }
 
-    // 2. W-Tap / S-Tap Sprint Reset window (1-2 ticks)
-    if (this.wTapTicksRemaining > 0) {
+    // 2. Crisp 1–2 tick W-Tap / S-Tap Sprint Reset window right after landing a hit
+    if (this.wTapTicksRemaining > 0 && !wantCritJump) {
       this.wTapTicksRemaining--;
       const safeBack = this.useSTap && this._isBackpedalSafe(targetYaw);
       this.bot.setControlState('forward', false);
@@ -125,34 +128,39 @@ const movementSpacingMethods = {
       return;
     }
 
-    // 3. Step-up / obstacle check ahead when chasing
+    // 3. Obstacle / step-up inspection ahead during chase or close engagement
     const pos = this.bot.entity.position;
     let stepUpJump = false;
     let wallBlocked = false;
     if (reachDist > optMax) {
-      const col = inspectColumnStep(this.bot, pos.x - Math.sin(targetYaw) * 0.9, pos.y, pos.z - Math.cos(targetYaw) * 0.9);
-      stepUpJump = Boolean(col.needsJump && !col.blocked);
-      wallBlocked = Boolean(col.blocked);
+      const col = inspectColumnStep(this.bot, pos.x - Math.sin(targetYaw) * 0.95, pos.y, pos.z - Math.cos(targetYaw) * 0.95);
+      stepUpJump = Boolean(col.needsJump && !col.blocked && !col.hasHazard);
+      wallBlocked = Boolean(col.blocked || col.hasHazard);
     }
 
     let forward = false;
     let back = false;
     let sprint = false;
-    let jump = false;
+    let jump = wantCritJump && onGround;
+
+    // Axe-only cooldown kiting: step slightly out to 2.9–3.3b while 1.0s Axe recharges, then burst back in!
+    const axeCooldownKite = weaponRole === 'axe' && cooldown < 0.72 && reachDist < 2.95 && !preparingCrit;
 
     if (reachDist > chaseDist) {
       forward = true;
       sprint = !preparingCrit && this.bot.food > 6;
-      // Sprint-jump chase when far (>5b) or stepping up a 1-block ledge
-      if (stepUpJump || (horizDist > 5.0 && this.bot.entity.onGround && !preparingCrit)) {
+      if (stepUpJump || (horizDist > 4.8 && onGround && !preparingCrit && !wallBlocked)) {
         jump = true;
       }
       if (wallBlocked) {
         if (this._edgeSlideHoldTicks <= 0) {
-          this._edgeSlideDir = this._isStrafeDirectionSafe(targetYaw, this.strafeDirection)
-            ? this.strafeDirection
-            : -this.strafeDirection;
-          this._edgeSlideHoldTicks = 6;
+          // Pick whichever side around the pillar/wall is actually open
+          const rightOpen = this._isStrafeDirectionSafe(targetYaw, 1);
+          const leftOpen = this._isStrafeDirectionSafe(targetYaw, -1);
+          if (rightOpen && !leftOpen) this._edgeSlideDir = 1;
+          else if (leftOpen && !rightOpen) this._edgeSlideDir = -1;
+          else this._edgeSlideDir = this.strafeDirection;
+          this._edgeSlideHoldTicks = 8;
         }
         this._edgeSlideHoldTicks--;
       } else {
@@ -161,31 +169,48 @@ const movementSpacingMethods = {
     } else if (reachDist > optMax) {
       forward = true;
       sprint = !preparingCrit && this.bot.food > 6;
-      jump = stepUpJump;
+      jump = jump || stepUpJump;
+    } else if (axeCooldownKite) {
+      // Micro-kite while Axe recharges so enemy can't get free sword hits on us
+      back = this._isBackpedalSafe(targetYaw);
+      forward = !back;
+      sprint = false;
     } else if (reachDist < tooClose) {
-      // Cross-strafe-through when backed near hazard, otherwise brief S-spacing
+      // Cross-strafe / brief S-spacing to stay at edge of reach
       back = this._isBackpedalSafe(targetYaw);
       forward = !back;
       sprint = false;
     } else if (reachDist < optMin) {
-      forward = false;
-      back = false;
-      sprint = false;
+      // NEVER stand dead still! Keep forward pressure when swing is ready, or fluid circle-strafe otherwise
+      if (cooldown >= 0.78 || wantCritJump) {
+        forward = true;
+        sprint = !preparingCrit && this.bot.food > 6;
+      } else {
+        // Brief micro-space while circling so opponent misses their counter-swing
+        back = reachDist < 2.25 && this._isBackpedalSafe(targetYaw);
+        forward = !back && reachDist >= 2.35;
+        sprint = false;
+      }
     } else {
-      // Sweet spot (2.65–2.95b): hold forward pressure for crisp sprint-hits
+      // Sweet spot (2.55–2.95b): crisp forward sprint-pressure (or sprint-dropped falling crit!)
       forward = true;
       sprint = !preparingCrit && this.bot.food > 6;
     }
 
-    // Strafe controls (pause briefly on micro-juke or wall-slide override)
+    // Smooth circle-strafe around opponent (or wall-slide override when blocked)
     let left = false;
     let right = false;
     const effectiveDir = this._edgeSlideHoldTicks > 0 ? this._edgeSlideDir : this.strafeDirection;
-    if (horizDist <= 5.5 || this._edgeSlideHoldTicks > 0) {
+    if (horizDist <= 6.2 || this._edgeSlideHoldTicks > 0) {
       if (this._isStrafeDirectionSafe(targetYaw, effectiveDir)) {
         left = effectiveDir < 0;
         right = effectiveDir > 0;
       }
+    }
+
+    // Never sprint during a falling crit (MC cancels crit if sprinting on hit!)
+    if (preparingCrit) {
+      sprint = false;
     }
 
     this.bot.setControlState('forward', forward);
@@ -194,6 +219,23 @@ const movementSpacingMethods = {
     this.bot.setControlState('right', right);
     this.bot.setControlState('sprint', sprint);
     this.bot.setControlState('jump', jump);
+  },
+
+  /**
+   * Clears transient combat timers/pathfinder WITHOUT wiping movement controls.
+   * Call this when another subsystem (`aerial`, `survival`, `burst`, `ranged`, `cart`) owns the tick!
+   */
+  resetTransientState() {
+    if (this.usingPathfinder && this.bot && this.bot.pathfinder) {
+      try { this.bot.pathfinder.setGoal(null); } catch (_) {}
+      this.usingPathfinder = false;
+    }
+    this.wTapTicksRemaining = 0;
+    this.jumpResetTicksRemaining = 0;
+    this.hitSelectDelayTicks = 0;
+    this.pendingBreachSwap = false;
+    this._edgeSlideHoldTicks = 0;
+    this.strafePauseTicks = 0;
   },
 
   stopMovement() {
@@ -206,13 +248,8 @@ const movementSpacingMethods = {
 
   releaseControl() {
     this.stopMovement();
-    this.wTapTicksRemaining = 0;
-    this.jumpResetTicksRemaining = 0;
-    this.hitSelectDelayTicks = 0;
-    this.pendingBreachSwap = false;
-    this._edgeSlideHoldTicks = 0;
+    this.resetTransientState();
     this._edgeSlideDir = 1;
-    this.strafePauseTicks = 0;
     this.lastBotCheckPos = null;
     this._enemyPrevYaw = null;
   }

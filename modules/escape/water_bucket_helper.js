@@ -1,15 +1,14 @@
 'use strict';
 
+const { Vec3 } = require('vec3');
 const { findInventoryItem, ensureItemHeld, findNearestLiquidSource } = require('../inventory_utils');
 
 /**
  * Unified anti-cheat-safe Water Bucket FSM (`EQUIP_PLACE -> PICKUP_WAIT`)
  * shared by Cobweb Escape, Fire Extinguish, and Lava Escape.
- * Enforces:
- * - 1-tick post-swap settle (`!eq.swapped && eq.held`)
- * - Aim alignment check before `activateItem(false)`
- * - Nether dimension guard (water evaporates in Nether)
- * - Clean bucket pickup recovery
+ * - Aims at the solid floor block beneath cobwebs/feet & places via `activateBlock`/`activateItem` reliably
+ * - Enforces 1-tick post-swap settle (`!eq.swapped && eq.held`) and aim alignment
+ * - Nether dimension guard + place timeout so it never stalls forever
  */
 class WaterBucketController {
   constructor(bot, aimer) {
@@ -19,6 +18,7 @@ class WaterBucketController {
     this.kind = null; // 'cobweb' | 'fire' | 'lava'
     this.targetPos = null;
     this.ticks = 0;
+    this.placeTicks = 0;
     this.lastPlacedAt = { cobweb: 0, fire: 0, lava: 0 };
     this.failedUntil = { cobweb: 0, fire: 0, lava: 0 };
   }
@@ -33,6 +33,7 @@ class WaterBucketController {
     this.kind = null;
     this.targetPos = null;
     this.ticks = 0;
+    this.placeTicks = 0;
   }
 
   isInNether() {
@@ -58,8 +59,7 @@ class WaterBucketController {
 
   /**
    * Advances or starts a water-bucket place-and-pickup cycle.
-   * `options`: `{ kind, aimPoint, pitchOverride, pickupTicks, checkStillNeeded }`
-   * Returns `true` while owning the tick, `false` once finished/aborted.
+   * `options`: `{ kind, targetPos, aimPoint, pitchOverride, pickupTicks, checkStillNeeded }`
    */
   tick(options) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position || this.isInNether()) {
@@ -69,7 +69,7 @@ class WaterBucketController {
 
     const now = Date.now();
     const kind = options.kind;
-    const pickupTicks = options.pickupTicks !== undefined ? options.pickupTicks : 4;
+    const pickupTicks = options.pickupTicks !== undefined ? options.pickupTicks : 5;
 
     if (this.state === 'PICKUP_WAIT' && this.kind === kind) {
       this.ticks--;
@@ -77,10 +77,10 @@ class WaterBucketController {
       const emptyBucket = findInventoryItem(this.bot, 'bucket');
       const waterSrc = this.findNearestWater(this.targetPos || this.bot.entity.position, 3);
 
-      // Give server >= 1 tick for water to clear cobweb/fire before scooping
+      // Give server >= 1 tick for water to break cobweb/extinguish fire before scooping back
       if (this.ticks <= Math.max(1, pickupTicks - 1) && emptyBucket && waterSrc && (!stillNeeded || this.ticks <= 2)) {
         const aim = this.aimer
-          ? this.aimer.stepTowardsPoint(waterSrc.offset(0.5, 0.35, 0.5), { speedMultiplier: 1.85, toleranceRad: 0.25 })
+          ? this.aimer.stepTowardsPoint(waterSrc.offset(0.5, 0.35, 0.5), { speedMultiplier: 2.0, toleranceRad: 0.28 })
           : { aligned: true };
         const eq = ensureItemHeld(this.bot, emptyBucket);
         if (!eq.swapped && eq.held && aim.aligned) {
@@ -95,7 +95,7 @@ class WaterBucketController {
 
       if (this.ticks <= 0 || (!stillNeeded && !emptyBucket)) {
         if (stillNeeded) {
-          this.failedUntil[kind] = now + 2800;
+          this.failedUntil[kind] = now + 2200;
         }
         this.cancel();
         return false;
@@ -110,21 +110,47 @@ class WaterBucketController {
       return false;
     }
 
+    if (this.state !== 'EQUIP_PLACE' || this.kind !== kind) {
+      this.placeTicks = 0;
+    }
     this.kind = kind;
     this.state = 'EQUIP_PLACE';
+    this.placeTicks++;
+
+    if (this.placeTicks > 8) {
+      this.failedUntil[kind] = now + 2200;
+      this.cancel();
+      return false;
+    }
+
     if (options.targetPos) {
       this.targetPos = options.targetPos.floored();
     } else if (!this.targetPos) {
       this.targetPos = this.bot.entity.position.floored();
     }
 
+    // For cobweb/feet placement, target the TOP face of the solid floor block beneath `targetPos`
+    // so Minecraft's bucket raycast hits the solid block and places water directly into the cobweb!
+    let floorBlock = null;
+    if (typeof this.bot.blockAt === 'function' && this.targetPos) {
+      const below = this.bot.blockAt(this.targetPos.offset(0, -1, 0));
+      if (below && below.boundingBox === 'block') {
+        floorBlock = below;
+      }
+    }
+
     let aim = { aligned: true };
     if (this.aimer) {
-      if (options.aimPoint) {
-        aim = this.aimer.stepTowardsPoint(options.aimPoint, { speedMultiplier: 1.85, toleranceRad: 0.25 });
+      if (floorBlock && kind === 'cobweb') {
+        aim = this.aimer.stepTowardsPoint(floorBlock.position.offset(0.5, 0.98, 0.5), {
+          speedMultiplier: 2.2,
+          toleranceRad: 0.25
+        });
+      } else if (options.aimPoint) {
+        aim = this.aimer.stepTowardsPoint(options.aimPoint, { speedMultiplier: 2.1, toleranceRad: 0.25 });
       } else {
         const pitch = options.pitchOverride !== undefined ? options.pitchOverride : -Math.PI / 2;
-        aim = this.aimer.stepTowardsAngles(this.bot.entity.yaw, pitch, { speedMultiplier: 1.85, toleranceRad: 0.25 });
+        aim = this.aimer.stepTowardsAngles(this.bot.entity.yaw, pitch, { speedMultiplier: 2.1, toleranceRad: 0.25 });
       }
     }
 
@@ -133,12 +159,22 @@ class WaterBucketController {
       return true;
     }
 
-    if (typeof this.bot.activateItem === 'function') {
+    // Use activateItem (buckets are instant use_item raycast in vanilla; if floorBlock exists on Spigot/Paper,
+    // placeBlock on floorBlock top face ALSO dispatches block_place into the cobweb voxel!)
+    if (floorBlock && kind === 'cobweb' && typeof this.bot.placeBlock === 'function') {
+      Promise.resolve(this.bot.placeBlock(floorBlock, new Vec3(0, 1, 0))).catch(() => {
+        if (typeof this.bot.activateItem === 'function') {
+          try { this.bot.activateItem(false); } catch (_) {}
+        }
+      });
+    } else if (typeof this.bot.activateItem === 'function') {
       this.bot.activateItem(false);
     }
+
     this.lastPlacedAt[kind] = now;
     this.state = 'PICKUP_WAIT';
     this.ticks = pickupTicks;
+    this.placeTicks = 0;
     return true;
   }
 }

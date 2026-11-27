@@ -2,15 +2,27 @@
 
 const { Vec3 } = require('vec3');
 const { isAirLike, inspectColumnStep } = require('../constants');
+const { normalizeAngle } = require('../aim');
 const { findItemByPredicate, ensureItemHeld } = require('../inventory_utils');
 const { canSeeBlockFace } = require('../placement_los');
 const { LOS_BLOCK_NAMES } = require('./constants');
 
+const FULL_FAN_OFFSETS = [
+  0,
+  0.42, -0.42,
+  0.85, -0.85,
+  1.28, -1.28,
+  1.72, -1.72,
+  2.20, -2.20,
+  Math.PI
+];
+
 /**
- * Retreat, Evasive Heal-Walk, & LOS Cover Block Skill (`modules/survival/retreat_heal.js`):
- * - Hitbox-verified LOS cover block placement (never clips bot or target!)
- * - Smooth-aimed evasion (no hardcoded instant look snaps)
- * - Cleanly coordinates splash healing, drinkable healing, and Golden Apple eating
+ * High-Tier Retreat, Obstacle-Routing Heal-Walk, & LOS Cover Block Skill (`modules/survival/retreat_heal.js`):
+ * - 12-direction 2-step lookahead navigation around walls, pillars, fences, and arena corners
+ * - Real-time stuck detection (`_updateRetreatObstacleSteering`): automatically changes direction and
+ *   locks a clean detour yaw for 16–24 ticks when blocked or cornered
+ * - Hitbox-verified LOS cover block placement + seamless splash/drink/gapple coordination
  */
 const retreatHealMethods = {
   findLosBuildingBlock() {
@@ -68,7 +80,6 @@ const retreatHealMethods = {
       Math.floor(botPos.z + (dz / len) * 1.4)
     );
 
-    // Hitbox collision check: never place inside bot or target!
     const botFeet = botPos.floored();
     if (placePos.x === botFeet.x && placePos.z === botFeet.z) return false;
     const center = placePos.offset(0.5, 0.5, 0.5);
@@ -87,8 +98,7 @@ const retreatHealMethods = {
       refPos,
       face: new Vec3(0, 1, 0),
       aimPos: vis.aimPos,
-      ticks: 0,
-      settleTicks: 0
+      ticks: 0
     };
     return true;
   },
@@ -107,11 +117,6 @@ const retreatHealMethods = {
       : { aligned: true };
     const eq = ensureItemHeld(this.bot, { item: plan.item });
     if (eq.swapped || !eq.held || !aim.aligned) {
-      plan.settleTicks = eq.swapped ? 1 : plan.settleTicks;
-      return true;
-    }
-    if (plan.settleTicks > 0) {
-      plan.settleTicks--;
       return true;
     }
 
@@ -128,60 +133,180 @@ const retreatHealMethods = {
     return true;
   },
 
-  _isYawWalkable(yaw) {
+  /**
+   * Evaluates a yaw direction over 2 lookahead steps (`0.9b` and `1.9b`) for walls, hazards, and drops.
+   * Returns `{ ok, clearFar, needsJump }`.
+   */
+  _inspectYawClearance(yaw) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
-      return { ok: true, needsJump: false };
+      return { ok: true, clearFar: true, needsJump: false };
     }
     const pos = this.bot.entity.position;
     const dx = -Math.sin(yaw);
     const dz = -Math.cos(yaw);
-    const col = inspectColumnStep(this.bot, pos.x + dx * 1.1, pos.y, pos.z + dz * 1.1);
-    if (col.blocked || col.hasHazard) return { ok: false, needsJump: false };
-    if (!col.hasFloor) {
-      const bx = Math.floor(pos.x + dx * 1.1);
-      const by = Math.floor(pos.y);
-      const bz = Math.floor(pos.z + dz * 1.1);
-      let solid = false;
-      for (let d = 2; d <= 3; d++) {
-        const b = this.bot.blockAt(new Vec3(bx, by - d, bz));
-        if (b && b.boundingBox === 'block') { solid = true; break; }
+
+    const checkStep = (dist, baseY) => {
+      const col = inspectColumnStep(this.bot, pos.x + dx * dist, baseY, pos.z + dz * dist);
+      if (col.blocked || col.hasHazard) return { ok: false, needsJump: false, nextY: baseY };
+      if (!col.hasFloor) {
+        const bx = Math.floor(pos.x + dx * dist);
+        const by = Math.floor(baseY);
+        const bz = Math.floor(pos.z + dz * dist);
+        let solid = false;
+        for (let d = 2; d <= 3; d++) {
+          const b = this.bot.blockAt(new Vec3(bx, by - d, bz));
+          if (b && b.boundingBox === 'block') { solid = true; break; }
+        }
+        if (!solid) return { ok: false, needsJump: false, nextY: baseY };
       }
-      if (!solid) return { ok: false, needsJump: false };
+      return { ok: true, needsJump: col.needsJump, nextY: col.targetFeetY };
+    };
+
+    const near = checkStep(0.95, pos.y);
+    if (!near.ok) return { ok: false, clearFar: false, needsJump: false };
+
+    const far = checkStep(1.95, near.nextY);
+    return {
+      ok: true,
+      clearFar: far.ok,
+      needsJump: Boolean(near.needsJump)
+    };
+  },
+
+  _isYawWalkable(yaw) {
+    return this._inspectYawClearance(yaw);
+  },
+
+  /**
+   * Obstacle-aware, stuck-detecting retreat steering:
+   * - Detects when horizontal progress stalls (< 0.08b/tick for 4+ ticks) on pillars/walls/corners
+   * - Scans all 12 compass directions over 2-block lookahead to route AROUND blocks cleanly
+   * - Locks a detour yaw for 16–22 ticks whenever stuck or blocked so the bot commits to clearing the obstacle
+   */
+  _chooseObstacleAwareRetreatYaw(target) {
+    const pos = this.bot.entity.position;
+    const awayYaw = this._getAwayYaw(target);
+
+    // Track horizontal stuck detection
+    if (this._retreatLastPos) {
+      const moved = Math.hypot(pos.x - this._retreatLastPos.x, pos.z - this._retreatLastPos.z);
+      if (moved < 0.075) {
+        this._retreatStuckTicks = (this._retreatStuckTicks || 0) + 1;
+      } else {
+        this._retreatStuckTicks = Math.max(0, (this._retreatStuckTicks || 0) - 1);
+      }
+    } else {
+      this._retreatStuckTicks = 0;
     }
-    return { ok: true, needsJump: col.needsJump };
+    this._retreatLastPos = pos.clone();
+
+    const isStuck = (this._retreatStuckTicks || 0) >= 4;
+
+    // Keep locked detour yaw while it stays clear and we aren't newly stuck
+    if (!isStuck && this._retreatDetourTicks > 0 && typeof this._retreatDetourYaw === 'number') {
+      this._retreatDetourTicks--;
+      const check = this._inspectYawClearance(this._retreatDetourYaw);
+      if (check.ok) {
+        return { yaw: this._retreatDetourYaw, needsJump: check.needsJump, detouring: true };
+      }
+      this._retreatDetourTicks = 0;
+    }
+
+    // Check direct away direction first if not stuck
+    const directCheck = this._inspectYawClearance(awayYaw);
+    if (!isStuck && directCheck.ok && directCheck.clearFar) {
+      this._retreatDetourYaw = null;
+      return { yaw: awayYaw, needsJump: directCheck.needsJump, detouring: false };
+    }
+
+    // Score all 12 compass directions around obstacles, preferring directions that clear the block AND gain distance
+    const prevBadYaw = isStuck ? (this._retreatDetourYaw !== null && this._retreatDetourYaw !== undefined ? this._retreatDetourYaw : awayYaw) : null;
+    const sidePref = this.retreatStrafeDir || 1;
+    let best = null;
+
+    for (let i = 0; i < FULL_FAN_OFFSETS.length; i++) {
+      const off = FULL_FAN_OFFSETS[i] * sidePref;
+      const candYaw = normalizeAngle(awayYaw + off);
+      const check = this._inspectYawClearance(candYaw);
+      if (!check.ok) continue;
+
+      let score = 0;
+      // Reward full 2-block clearance heavily so we don't turn into a dead-end niche
+      score += check.clearFar ? 30 : 8;
+      // Reward moving away from opponent (cos(off) = +1 straight away, 0 perpendicular, -1 toward)
+      score += Math.cos(off) * 18;
+      // Mild penalty for jumping over ledges vs smooth flat corridor
+      if (check.needsJump) score -= 2.5;
+      // When stuck, strongly penalize the direction we were just stuck running into!
+      if (prevBadYaw !== null) {
+        const diffFromBad = Math.abs(normalizeAngle(candYaw - prevBadYaw));
+        if (diffFromBad < 0.75) score -= 40;
+        else score += diffFromBad * 6;
+      }
+      // Reward continuity with previous detour direction if still valid
+      if (!isStuck && typeof this._retreatDetourYaw === 'number') {
+        const diffPrev = Math.abs(normalizeAngle(candYaw - this._retreatDetourYaw));
+        score -= diffPrev * 4;
+      }
+
+      if (!best || score > best.score) {
+        best = { yaw: candYaw, needsJump: check.needsJump, score };
+      }
+    }
+
+    if (best) {
+      // Flip default side preference on stuck so we explore the opposite side if we hit another wall
+      if (isStuck) {
+        this.retreatStrafeDir = -(this.retreatStrafeDir || 1);
+        this._retreatStuckTicks = 0;
+      }
+      const offFromAway = Math.abs(normalizeAngle(best.yaw - awayYaw));
+      if (isStuck || offFromAway > 0.35) {
+        this._retreatDetourYaw = best.yaw;
+        this._retreatDetourTicks = isStuck ? 20 : 14;
+        return { yaw: best.yaw, needsJump: best.needsJump, detouring: true };
+      }
+      return { yaw: best.yaw, needsJump: best.needsJump, detouring: false };
+    }
+
+    // Complete cornered fallback: turn perpendicular/away from wall
+    const fallbackYaw = normalizeAngle(awayYaw + (this.retreatStrafeDir || 1) * (Math.PI * 0.75));
+    this.retreatStrafeDir = -(this.retreatStrafeDir || 1);
+    this._retreatStuckTicks = 0;
+    this._retreatDetourYaw = fallbackYaw;
+    this._retreatDetourTicks = 14;
+    return { yaw: fallbackYaw, needsJump: true, detouring: true };
   },
 
   _moveAwayWalk(target) {
     if (!this.bot || !this.bot.entity) return;
-    const awayYaw = this._getAwayYaw(target);
-    this.healStrafeTicks--;
-    if (this.healStrafeTicks <= 0) {
-      this.healStrafeDir = -this.healStrafeDir;
-      this.healStrafeTicks = 7 + Math.floor(Math.random() * 8);
-    }
-
-    let chosenYaw = awayYaw;
-    let needsJump = false;
-    const offsets = [0, this.healStrafeDir * 0.55, -this.healStrafeDir * 0.55, Math.PI * 0.5, -Math.PI * 0.5];
-    for (const off of offsets) {
-      const check = this._isYawWalkable(awayYaw + off);
-      if (check.ok) {
-        chosenYaw = awayYaw + off;
-        needsJump = check.needsJump;
-        break;
-      }
-    }
+    const nav = this._chooseObstacleAwareRetreatYaw(target);
 
     if (this.aimer) {
-      this.aimer.stepTowardsAngles(chosenYaw, 0.0, { speedMultiplier: 1.5, toleranceRad: 0.25 });
+      this.aimer.stepTowardsAngles(nav.yaw, 0.0, { speedMultiplier: 1.75, toleranceRad: 0.25 });
     }
     if (typeof this.bot.setControlState === 'function') {
+      // Only add slight weaving strafe when NOT routing around an obstacle (never push into walls!)
+      let left = false;
+      let right = false;
+      if (!nav.detouring) {
+        this.healStrafeTicks--;
+        if (this.healStrafeTicks <= 0) {
+          this.healStrafeDir = -this.healStrafeDir;
+          this.healStrafeTicks = 9 + Math.floor(Math.random() * 8);
+        }
+        const sideYaw = nav.yaw + (this.healStrafeDir > 0 ? Math.PI / 2 : -Math.PI / 2);
+        if (this._inspectYawClearance(sideYaw).ok) {
+          left = this.healStrafeDir < 0;
+          right = this.healStrafeDir > 0;
+        }
+      }
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
-      this.bot.setControlState('left', this.healStrafeDir < 0);
-      this.bot.setControlState('right', this.healStrafeDir > 0);
+      this.bot.setControlState('left', left);
+      this.bot.setControlState('right', right);
       this.bot.setControlState('sprint', false);
-      this.bot.setControlState('jump', Boolean(needsJump && this.bot.entity.onGround));
+      this.bot.setControlState('jump', Boolean(nav.needsJump && this.bot.entity.onGround));
     }
   },
 
@@ -212,7 +337,10 @@ const retreatHealMethods = {
       }
     }
 
-    const potCooldownMs = this.survCfg.potionCooldownMs !== undefined ? this.survCfg.potionCooldownMs : 450;
+    // Fast splash heal during retreat (280ms chain cooldown when low!)
+    const potCooldownMs = this.bot.health <= 9
+      ? Math.min(280, this.survCfg.potionCooldownMs || 350)
+      : (this.survCfg.potionCooldownMs !== undefined ? this.survCfg.potionCooldownMs : 350);
     const healPot = (now - this.lastPotionTime) >= potCooldownMs ? this.findHealingPotion() : null;
     if (healPot) {
       this._queueSplashPotion(healPot, false, null);
@@ -223,12 +351,13 @@ const retreatHealMethods = {
     const dist = (target && target.position) ? this.bot.entity.position.distanceTo(target.position) : 99;
     const retreatDist = this.survCfg.retreatDistance || 7.5;
 
-    if (dist < 4.5 && this._tryQueueLosBlock(target)) {
+    if (dist < 4.8 && this._tryQueueLosBlock(target)) {
       this._tickPendingLosBlock();
       return;
     }
 
-    if (dist >= Math.min(4.2, retreatDist * 0.6)) {
+    // Start eating/drinking once we have cover OR sufficient gap (>= 4.5b)
+    if (dist >= Math.min(4.5, retreatDist * 0.6) || this._hasCoverBetween(target)) {
       const drinkHeal = this.findDrinkableHealPotion();
       if (drinkHeal && this._startDrinkingPotion(drinkHeal, null)) {
         this._moveAwayWalk(target);
@@ -241,32 +370,20 @@ const retreatHealMethods = {
       }
     }
 
-    // Sprint-jump away to create safe healing gap
-    const awayYaw = this._getAwayYaw(target);
-    this.retreatStrafeTicks--;
-    if (this.retreatStrafeTicks <= 0) {
-      this.retreatStrafeDir = -this.retreatStrafeDir;
-      this.retreatStrafeTicks = 12 + Math.floor(Math.random() * 14);
-    }
-
-    let chosenYaw = awayYaw;
-    for (const off of [0, this.retreatStrafeDir * 0.6, -this.retreatStrafeDir * 0.6, Math.PI * 0.5, -Math.PI * 0.5]) {
-      if (this._isYawWalkable(awayYaw + off).ok) {
-        chosenYaw = awayYaw + off;
-        break;
-      }
-    }
-
+    // Obstacle-aware sprint-jump away to create safe healing gap
+    const nav = this._chooseObstacleAwareRetreatYaw(target);
     if (this.aimer) {
-      this.aimer.stepTowardsAngles(chosenYaw, 0.0, { speedMultiplier: 1.75, toleranceRad: 0.25 });
+      this.aimer.stepTowardsAngles(nav.yaw, 0.0, { speedMultiplier: 1.9, toleranceRad: 0.25 });
     }
     if (typeof this.bot.setControlState === 'function') {
+      const canSprint = this.bot.food > 6;
       this.bot.setControlState('forward', true);
       this.bot.setControlState('back', false);
       this.bot.setControlState('left', false);
       this.bot.setControlState('right', false);
-      this.bot.setControlState('sprint', this.bot.food > 6);
-      this.bot.setControlState('jump', Boolean(this.bot.entity.onGround));
+      this.bot.setControlState('sprint', canSprint);
+      // Jump over ledges OR sprint-jump on flat open ground (not into low ceilings/walls)
+      this.bot.setControlState('jump', Boolean(this.bot.entity.onGround && (nav.needsJump || !nav.detouring)));
     }
   },
 
@@ -292,7 +409,9 @@ const retreatHealMethods = {
       }
     }
 
-    const potCooldownMs = this.survCfg.potionCooldownMs !== undefined ? this.survCfg.potionCooldownMs : 450;
+    const potCooldownMs = this.bot.health <= 9
+      ? Math.min(280, this.survCfg.potionCooldownMs || 350)
+      : (this.survCfg.potionCooldownMs !== undefined ? this.survCfg.potionCooldownMs : 350);
     const healPot = (now - this.lastPotionTime) >= potCooldownMs ? this.findHealingPotion() : null;
     if (healPot) {
       this._queueSplashPotion(healPot, false, null);

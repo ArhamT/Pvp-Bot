@@ -285,44 +285,49 @@ const potionSkillMethods = {
     }
 
     const potion = this.pendingSplashPotion;
-    // Velocity-lead downward pitch: steeper when slow (-86°), slightly angled forward (-75°) when moving fast
     const vel = this.bot.entity && this.bot.entity.velocity;
-    const hSpeed = vel ? Math.sqrt(vel.x * vel.x + vel.z * vel.z) : 0;
-    const pitchDeg = hSpeed > 0.16 ? -76 : (hSpeed > 0.08 ? -81 : -86);
+    const vx = vel ? (vel.x || 0) : 0;
+    const vz = vel ? (vel.z || 0) : 0;
+    const hSpeed = Math.hypot(vx, vz);
+
+    // HT1 Splash Aim: throw slightly ahead of our REAL velocity vector when moving fast so we walk
+    // directly into the splash center for 100% full 8-HP heal, or straight down (-88°) when slow!
+    const pitchDeg = hSpeed > 0.16 ? -76 : (hSpeed > 0.08 ? -82 : -88);
     const targetPitch = pitchDeg * (Math.PI / 180);
 
-    const aimYaw = (target && target.position && inlineCombat)
-      ? Math.atan2(-(this.bot.entity.position.x - target.position.x), -(this.bot.entity.position.z - target.position.z))
-      : (this.bot.entity.yaw || 0);
+    let aimYaw = this.bot.entity.yaw || 0;
+    if (hSpeed > 0.08) {
+      aimYaw = Math.atan2(-vx, -vz);
+    } else if (target && target.position && inlineCombat) {
+      aimYaw = Math.atan2(-(this.bot.entity.position.x - target.position.x), -(this.bot.entity.position.z - target.position.z));
+    }
 
     const aim = this.aimer
-      ? this.aimer.stepTowardsAngles(aimYaw, targetPitch, { speedMultiplier: 2.2, toleranceRad: 0.22 })
+      ? this.aimer.stepTowardsAngles(aimYaw, targetPitch, { speedMultiplier: 2.3, toleranceRad: 0.24 })
       : { aligned: true };
 
     if (typeof this.bot.setControlState === 'function') {
       this.bot.setControlState('sprint', false);
       this.bot.setControlState('jump', false);
-      this.bot.setControlState('forward', inlineCombat);
+      this.bot.setControlState('forward', hSpeed > 0.08 || !inlineCombat);
       this.bot.setControlState('back', false);
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
     }
 
+    // ensureItemHeld ALREADY enforces the 1-tick post-swap settle (`swapped: true, held: false`) — no double-tick wait!
     const eq = ensureItemHeld(this.bot, { item: potion });
     if (eq.swapped || !eq.held) {
-      this.pendingSplashSettleTicks = 1;
-      return true;
-    }
-    if (this.pendingSplashSettleTicks > 0) {
-      this.pendingSplashSettleTicks--;
       return true;
     }
 
     // Grounded / descending gate: don't waste splash potion while rising rapidly at jump apex
     const vy = vel && typeof vel.y === 'number' ? vel.y : 0;
-    if (this.bot.entity && !this.bot.entity.onGround && vy > 0.18 && (now - this.pendingSplashCreatedAt) < 400) {
+    if (this.bot.entity && !this.bot.entity.onGround && vy > 0.18 && (now - this.pendingSplashCreatedAt) < 350) {
       return true;
     }
 
-    if (!aim.aligned && (now - this.pendingSplashCreatedAt) < 350) {
+    if (!aim.aligned && (now - this.pendingSplashCreatedAt) < 260) {
       return true;
     }
 

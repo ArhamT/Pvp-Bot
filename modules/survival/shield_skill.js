@@ -199,7 +199,19 @@ const shieldSkillMethods = {
         }
       }
 
-      if (this.shieldTicksRemaining <= 0 || this.shieldHoldTicks >= 24) {
+      // HT1 Shield-Flash: drop shield as soon as our melee swing is ready (unless blocking Mace, Bow, or Blast!)
+      if (
+        !this.shieldingForMace &&
+        !this.shieldingForExternal &&
+        weaponCooldownProgress >= 0.86 &&
+        this.shieldHoldTicks >= 3 &&
+        !this.isEnemyDrawingBow(target)
+      ) {
+        this.lowerShield();
+        return false;
+      }
+
+      if (this.shieldTicksRemaining <= 0 || this.shieldHoldTicks >= 22) {
         this.lowerShield();
         return false;
       }
@@ -218,7 +230,7 @@ const shieldSkillMethods = {
         this.isShielding = true;
         this.shieldHand = 'main-hand';
         this.shieldingForMace = Boolean(maceThreat.shouldShield);
-        this.shieldTicksRemaining = maceThreat.shouldShield ? 12 : (this.survCfg.shieldBlockDurationTicks || 10);
+        this.shieldTicksRemaining = maceThreat.shouldShield ? 12 : (this.survCfg.shieldBlockDurationTicks || 8);
         this.shieldHoldTicks = 0;
         this.pendingMainhandShieldSlot = -1;
         return true;
@@ -227,8 +239,8 @@ const shieldSkillMethods = {
       return false;
     }
 
-    const maceCooldownMs = 280;
-    const normalCooldownMs = this.survCfg.shieldCooldownMs || 1200;
+    const maceCooldownMs = 260;
+    const normalCooldownMs = Math.min(500, this.survCfg.shieldCooldownMs || 500);
 
     if (maceThreat.shouldShield && (now - this.lastMaceShieldEndTime) >= maceCooldownMs) {
       if (hasOffhandShield) {

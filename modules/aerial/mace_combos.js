@@ -322,12 +322,7 @@ const maceComboMethods = {
       return this._tickSwordRestore();
     }
 
-    const aimStatus = this._aimAtTarget(target, 1, {
-      speedMultiplier: 1.5,
-      toleranceRad: 0.28,
-      force: true
-    });
-    this._setAirborneMove(aimStatus.yawErrorDeg < 45, false);
+    const { aimStatus } = this._steerAirborneToward(target, 1);
 
     // 3-Branch Shield Countering: BACKSTAB (preferred airborne) bypasses shield without Axe swap
     const shieldCounter = evaluateShieldCounter(this.bot, this.targetState, {

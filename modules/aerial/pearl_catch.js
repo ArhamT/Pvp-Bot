@@ -22,13 +22,56 @@ const pearlCatchMethods = {
     const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
     if (eyePos.distanceTo(entity.position) < 1.8) return;
 
-    const pred = predictEntityProjectileLanding(this.bot, entity, 60);
-    if (!pred || !pred.pos) return;
+    const vel = entity.velocity;
+    const hasVel = Boolean(vel && Math.hypot(vel.x || 0, vel.y || 0, vel.z || 0) > 0.08);
+    const pred = hasVel ? predictEntityProjectileLanding(this.bot, entity, 65) : null;
     this.trackedEnemyPearl = {
       entity,
-      landingPos: pred.pos,
+      spawnPos: entity.position.clone(),
+      lastPos: entity.position.clone(),
+      landingPos: (pred && pred.pos) ? pred.pos : null,
+      resolved: Boolean(pred && pred.pos),
       expiresAt: Date.now() + 3500
     };
+  },
+
+  /**
+   * Resolves enemy pearl velocity on tick 2 if `entitySpawn` fired before the `entity_velocity` packet
+   * (fixes MC 1.20.4–1.21+ Paper/Spigot pearl tracking!).
+   */
+  _updateTrackedEnemyPearl() {
+    const tp = this.trackedEnemyPearl;
+    if (!tp) return;
+    if (Date.now() > tp.expiresAt || !tp.entity || !tp.entity.isValid || !tp.entity.position) {
+      if (Date.now() > (tp.expiresAt || 0)) this.trackedEnemyPearl = null;
+      return;
+    }
+    if (tp.resolved && tp.landingPos) return;
+
+    const vel = tp.entity.velocity;
+    const hasVel = Boolean(vel && Math.hypot(vel.x || 0, vel.y || 0, vel.z || 0) > 0.08);
+    if (hasVel) {
+      const pred = predictEntityProjectileLanding(this.bot, tp.entity, 65);
+      if (pred && pred.pos) {
+        tp.landingPos = pred.pos;
+        tp.resolved = true;
+      }
+      return;
+    }
+
+    // Fallback: derive velocity from 1-tick position delta
+    const delta = tp.entity.position.minus(tp.lastPos);
+    tp.lastPos = tp.entity.position.clone();
+    if (delta.norm() > 0.08) {
+      const pred = predictEntityProjectileLanding(this.bot, {
+        position: tp.entity.position.clone(),
+        velocity: delta
+      }, 65);
+      if (pred && pred.pos) {
+        tp.landingPos = pred.pos;
+        tp.resolved = true;
+      }
+    }
   },
 
   _predictProjectileLanding(startPos, startVel) {
@@ -77,14 +120,15 @@ const pearlCatchMethods = {
     const minHoriz = this.aerialCfg.pearlCatchMinHorizDist !== undefined ? this.aerialCfg.pearlCatchMinHorizDist : 4.2;
     const maxDist = this.aerialCfg.pearlCatchMaxDist !== undefined ? this.aerialCfg.pearlCatchMaxDist : 64.0;
 
-    // Case 1: Intercept an enemy-thrown Ender Pearl (ballistic arc directly to their landing spot!)
+    // Case 1: Intercept an enemy-thrown Ender Pearl (works BOTH airborne AND grounded!)
     if (
       this.trackedEnemyPearl &&
-      now <= this.trackedEnemyPearl.expiresAt &&
-      (!onGround || heightAboveTarget >= 2.0 || this.fallDistance >= 2.0 || velY > 0.3)
+      this.trackedEnemyPearl.resolved &&
+      this.trackedEnemyPearl.landingPos &&
+      now <= this.trackedEnemyPearl.expiresAt
     ) {
       const catchDist = pos.distanceTo(this.trackedEnemyPearl.landingPos);
-      if (catchDist >= 3.5 && catchDist <= maxDist) {
+      if (catchDist >= 5.0 && catchDist <= maxDist) {
         return {
           reason: 'enemy_pearl_intercept',
           catchPos: this.trackedEnemyPearl.landingPos.clone(),
@@ -93,14 +137,14 @@ const pearlCatchMethods = {
       }
     }
 
-    // Case 2: Airborne Wind-Burst / high-altitude vertical Pearl Catch when enemy dodges out from under us
+    // Case 2: Airborne Wind-Burst / high-altitude BALLISTIC Pearl Catch when enemy dodges horizontally out from under us!
     if (!onGround) {
       const hasWindBurstAltitude = heightAboveTarget >= minHeight || this.fallDistance >= minHeight || velY > 0.35;
       if (hasWindBurstAltitude && horizDist >= minHoriz && horizDist <= maxDist) {
         const pred = this._getPredictedPosition(target, 3);
         return {
           reason: 'windburst_self_pearl_catch',
-          catchPos: pred.offset(0, 0.3, 0),
+          catchPos: pred.offset(0, 1.2, 0),
           useTargetVel: true
         };
       }
@@ -185,7 +229,9 @@ const pearlCatchMethods = {
         this._findItemByName('wind_charge')
       );
       const isEnemyPearl = reason === 'enemy_pearl_intercept';
-      const useVerticalCatch = !isEnemyPearl && (hasWindCharge || reason === 'windburst_self_pearl_catch' || reason === 'ground_pearl_catch');
+      const isAirborneIntercept = reason === 'windburst_self_pearl_catch';
+      // Vertical +90° Wind-Charge sky-pearl ONLY for grounded sky launch; airborne dodge & enemy pearls use exact ballistic intercept!
+      const useVerticalCatch = !isEnemyPearl && !isAirborneIntercept && hasWindCharge && reason === 'ground_pearl_catch';
 
       if (useVerticalCatch) {
         clearMovementControls(this.bot);
