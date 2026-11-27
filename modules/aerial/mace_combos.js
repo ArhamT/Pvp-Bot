@@ -1,10 +1,32 @@
 'use strict';
 
 const { DEG_TO_RAD } = require('../aim');
-const { evaluateShieldCounter, executeAttributeSwapAttack } = require('../mace_elytra');
+const { evaluateShieldCounter } = require('../mace_elytra');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 const maceComboMethods = {
+  /**
+   * Shared 3-Branch Shield Countering handoff helper (used across Mace, Spear-Mace, Elytra-Mace, & Pearl Catch).
+   * Returns true if it transitioned into STUN_SLAM (AXE_BREAK).
+   */
+  _tryEnterStunSlam(target, minFall = 1.8) {
+    if (this.aerialCfg.stunSlamEnabled === false) return false;
+    const { onGround } = this._getEnvironmentFlags();
+    const counter = evaluateShieldCounter(this.bot, this.targetState, {
+      hasAxe: Boolean(this._findAxe()),
+      hasMace: Boolean(this._findMace(true)),
+      isAirborne: !onGround,
+      isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
+    });
+    if (this.fallDistance >= minFall && counter.strategy === 'STUN_SLAM') {
+      this.mode = AERIAL_MODES.STUN_SLAM;
+      this.stage = 'AXE_BREAK';
+      this.stageTicks = 0;
+      return true;
+    }
+    return false;
+  },
+
   _canStartOpportunisticMaceSmash(target) {
     if (!target || !target.isValid || !this.bot.entity) return false;
     const { onGround, inWater, inLava } = this._getEnvironmentFlags();
@@ -76,7 +98,7 @@ const maceComboMethods = {
     const launchPitchDeg = horizDist < 3.5 ? -86 : (horizDist < 7.0 ? -80 : -75);
     const launchPitchRad = launchPitchDeg * DEG_TO_RAD;
 
-    // Stage 1: Same-tick Grounded Wind Charge Launch (jump + pitch -Math.PI/2 + activateItem)
+    // Stage 1: Anti-cheat-safe Sprint-Jump + Wind Charge Pre-Equip (1-tick settle before airborne fire!)
     if (this.stage === 'JUMP_INIT') {
       this.maceJumpTicks++;
       const windSel = this._findItemByName('wind_charge');
@@ -85,19 +107,10 @@ const maceComboMethods = {
         return false;
       }
 
-      if (typeof windSel.hotbarIndex === 'number' && windSel.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
-        if (this.bot.quickBarSlot !== windSel.hotbarIndex) {
-          this.bot.setQuickBarSlot(windSel.hotbarIndex);
-        }
-      } else {
-        const eq = this._equipHand(windSel);
-        if (!eq.ready) return true;
-      }
-
-      this.aimer.stepTowardsAngles(yawToTarget, -Math.PI / 2, {
+      const eq = this._equipHand(windSel);
+      this.aimer.stepTowardsAngles(yawToTarget, launchPitchRad, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.22
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -106,19 +119,17 @@ const maceComboMethods = {
         this.bot.setControlState('jump', onGround);
       }
 
-      if (typeof this.bot.activateItem === 'function') {
-        this.bot.activateItem(false);
+      // Transition to airborne WIND_CHARGE_LAUNCH once jump begins & slot swap settled
+      if (eq.ready && !eq.swapped && (!onGround || this.maceJumpTicks >= 2)) {
+        this.stage = 'WIND_CHARGE_LAUNCH';
+        this.stageTicks = 0;
       }
-      this.lastMaceLaunchTime = Date.now();
-      this.stage = 'AIRBORNE_DESCENT';
-      this.stageTicks = 0;
-      this.spearLaunchTicks = 0;
       return true;
     }
 
-    // Stage 2: Fire angled Wind Charge while airborne right after jump
+    // Stage 2: Fire angled Wind Charge while airborne right after jump (+3–4b extra launch height!)
     if (this.stage === 'WIND_CHARGE_LAUNCH') {
-      if (this.stageTicks > 15) {
+      if (this.stageTicks > 12) {
         this.cancel();
         return false;
       }
@@ -130,8 +141,8 @@ const maceComboMethods = {
 
       const eq = this._equipHand(windSel);
       const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, launchPitchRad, {
-        speedMultiplier: 2.0,
-        toleranceRad: 0.2
+        speedMultiplier: 2.2,
+        toleranceRad: 0.22
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -214,22 +225,7 @@ const maceComboMethods = {
         : 1.8;
 
       if (velY < -0.05) {
-        // Branch A: 3-Branch Shield Countering (BACKSTAB / STUN_SLAM / SHIELD_DRAIN)
-        const counter = evaluateShieldCounter(this.bot, this.targetState, {
-          hasAxe: Boolean(this._findAxe()),
-          hasMace: Boolean(this._findMace(true)),
-          isAirborne: !onGround,
-          isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
-        });
-        if (
-          this.aerialCfg.stunSlamEnabled !== false &&
-          this.fallDistance >= minFall &&
-          counter.strategy === 'STUN_SLAM'
-        ) {
-          this.mode = AERIAL_MODES.STUN_SLAM;
-          this.stage = 'AXE_BREAK';
-          this.stageTicks = 0;
-          this.stunSlamAxeSwapped = false;
+        if (this._tryEnterStunSlam(target, minFall)) {
           return this._tickStunSlam(target);
         }
 
@@ -279,7 +275,7 @@ const maceComboMethods = {
 
     const minFall = this.aerialCfg.stunSlamMinFallDistance !== undefined
       ? this.aerialCfg.stunSlamMinFallDistance
-      : 2.0;
+      : 1.8;
     const maxRange = this.aerialCfg.stunSlamRange !== undefined
       ? this.aerialCfg.stunSlamRange
       : 4.5;
@@ -357,31 +353,8 @@ const maceComboMethods = {
 
       if (readyToEquipAxe) {
         const eq = this._equipHand(axeSel);
-        if (eq.ready && reachDist <= reach && aimStatus.aligned) {
-          if (
-            this.aerialCfg.sameTickAttributeSwap !== false &&
-            shieldCounter.strategy === 'STUN_SLAM'
-          ) {
-            const maceSel = this._findMace(true);
-            this.bot.attack(target);
-            this._markShieldDisabled();
-            if (maceSel) {
-              executeAttributeSwapAttack(this.bot, target, axeSel, maceSel, {
-                durabilityDrainMode: Boolean(this.combatCfg.durabilityDrainMode)
-              });
-              this._resetFallAfterSmash();
-              if (this.aerialCfg.windBurstChainEnabled !== false && maceSel.isWindBurst) {
-                this.windBurstChainCount++;
-                this.mode = AERIAL_MODES.MACE_LAUNCH;
-                this.stage = 'WIND_BURST_BOUNCE';
-                this.stageTicks = 0;
-                this.windBurstBounceTicks = 0;
-              } else {
-                this.stage = 'SWORD_RESTORE';
-              }
-              return true;
-            }
-          }
+        if (eq.ready && !eq.swapped && reachDist <= reach && aimStatus.aligned) {
+          // Single clean Axe shield-break swing (NEVER double-attack in one tick!) -> next-tick Mace Smash
           this.bot.attack(target);
           this._markShieldDisabled();
           this.stage = shieldCounter.strategy === 'SHIELD_DRAIN' ? 'AXE_BREAK' : 'MACE_SMASH';
@@ -391,7 +364,7 @@ const maceComboMethods = {
       return true;
     }
 
-    // --- Stage 2: Swap to 7-Block Mace & land smash before ground ---
+    // --- Stage 2: Swap to 7-Block Mace & land smash before ground (1-tick settled!) ---
     if (this.stage === 'MACE_SMASH') {
       const maceSel = this._findMace(this.aerialCfg.windBurstChainEnabled !== false);
       if (!maceSel) {
@@ -400,7 +373,7 @@ const maceComboMethods = {
       }
 
       const eq = this._equipHand(maceSel);
-      if (eq.ready && reachDist <= reach + 0.15 && (aimStatus.aligned || aimStatus.yawErrorDeg < 30)) {
+      if (eq.ready && !eq.swapped && reachDist <= reach + 0.15 && (aimStatus.aligned || aimStatus.yawErrorDeg < 30)) {
         if (typeof this.bot.setControlState === 'function') {
           this.bot.setControlState('sprint', false);
         }

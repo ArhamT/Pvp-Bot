@@ -1,23 +1,22 @@
 'use strict';
 
-const { Vec3 } = require('vec3');
-const { posKey, isAirLike } = require('../constants');
+const {
+  BLAST_SHIELD_BLOCK_PRIORITY,
+  COVER_BLOCK_PRIORITY,
+  posKey,
+  sameBlockPos,
+  isAirLike,
+  isNonNullAir
+} = require('../constants');
 
-const HOTBAR_END = 44;
 const CRYSTAL_POWER = 6.0;
 const ANCHOR_POWER = 5.0;
 
-const BLAST_SHIELD_BLOCK_PRIORITY = [
-  'obsidian',
-  'glowstone',
-  'cobbled_deepslate',
-  'cobblestone',
-  'stone',
-  'deepslate',
-  'end_stone'
+// Blast-resistant solid blocks ONLY (NEVER cobweb — cobwebs have empty boundingBox and don't block blast rays!)
+const DEFENSE_BLOCK_PRIORITY = [
+  ...BLAST_SHIELD_BLOCK_PRIORITY,
+  ...COVER_BLOCK_PRIORITY.filter((b) => !BLAST_SHIELD_BLOCK_PRIORITY.includes(b))
 ];
-
-const COVER_BLOCK_PRIORITY = BLAST_SHIELD_BLOCK_PRIORITY;
 
 function isCrystalEntity(entity) {
   if (!entity || !entity.isValid) return false;
@@ -25,12 +24,6 @@ function isCrystalEntity(entity) {
   const display = String(entity.displayName || '').toLowerCase();
   return name === 'end_crystal' || name === 'ender_crystal' || name === 'endercrystal' || display === 'end crystal';
 }
-
-const DEFENSE_BLOCK_PRIORITY = [
-  'cobweb', 'obsidian', 'cobbled_deepslate', 'cobblestone', 'stone',
-  'deepslate', 'netherrack', 'dirt', 'oak_planks', 'spruce_planks',
-  'birch_planks', 'stone_bricks', 'end_stone'
-];
 
 const ARMOR_STATS = {
   netherite_helmet: { armor: 3, toughness: 3 },
@@ -60,25 +53,16 @@ const ARMOR_STATS = {
   leather_boots: { armor: 1, toughness: 0 }
 };
 
-const PLACEMENT_FACES = [
-  { offset: new Vec3(0, -1, 0), face: new Vec3(0, 1, 0) },
-  { offset: new Vec3(1, 0, 0), face: new Vec3(-1, 0, 0) },
-  { offset: new Vec3(-1, 0, 0), face: new Vec3(1, 0, 0) },
-  { offset: new Vec3(0, 0, 1), face: new Vec3(0, 0, -1) },
-  { offset: new Vec3(0, 0, -1), face: new Vec3(0, 0, 1) },
-  { offset: new Vec3(0, 1, 0), face: new Vec3(0, -1, 0) }
-];
-
 module.exports = {
-  HOTBAR_END,
   CRYSTAL_POWER,
   ANCHOR_POWER,
   BLAST_SHIELD_BLOCK_PRIORITY,
   COVER_BLOCK_PRIORITY,
   DEFENSE_BLOCK_PRIORITY,
   ARMOR_STATS,
-  PLACEMENT_FACES,
   posKey,
+  sameBlockPos,
   isAirLike,
+  isNonNullAir,
   isCrystalEntity
 };

@@ -1,19 +1,16 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { isAirLike: isConstantsAirLike } = require('../constants');
-const { CRYSTAL_POWER } = require('./shared');
+const { getEnchantmentLevel } = require('../enchant_utils');
+const { CRYSTAL_POWER, isNonNullAir } = require('./shared');
 const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
-const { hasExistingCrystalAt } = require('./surround_city');
-
-function isNonNullAir(block) {
-  return Boolean(block) && isConstantsAirLike(block);
-}
+const { collectCrystalPositions, hasExistingCrystalAt } = require('./surround_city');
 
 /**
- * Plans an Obsidian + End Crystal placement along the target's sprint-knockback landing trajectory.
+ * Plans an Obsidian + End Crystal placement along the target's sprint-knockback landing trajectory,
+ * scaling forward knockback projection by the sword's Knockback enchantment level.
  */
-function planHitCrystalTrajectory(burst, target) {
+function planHitCrystalTrajectory(burst, target, swordItem = null) {
   if (!burst || !burst.bot || !burst.bot.entity || typeof burst.bot.blockAt !== 'function') return null;
   if (!target || !target.isValid || !target.position) return null;
 
@@ -35,16 +32,19 @@ function planHitCrystalTrajectory(burst, target) {
   const lx = -uz;
   const lz = ux;
 
+  const kbLvl = swordItem ? getEnchantmentLevel(swordItem, 'knockback') : 0;
+  const projDist = 1.8 + kbLvl * 0.65;
   const targetLandingFeet = new Vec3(
-    target.position.x + ux * 1.8,
+    target.position.x + ux * projDist,
     target.position.y + 0.65,
-    target.position.z + uz * 1.8
+    target.position.z + uz * projDist
   );
 
-  const forwardSteps = [1.3, 1.8, 2.3, 2.7];
+  const forwardSteps = [projDist - 0.5, projDist, projDist + 0.5, projDist + 0.9];
   const lateralOffsets = [0, 0.5, -0.5];
   const dyLevels = [-1, 0];
   const seenKeys = new Set();
+  const liveCrystals = collectCrystalPositions(burst.bot);
   let best = null;
 
   for (const fwd of forwardSteps) {
@@ -65,7 +65,7 @@ function planHitCrystalTrajectory(burst, target) {
         const crystalSpace = basePos.offset(0, 1, 0);
         const aboveBlock = burst.bot.blockAt(crystalSpace);
         if (!baseBlock || !isNonNullAir(aboveBlock)) continue;
-        if (hasExistingCrystalAt(burst.bot, crystalSpace)) continue;
+        if (hasExistingCrystalAt(burst.bot, crystalSpace, liveCrystals)) continue;
         if (burst._intersectsEntityHitbox(crystalSpace, botPos)) continue;
 
         let needsObsidian = false;
@@ -125,24 +125,36 @@ function planHitCrystalTrajectory(burst, target) {
  * Sprint-knockback sword launch -> predictive Obsidian placement under airborne opponent -> End Crystal pop!
  */
 const hitCrystalMethods = {
-  _canStartHitCrystal(target) {
-    if (this.burstCfg.hitCrystalEnabled === false || this.burstCfg.crystalEnabled === false) return false;
-    if (!target || !target.isValid || !this.bot || !this.bot.entity) return false;
+  _planHitCrystalIfReady(target) {
+    if (this.burstCfg.hitCrystalEnabled === false || this.burstCfg.crystalEnabled === false) return null;
+    if (!target || !target.isValid || !this.bot || !this.bot.entity) return null;
 
     const now = Date.now();
-    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 50)) return false;
-    if ((now - this.lastHitCrystalTime) < (this.burstCfg.hitCrystalCooldownMs || 250)) return false;
+    const crystalCd = this.burstCfg.crystalCooldownMs !== undefined ? this.burstCfg.crystalCooldownMs : 50;
+    const hitCd = this.burstCfg.hitCrystalCooldownMs !== undefined ? this.burstCfg.hitCrystalCooldownMs : 250;
+    if ((now - this.lastCrystalTime) < crystalCd) return null;
+    if ((now - this.lastHitCrystalTime) < hitCd) return null;
 
-    if (!this._findItem('end_crystal')) return false;
-    if (!this._findBestSword()) return false;
+    // Require sword cooldown >= 0.85 so sprint-knockback actually launches the opponent!
+    if (this.combat && typeof this.combat.getCooldownProgress === 'function' && this.combat.getCooldownProgress() < 0.85) {
+      return null;
+    }
+
+    if (!this._findItem('end_crystal')) return null;
+    const swordRecord = this._findBestSword();
+    if (!swordRecord) return null;
 
     const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.4;
     const reachDist = this._getReachDistanceToEntity(target);
-    if (reachDist > maxHitRange) return false;
+    if (reachDist > maxHitRange) return null;
 
-    if (target.onGround === false && target.velocity && target.velocity.y > 0.15) return false;
+    if (target.onGround === false && target.velocity && target.velocity.y > 0.15) return null;
 
-    return Boolean(planHitCrystalTrajectory(this, target));
+    return planHitCrystalTrajectory(this, target, swordRecord.item);
+  },
+
+  _canStartHitCrystal(target) {
+    return Boolean(this._planHitCrystalIfReady(target));
   },
 
   _tickHitCrystalLaunch(target) {
@@ -165,7 +177,7 @@ const hitCrystalMethods = {
     }
 
     const torsoPos = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
-    const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 2.0, toleranceRad: 0.22, force: true });
+    const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 2.0, toleranceRad: 0.22 });
     const equipRes = this._ensureItemHeld(swordRecord);
 
     if (typeof this.bot.setControlState === 'function') {
@@ -186,7 +198,8 @@ const hitCrystalMethods = {
       this.bot.setControlState('forward', false);
     }
 
-    const trajPlan = planHitCrystalTrajectory(this, target) ||
+    const cached = this.activePlan && this.activePlan.cachedTrajectory;
+    const trajPlan = cached || planHitCrystalTrajectory(this, target, swordRecord.item) ||
       this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 2));
     if (!trajPlan) {
       this._resetOffensiveState(true);
@@ -195,13 +208,11 @@ const hitCrystalMethods = {
 
     this.activePlan = trajPlan;
     this.stepDelayTicks = 1;
-    if (trajPlan.coverSpot) {
-      this.state = 'CRYSTAL_COVER';
-    } else if (trajPlan.needsObsidian) {
-      this.state = 'CRYSTAL_PLACE_OBSIDIAN';
-    } else {
-      this.state = 'CRYSTAL_PLACE_CRYSTAL';
-    }
+    this._enterState(
+      trajPlan.coverSpot
+        ? 'CRYSTAL_COVER'
+        : (trajPlan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL')
+    );
     return true;
   }
 };

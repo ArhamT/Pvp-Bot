@@ -1,8 +1,9 @@
 'use strict';
 
 /**
- * Protocol sanitizer, teleport settle tracker, & outgoing packet-rate monitor for PvPBotController.
- * Normalizes 1.21.6+ shifted `entity_action` IDs and strips unexpected `teleport_confirm` fields.
+ * Protocol sanitizer, teleport settle tracker, & O(1) outgoing packet-rate monitor.
+ * Normalizes 1.21.6+ shifted `entity_action` IDs (including `2: leave_bed`),
+ * fixes MC 1.21.9+ `lpVec3` knockback velocity scaling, and strips invalid `teleport_confirm` fields.
  */
 const packetSanitizerMethods = {
   _attachPacketMonitor(bot) {
@@ -11,6 +12,8 @@ const packetSanitizerMethods = {
     let cachedVersion = null;
     let isShiftedEntityAction = false;
     let usesLpVec3Velocity = false;
+    this._loggedLpVec3Fix = false;
+    this._packetHead = 0;
 
     const resolveProtocolQuirks = () => {
       const ver = bot.version || (bot._client && bot._client.version);
@@ -34,8 +37,6 @@ const packetSanitizerMethods = {
           : null;
         isShiftedEntityAction = Boolean(mappings && mappings['6'] === 'start_fall_flying');
 
-        // MC 1.21.9+ switched packet_entity_velocity from scaled i16 (1/8000 b/t) to lpVec3 (already in blocks/tick).
-        // Mineflayer 4.39.0 still divides packet.velocity by 8000, reducing all knockback by 8000x!
         const velSchema = mcData &&
           mcData.protocol &&
           mcData.protocol.play &&
@@ -52,6 +53,16 @@ const packetSanitizerMethods = {
       }
     };
 
+    const legacyShiftMap = {
+      2: 'leave_bed',
+      3: 'start_sprinting',
+      4: 'stop_sprinting',
+      5: 'start_riding_jump',
+      6: 'stop_riding_jump',
+      7: 'open_inventory',
+      8: 'start_fall_flying'
+    };
+
     bot._client.write = (name, params, ...rest) => {
       let outParams = params;
 
@@ -61,37 +72,24 @@ const packetSanitizerMethods = {
         if (params.actionId === 'start_elytra_flying') {
           outParams = { ...params, actionId: 'start_fall_flying' };
         } else if ((resolveProtocolQuirks(), isShiftedEntityAction) && typeof params.actionId === 'number') {
-          // 1.21.6+ removed start_sneaking (0) / stop_sneaking (1) and shifted all later IDs down by 2
           if (params.actionId === 0 || params.actionId === 1) {
             return false;
           }
-          const legacyMap = {
-            3: 'start_sprinting',
-            4: 'stop_sprinting',
-            5: 'start_riding_jump',
-            6: 'stop_riding_jump',
-            7: 'open_inventory',
-            8: 'start_fall_flying'
-          };
-          if (legacyMap[params.actionId]) {
-            outParams = { ...params, actionId: legacyMap[params.actionId] };
+          if (legacyShiftMap[params.actionId]) {
+            outParams = { ...params, actionId: legacyShiftMap[params.actionId] };
           }
         }
       }
 
       const now = Date.now();
       this._packetTimestamps.push(now);
-      if (this._packetTimestamps.length > 200) {
-        this._packetTimestamps = this._packetTimestamps.filter((t) => (now - t) <= 1000);
+      if (this._packetTimestamps.length - this._packetHead > 256) {
+        this._prunePacketTimestamps(now);
       }
       return origWrite(name, outParams, ...rest);
     };
 
     if (typeof bot._client.on === 'function') {
-      // Fix MC 1.21.9–1.21.11+ lpVec3 entity_velocity knockback (Mineflayer 4.39.0 divides lpVec3 by 8000).
-      // CRITICAL: Mineflayer loads its built-in `entities` plugin asynchronously on `inject_allowed`
-      // (`setTimeout(..., 0)`), AFTER createBot() returns. Re-append our listener on `inject_allowed`,
-      // `login`, and `spawn` so it is ALWAYS registered AFTER Mineflayer's entities.js listener!
       const onEntityVelocity = (packet) => {
         resolveProtocolQuirks();
         if (!usesLpVec3Velocity || !packet || !packet.velocity || typeof packet.velocity !== 'object') return;
@@ -137,17 +135,37 @@ const packetSanitizerMethods = {
         if (this.aerial && typeof this.aerial.notifyTeleport === 'function') {
           this.aerial.notifyTeleport(4);
         }
-        if (this.combat && typeof this.combat.cancelSpearLunge === 'function') {
-          this.combat.cancelSpearLunge();
+        if (this.ranged && typeof this.ranged.notifyTeleport === 'function') {
+          this.ranged.notifyTeleport();
+        }
+        if (this.burst && typeof this.burst.notifyTeleport === 'function') {
+          this.burst.notifyTeleport();
+        }
+        if (this.escape && typeof this.escape.cancel === 'function') {
+          this.escape.cancel();
         }
       });
     }
   },
 
+  _prunePacketTimestamps(now) {
+    const cutoff = now - 1000;
+    const arr = this._packetTimestamps;
+    let head = this._packetHead || 0;
+    while (head < arr.length && arr[head] < cutoff) {
+      head++;
+    }
+    if (head > 128) {
+      this._packetTimestamps = arr.slice(head);
+      this._packetHead = 0;
+    } else {
+      this._packetHead = head;
+    }
+  },
+
   getOutgoingPacketRate() {
-    const now = Date.now();
-    this._packetTimestamps = this._packetTimestamps.filter((t) => (now - t) <= 1000);
-    return this._packetTimestamps.length;
+    this._prunePacketTimestamps(Date.now());
+    return Math.max(0, this._packetTimestamps.length - (this._packetHead || 0));
   }
 };
 

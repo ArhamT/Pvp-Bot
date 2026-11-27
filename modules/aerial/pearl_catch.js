@@ -2,20 +2,16 @@
 
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('../aim');
+const { clearMovementControls } = require('../constants');
 const {
-  PEARL_SPEED,
-  PEARL_GRAVITY,
-  PEARL_DRAG,
-  clearMovementControls
-} = require('../constants');
-const { evaluateShieldCounter } = require('../mace_elytra');
+  canThrowPearl,
+  markPearlThrown,
+  solvePearlBallistics,
+  predictEntityProjectileLanding
+} = require('../pearl_ballistics');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 const pearlCatchMethods = {
-  /**
-   * Tracks enemy-thrown Ender Pearl projectiles in mid-air and simulates their exact landing point
-   * so the bot can pearl-catch the enemy on landing with a Wind Burst Mace smash.
-   */
   _handleEntitySpawn(entity) {
     if (this.aerialCfg.pearlCatchEnabled === false) return;
     if (!entity || !entity.position || !this.bot || !this.bot.entity || !this.bot.entity.position) return;
@@ -23,131 +19,26 @@ const pearlCatchMethods = {
     const name = String(entity.name || entity.displayName || '').toLowerCase();
     if (!name.includes('ender_pearl') && !name.includes('thrownenderpearl')) return;
 
-    // Ignore pearls spawned directly at our own eyes (our own thrown pearls)
     const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
     if (eyePos.distanceTo(entity.position) < 1.8) return;
 
-    const landingPos = this._predictProjectileLanding(entity.position, entity.velocity);
+    const pred = predictEntityProjectileLanding(this.bot, entity, 60);
+    if (!pred || !pred.pos) return;
     this.trackedEnemyPearl = {
       entity,
-      landingPos,
+      landingPos: pred.pos,
       expiresAt: Date.now() + 3500
     };
   },
 
-  /**
-   * Simulates an Ender Pearl's discrete Minecraft flight (drag 0.99, gravity 0.03)
-   * until hitting a solid block or reaching 60 ticks, returning predicted landing Vec3.
-   */
   _predictProjectileLanding(startPos, startVel) {
-    let x = startPos.x;
-    let y = startPos.y;
-    let z = startPos.z;
-    const vel = startVel || new Vec3(0, 0, 0);
-    let vx = vel.x;
-    let vy = vel.y;
-    let vz = vel.z;
-
-    for (let t = 0; t < 60; t++) {
-      const nextX = x + vx;
-      const nextY = y + vy;
-      const nextZ = z + vz;
-
-      if (this.bot && typeof this.bot.blockAt === 'function') {
-        const block = this.bot.blockAt(new Vec3(nextX, nextY, nextZ));
-        if (block && block.boundingBox === 'block') {
-          return new Vec3(x, Math.floor(nextY) + 1, z);
-        }
-      }
-
-      x = nextX;
-      y = nextY;
-      z = nextZ;
-      vx *= PEARL_DRAG;
-      vy = vy * PEARL_DRAG - PEARL_GRAVITY;
-      vz *= PEARL_DRAG;
-
-      if (y < -64) break;
-    }
-
-    return new Vec3(x, y, z);
+    const res = predictEntityProjectileLanding(this.bot, { position: startPos, velocity: startVel }, 60);
+    return res ? res.pos : startPos.clone();
   },
 
-  /**
-   * Solves ballistic (yaw, pitch) for throwing an Ender Pearl to land directly at `targetPos`.
-   */
   _solvePearlBallistics(targetPos, targetVel = null) {
     const eye = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
-    const vel = targetVel || new Vec3(0, 0, 0);
-
-    let flightTicks = clamp(eye.distanceTo(targetPos) / PEARL_SPEED, 1, 45);
-    let bestYaw = 0;
-    let bestPitch = 0;
-
-    for (let iter = 0; iter < 3; iter++) {
-      const predX = targetPos.x + vel.x * flightTicks;
-      const predY = targetPos.y + (Math.abs(vel.y) > 0.05 ? vel.y * flightTicks * 0.35 : 0);
-      const predZ = targetPos.z + vel.z * flightTicks;
-
-      const dx = predX - eye.x;
-      const dy = predY - eye.y;
-      const dz = predZ - eye.z;
-      const horizDist = Math.sqrt(dx * dx + dz * dz);
-      bestYaw = Math.atan2(-dx, -dz);
-
-      if (horizDist < 0.5) {
-        bestPitch = clamp(Math.atan2(dy, Math.max(0.1, horizDist)), -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05);
-        break;
-      }
-
-      // Binary search pitch in [-82°, +45°] using exact discrete pearl drag/gravity
-      let low = -82 * DEG_TO_RAD;
-      let high = 45 * DEG_TO_RAD;
-      let lastTicks = flightTicks;
-
-      for (let step = 0; step < 14; step++) {
-        const mid = (low + high) * 0.5;
-        let vx = PEARL_SPEED * Math.cos(mid);
-        let vy = PEARL_SPEED * Math.sin(mid);
-        let x = 0;
-        let y = 0;
-        let reached = false;
-        let yAtDist = -Infinity;
-        let ticks = 60;
-
-        for (let t = 1; t <= 60; t++) {
-          const px = x;
-          const py = y;
-          x += vx;
-          y += vy;
-          vx *= PEARL_DRAG;
-          vy = vy * PEARL_DRAG - PEARL_GRAVITY;
-          if (x >= horizDist) {
-            const frac = (x - px) > 1e-6 ? (horizDist - px) / (x - px) : 0;
-            yAtDist = py + (y - py) * frac;
-            ticks = (t - 1) + frac;
-            reached = true;
-            break;
-          }
-        }
-
-        if (!reached || yAtDist < dy) {
-          low = mid;
-        } else {
-          high = mid;
-          lastTicks = ticks;
-        }
-      }
-
-      bestPitch = (low + high) * 0.5;
-      flightTicks = lastTicks;
-    }
-
-    return {
-      yaw: bestYaw,
-      pitch: clamp(bestPitch, -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05),
-      flightTicks
-    };
+    return solvePearlBallistics(eye, targetPos, targetVel, 60) || { yaw: 0, pitch: 0, flightTicks: 10 };
   },
 
   /**
@@ -166,6 +57,9 @@ const pearlCatchMethods = {
     const now = Date.now();
     const cooldownMs = this.aerialCfg.pearlCatchCooldownMs !== undefined ? this.aerialCfg.pearlCatchCooldownMs : 2200;
     if ((now - this.lastPearlCatchTime) < cooldownMs) return null;
+    if (!canThrowPearl(this.bot, { emergency: false, reserveCount: 1, cooldownMs: Math.min(1200, cooldownMs), now })) {
+      return null;
+    }
 
     const { onGround, inWater, inLava, inCobweb } = this._getEnvironmentFlags();
     if (inWater || inLava || inCobweb) return null;
@@ -276,6 +170,10 @@ const pearlCatchMethods = {
     // Stage 1: Dead-stop horizontal velocity, aim straight up (+90°) for vertical catch OR ballistic arc for enemy pearl
     if (this.stage === 'PEARL_AIM_THROW') {
       if (this.stageTicks > 18 || !this.pearlCatchLandingTarget) {
+        if (onGround) {
+          this.stage = 'SWORD_RESTORE';
+          return this._tickSwordRestore();
+        }
         this.mode = AERIAL_MODES.MACE_LAUNCH;
         this.stage = 'AIRBORNE_DESCENT';
         return true;
@@ -289,13 +187,16 @@ const pearlCatchMethods = {
       const isEnemyPearl = reason === 'enemy_pearl_intercept';
       const useVerticalCatch = !isEnemyPearl && (hasWindCharge || reason === 'windburst_self_pearl_catch' || reason === 'ground_pearl_catch');
 
-      // CRITICAL: Zero all WASD/sprint/jump controls for vertical catch so horizontal drift NEVER breaks alignment!
       if (useVerticalCatch) {
         clearMovementControls(this.bot);
       }
 
       const pearlSel = this._findItemByName('ender_pearl');
       if (!pearlSel) {
+        if (onGround) {
+          this.stage = 'SWORD_RESTORE';
+          return this._tickSwordRestore();
+        }
         this.mode = AERIAL_MODES.MACE_LAUNCH;
         this.stage = 'AIRBORNE_DESCENT';
         return true;
@@ -336,6 +237,7 @@ const pearlCatchMethods = {
         this.pearlTeleportArrived = false;
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
+          markPearlThrown(this.bot, 'pearl_catch');
         }
         this.lastPearlCatchTime = Date.now();
         this.trackedEnemyPearl = null;
@@ -350,25 +252,26 @@ const pearlCatchMethods = {
       return true;
     }
 
-    // Stage 1b: Next-tick Wind Charge interception straight up (+90° pitch) while movement stays dead-stopped
+    // Stage 1b: Strictly 1-tick-settled Wind Charge interception straight up (+90° pitch)
     if (this.stage === 'PEARL_WIND_INTERCEPT') {
       clearMovementControls(this.bot);
 
       const windSel = this._findItemByName('wind_charge');
-      if (!windSel || !this.pearlInterceptVec) {
+      if (!windSel || !this.pearlInterceptVec || this.stageTicks > 5) {
         this.stage = 'PEARL_WAIT_TP';
         this.stageTicks = 0;
         return true;
       }
 
-      if (typeof windSel.hotbarIndex === 'number' && windSel.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
-        this.bot.setQuickBarSlot(windSel.hotbarIndex);
-      } else {
-        this._equipHand(windSel);
-      }
-
       const windPitch = this.pearlInterceptVec.vertical ? Math.PI / 2 : this.pearlInterceptVec.pitch;
-      this.aimer.stepTowardsAngles(this.pearlInterceptVec.yaw, windPitch, { force: true });
+      const aimStatus = this.aimer.stepTowardsAngles(this.pearlInterceptVec.yaw, windPitch, {
+        speedMultiplier: 2.2,
+        toleranceRad: 0.14
+      });
+      const eq = this._equipHand(windSel);
+      if (!eq.ready || eq.swapped || !aimStatus.aligned) {
+        return true;
+      }
       if (typeof this.bot.activateItem === 'function') {
         this.bot.activateItem(false);
       }
@@ -434,21 +337,9 @@ const pearlCatchMethods = {
         return this._tickPearlCatch(target);
       }
 
-      // Full 360° WASD+sprint airborne steering directly onto opponent's predicted hitbox!
       const { aimStatus } = this._steerAirborneToward(target, 1);
 
-      // Shield countering branch (BACKSTAB / STUN_SLAM / SHIELD_DRAIN)
-      const counter = evaluateShieldCounter(this.bot, this.targetState, {
-        hasAxe: Boolean(this._findAxe()),
-        hasMace: Boolean(this._findDensityMace()),
-        isAirborne: !onGround,
-        isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
-      });
-      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.8) {
-        this.mode = AERIAL_MODES.STUN_SLAM;
-        this.stage = 'AXE_BREAK';
-        this.stageTicks = 0;
-        this.stunSlamAxeSwapped = false;
+      if (reachDist <= 3.8 && this._tryEnterStunSlam(target, 1.8)) {
         return this._tickStunSlam(target);
       }
 
@@ -566,18 +457,7 @@ const pearlCatchMethods = {
       const reachDist = this._getReachDistance(target);
       const { aimStatus } = this._steerAirborneToward(target, 1);
 
-      // If opponent raises shield frontally, stun-slam with Axe -> Density Mace!
-      const counter = evaluateShieldCounter(this.bot, this.targetState, {
-        hasAxe: Boolean(this._findAxe()),
-        hasMace: Boolean(this._findDensityMace()),
-        isAirborne: !onGround,
-        isGliding: false
-      });
-      if (counter.strategy === 'STUN_SLAM' && reachDist <= 3.8) {
-        this.mode = AERIAL_MODES.STUN_SLAM;
-        this.stage = 'AXE_BREAK';
-        this.stageTicks = 0;
-        this.stunSlamAxeSwapped = false;
+      if (reachDist <= 3.8 && this._tryEnterStunSlam(target, 1.8)) {
         return this._tickStunSlam(target);
       }
 

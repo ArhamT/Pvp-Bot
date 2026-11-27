@@ -1,23 +1,33 @@
 'use strict';
 
-const { posKey, findOverlappingBlock, isPlayerEmbeddedInBlock } = require('./constants');
+const {
+  posKey,
+  hasStatusEffect,
+  sampleBodyHazards,
+  isPlayerEmbeddedInBlock
+} = require('./constants');
 const { findInventoryItem, ensureItemHeld } = require('./inventory_utils');
 const { BlockMiner } = require('./mining');
+const { WaterBucketController } = require('./escape/water_bucket_helper');
 const { cobwebEscapeMethods } = require('./escape/cobweb_escape');
 const { liquidEscapeMethods } = require('./escape/liquid_escape');
 const { blockEscapeMethods } = require('./escape/block_escape');
+const { boxBreakoutMethods } = require('./escape/box_breakout');
 const {
-  hazardUnstickMethods,
+  railStallEscapeMethods,
   RAIL_BLOCK_NAMES,
   UNBREAKABLE_BLOCKS,
   isTntCartEntity
-} = require('./escape/hazard_unstick');
+} = require('./escape/rail_stall_escape');
 
 /**
  * Modular escape coordinator combining:
- * - Lava & water shore escape (`modules/escape/liquid_escape.js`)
- * - 3-tier cobweb escape (`modules/escape/cobweb_escape.js`)
- * - Rail/TNT-cart evasion, embedded-block digging, & stall unstick (`modules/escape/hazard_unstick.js`)
+ * - Unified Water Bucket FSM (`modules/escape/water_bucket_helper.js`)
+ * - 3-tier Cobweb Escape (`modules/escape/cobweb_escape.js`)
+ * - Lava, Fire & Water Shore Escape (`modules/escape/liquid_escape.js`)
+ * - Pillar-Out, Bridge-Step & Anti-Combo Wall (`modules/escape/block_escape.js`)
+ * - Box & Roof Breakout (`modules/escape/box_breakout.js`)
+ * - Rail/TNT-Cart Evasion & Stall Unstick (`modules/escape/rail_stall_escape.js`)
  */
 class EscapeModule {
   constructor(bot, config, aimer) {
@@ -26,27 +36,14 @@ class EscapeModule {
     this.escapeCfg = (config && config.escape) || {};
     this.aimer = aimer;
 
-    this.activeMode = 'IDLE'; // 'IDLE' | 'LAVA_ESCAPE' | 'COBWEB_ESCAPE' | 'WATER_ESCAPE' | 'BLOCK_STUCK' | 'RAIL_EVADE' | 'STALL_UNSTICK'
+    this.activeMode = 'IDLE';
     this.modeTicks = 0;
 
     this.diggingInProgress = false;
-    this.digStartedAt = 0;
-    this.digSettleTicks = 0;
     this.miner = new BlockMiner(bot, aimer);
+    this.waterCtrl = new WaterBucketController(bot, aimer);
 
-    this.lavaWaterState = 'IDLE';
-    this.lastLavaWaterAt = 0;
-    this.lavaWaterTicks = 0;
-    this.fireWaterState = 'IDLE';
-    this.lastFireWaterAt = 0;
-    this.fireWaterTicks = 0;
-    this.fireWaterPos = null;
     this.pearlSettleTicks = 0;
-
-    this.cobwebWaterState = 'IDLE';
-    this.cobwebWaterPos = null;
-    this.cobwebWaterTicks = 0;
-    this.cobwebWaterFailedUntil = 0;
     this.cobwebPearlSettleTicks = 0;
     this.lastCobwebPearlAt = 0;
 
@@ -56,6 +53,9 @@ class EscapeModule {
     this.evadeTargetPos = null;
     this.evadedRails = new Map();
     this.railBlockThreat = null;
+    this._railScanTickAt = 0;
+    this._railScanResult = null;
+    this._lastFullRailScanAt = 0;
 
     this.stallTicks = 0;
     this.lastCheckPos = null;
@@ -70,11 +70,21 @@ class EscapeModule {
     this.boxMinePlan = null;
     this.boxedTicks = 0;
 
+    this._bodyHazardCache = null;
+    this._bodyHazardCacheAt = 0;
+
     this._onBlockUpdate = this._handleBlockUpdate.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
     if (this.bot && typeof this.bot.on === 'function') {
       this.bot.on('blockUpdate', this._onBlockUpdate);
       this.bot.on('entitySpawn', this._onEntitySpawn);
+    }
+  }
+
+  _setActiveMode(nextMode) {
+    if (this.activeMode !== nextMode) {
+      this.activeMode = nextMode;
+      this.modeTicks = 0;
     }
   }
 
@@ -91,17 +101,9 @@ class EscapeModule {
     this.activeMode = 'IDLE';
     this.modeTicks = 0;
     this.diggingInProgress = false;
-    this.digSettleTicks = 0;
     if (this.miner) this.miner.cancel();
-    this.lavaWaterState = 'IDLE';
-    this.lavaWaterTicks = 0;
-    this.fireWaterState = 'IDLE';
-    this.fireWaterTicks = 0;
-    this.fireWaterPos = null;
+    if (this.waterCtrl) this.waterCtrl.cancel();
     this.pearlSettleTicks = 0;
-    this.cobwebWaterState = 'IDLE';
-    this.cobwebWaterPos = null;
-    this.cobwebWaterTicks = 0;
     this.cobwebPearlSettleTicks = 0;
     this.waterStuckTicks = 0;
     this.lastWaterCheckPos = null;
@@ -115,6 +117,7 @@ class EscapeModule {
     this.blockEscapePlan = null;
     this.boxMinePlan = null;
     this.boxedTicks = 0;
+    this._bodyHazardCache = null;
   }
 
   _handleBlockUpdate(oldBlock, newBlock) {
@@ -129,13 +132,21 @@ class EscapeModule {
       const exp = this.evadedRails.get(key);
       if (exp && Date.now() < exp) return;
       this.railBlockThreat = { type: 'rail', key, pos: center, blockPos: newBlock.position.clone(), detectedAt: Date.now() };
+      this._railScanTickAt = 0;
     }
   }
 
   _handleEntitySpawn(entity) {
     if (this.escapeCfg.enabled === false || !isTntCartEntity(entity) || !entity.position || !this.bot || !this.bot.entity) return;
     if (this.bot.entity.position.distanceTo(entity.position) <= 4.8) {
-      this.railBlockThreat = { type: 'tnt_minecart', key: `cart:${entity.id}`, pos: entity.position.clone(), detectedAt: Date.now() };
+      this.railBlockThreat = {
+        type: 'tnt_minecart',
+        entityId: entity.id,
+        key: `cart:${entity.id}`,
+        pos: entity.position.clone(),
+        detectedAt: Date.now()
+      };
+      this._railScanTickAt = 0;
     }
   }
 
@@ -147,69 +158,39 @@ class EscapeModule {
     return ensureItemHeld(this.bot, found);
   }
 
+  _getBodyHazards() {
+    const now = Date.now();
+    if (this._bodyHazardCache && (now - this._bodyHazardCacheAt) < 40) {
+      return this._bodyHazardCache;
+    }
+    this._bodyHazardCache = sampleBodyHazards(this.bot);
+    this._bodyHazardCacheAt = now;
+    return this._bodyHazardCache;
+  }
+
   isManagingOwnLiquid() {
-    return Boolean(this.lavaWaterState !== 'IDLE' || this.cobwebWaterState !== 'IDLE' || this.fireWaterState !== 'IDLE');
+    return Boolean(this.waterCtrl && this.waterCtrl.isActive());
   }
 
   hasFireResistance(context = {}) {
     if (context && context.hasFireRes) return true;
-    if (!this.bot || !this.bot.entity || !this.bot.entity.effects) return false;
-    const effects = this.bot.entity.effects;
-
-    // Resolve exact FireResistance effect ID from bot.registry (id 11 in minecraft-data 1.20.4–1.21.11+)
-    let regFireResId = null;
-    if (this.bot.registry && this.bot.registry.effectsByName) {
-      const regEntry = this.bot.registry.effectsByName.FireResistance || this.bot.registry.effectsByName.fire_resistance;
-      if (regEntry && typeof regEntry.id === 'number') {
-        regFireResId = regEntry.id;
-      }
-    }
-    if (regFireResId !== null && (effects[regFireResId] || effects[String(regFireResId)])) {
-      return true;
-    }
-
-    // Fallback when registry is absent: MC 1.20.5–1.21.11 uses 0-based id 11; older 1-based uses id 12
-    const ver = String(this.bot.version || '');
-    const isModern0Based = !ver || /^1\.(20\.[5-9]|21|2[2-9])/.test(ver);
-    if (isModern0Based && (effects[11] || effects['11'])) return true;
-    if (effects[12] || effects['12']) return true;
-
-    for (const [key, eff] of Object.entries(effects)) {
-      if (!eff) continue;
-      if (regFireResId !== null && Number(eff.id) === regFireResId) return true;
-      if (isModern0Based && Number(eff.id) === 11) return true;
-      if (Number(eff.id) === 12) return true;
-      const effName = String(eff.name || eff.displayName || '').toLowerCase();
-      if (effName.includes('fireresistance') || effName.includes('fire_resistance') || effName.includes('fire resistance')) {
-        return true;
-      }
-      if (this.bot.registry && this.bot.registry.effects) {
-        const reg = this.bot.registry.effects[Number(eff.id !== undefined ? eff.id : key)];
-        if (reg && /fire.?res/i.test(String(reg.name || reg.displayName || ''))) {
-          return true;
-        }
-      }
-    }
-    return false;
+    return hasStatusEffect(this.bot, 'fire_resistance');
   }
 
   isOnFire() {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
-    if (this.bot.entity.onFire || this.bot.entity.isOnFire) return true;
-    if (this.bot.entity.metadata && (Number(this.bot.entity.metadata[0]) & 0x01)) return true;
-    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'fire' || b.name === 'soul_fire'));
+    return this._getBodyHazards().inFire;
   }
 
   isInLava() {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
-    if (this.bot.entity.isInLava) return true;
-    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'lava' || b.name === 'flowing_lava'));
+    return this._getBodyHazards().inLava;
   }
 
   isInWater() {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return false;
-    if (this.bot.entity.isInWater) return true;
-    return Boolean(findOverlappingBlock(this.bot, (b) => b.name === 'water' || b.name === 'flowing_water'));
+    return this._getBodyHazards().inWater;
+  }
+
+  findOverlappingCobweb() {
+    return this._getBodyHazards().cobweb;
   }
 
   isEmbeddedInSolidBlock() {
@@ -224,33 +205,27 @@ class EscapeModule {
     return null;
   }
 
-  findOverlappingCobweb() {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position) return null;
-    return findOverlappingBlock(this.bot, (b) => b.name === 'cobweb');
-  }
-
-  isInCobwebWithoutWater() {
-    if (this._findItem('water_bucket')) return null;
-    return this.findOverlappingCobweb();
-  }
-
   tick(target, context = {}) {
     if (this.escapeCfg.enabled === false || !this.bot || !this.bot.entity || !this.bot.entity.position) {
       return false;
     }
 
-    if (this.isInLava() || this.lavaWaterState !== 'IDLE') {
+    // Fresh single-pass hitbox hazard sample once per tick
+    this._bodyHazardCache = sampleBodyHazards(this.bot);
+    this._bodyHazardCacheAt = Date.now();
+
+    if (this._bodyHazardCache.inLava || this.waterCtrl.isActive('lava')) {
       return this._tickLavaEscape(target);
     }
 
-    if (this.fireWaterState !== 'IDLE' || (this.isOnFire() && !this.hasFireResistance(context))) {
+    if (this.waterCtrl.isActive('fire') || (this._bodyHazardCache.inFire && !this.hasFireResistance(context))) {
       if (this._tickFireExtinguish(context)) {
         return true;
       }
     }
 
-    const overlappingCobweb = this.findOverlappingCobweb();
-    if (overlappingCobweb || this.cobwebWaterState !== 'IDLE') {
+    const overlappingCobweb = this._bodyHazardCache.cobweb;
+    if (overlappingCobweb || this.waterCtrl.isActive('cobweb')) {
       return this._tickCobwebEscape(overlappingCobweb, target);
     }
 
@@ -289,7 +264,8 @@ Object.assign(
   cobwebEscapeMethods,
   liquidEscapeMethods,
   blockEscapeMethods,
-  hazardUnstickMethods
+  boxBreakoutMethods,
+  railStallEscapeMethods
 );
 
 module.exports = {

@@ -3,7 +3,7 @@
 const { Vec3 } = require('vec3');
 const { canSeeBlockFace } = require('../placement_los');
 const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
-const { hasExistingCrystalAt } = require('./surround_city');
+const { collectCrystalPositions, hasExistingCrystalAt } = require('./surround_city');
 const {
   CRYSTAL_POWER,
   isAirLike,
@@ -51,7 +51,8 @@ const crystalSkillMethods = {
   _findBestCrystalPlacement(target, predictedFeet) {
     if (this.burstCfg.crystalEnabled === false) return null;
     const now = Date.now();
-    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 100)) return null;
+    const crystalCd = this.burstCfg.crystalCooldownMs !== undefined ? this.burstCfg.crystalCooldownMs : 50;
+    if ((now - this.lastCrystalTime) < crystalCd) return null;
 
     const crystalItem = this._findItem('end_crystal');
     if (!crystalItem) return null;
@@ -63,9 +64,18 @@ const crystalSkillMethods = {
 
     const obsidianItem = this._findItem('obsidian');
     const scanRadius = this.burstCfg.scanRadius || 4.5;
+    const scanRadiusSq = scanRadius * scanRadius;
     const rInt = Math.ceil(scanRadius);
     const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
     const minSafeHp = this._isHoldingOffhandTotem() ? 4 : 6;
+    const lowTargetHp = Boolean(
+      this._isInTotemPunishWindow() ||
+      (typeof target.health === 'number' && target.health <= 6)
+    );
+    const minTargetDmg = lowTargetHp ? 2.2 : 4.0;
+
+    // Pre-collect all live crystal positions once (eliminates N*M entity scan inside 3D loop!)
+    const liveCrystals = collectCrystalPositions(this.bot);
 
     const cx = Math.floor(predictedFeet.x);
     const cy = Math.floor(predictedFeet.y);
@@ -74,21 +84,29 @@ const crystalSkillMethods = {
     let best = null;
 
     for (let dx = -rInt; dx <= rInt; dx++) {
+      const bx = cx + dx;
+      const ddxT = (bx + 0.5) - predictedFeet.x;
+      const ddxE = (bx + 0.5) - eyePos.x;
       for (let dy = -2; dy <= 1; dy++) {
+        const by = cy + dy;
+        const ddyT = (by + 1.0) - predictedFeet.y;
+        const ddyE = (by + 0.8) - eyePos.y;
         for (let dz = -rInt; dz <= rInt; dz++) {
-          const basePos = new Vec3(cx + dx, cy + dy, cz + dz);
-          const blastPos = basePos.offset(0.5, 1.0, 0.5);
+          const bz = cz + dz;
+          const ddzT = (bz + 0.5) - predictedFeet.z;
+          if ((ddxT * ddxT + ddyT * ddyT + ddzT * ddzT) > scanRadiusSq) continue;
+          const ddzE = (bz + 0.5) - eyePos.z;
+          if ((ddxE * ddxE + ddyE * ddyE + ddzE * ddzE) > 20.25) continue;
 
-          if (blastPos.distanceTo(predictedFeet) > scanRadius) continue;
-          if (eyePos.distanceTo(basePos.offset(0.5, 0.8, 0.5)) > 4.5) continue;
+          const basePos = new Vec3(bx, by, bz);
+          const blastPos = new Vec3(bx + 0.5, by + 1.0, bz + 0.5);
 
           const baseBlock = this.bot.blockAt(basePos);
-          const crystalSpace = basePos.offset(0, 1, 0);
+          const crystalSpace = new Vec3(bx, by + 1, bz);
           const aboveBlock = this.bot.blockAt(crystalSpace);
           if (!baseBlock || !isAirLike(aboveBlock)) continue;
-          if (hasExistingCrystalAt(this.bot, crystalSpace)) continue;
+          if (hasExistingCrystalAt(this.bot, crystalSpace, liveCrystals)) continue;
 
-          // Ensure crystal space does not collide with target or bot
           if (this._intersectsEntityHitbox(crystalSpace, botPos)) continue;
           if (this._intersectsEntityHitbox(crystalSpace, target.position, target.height || 1.8)) continue;
 
@@ -110,7 +128,7 @@ const crystalSkillMethods = {
           }
 
           const targetDmg = this.estimateBlastDamage(blastPos, predictedFeet, target, CRYSTAL_POWER);
-          if (targetDmg < 4.0) continue;
+          if (targetDmg < minTargetDmg) continue;
 
           const rawSelfDmg = this.estimateBlastDamage(
             blastPos,
@@ -247,13 +265,13 @@ const crystalSkillMethods = {
         ? 'CRYSTAL_DETONATE'
         : (plan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL');
       if (!cover) {
-        this.state = nextState;
+        this._enterState(nextState);
         return true;
       }
-      const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 2.0, toleranceRad: 0.2, force: true });
+      const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, { speedMultiplier: 2.0, toleranceRad: 0.2 });
       const equipRes = this._ensureItemHeld(cover.blockRecord);
       if (!equipRes.found) {
-        this.state = nextState;
+        this._enterState(nextState);
         return true;
       }
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -273,7 +291,7 @@ const crystalSkillMethods = {
         }
       }
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = nextState;
+      this._enterState(nextState);
       return true;
     }
 
@@ -281,7 +299,7 @@ const crystalSkillMethods = {
     if (this.state === 'CRYSTAL_PLACE_OBSIDIAN') {
       const existingBase = this.bot.blockAt(plan.basePos);
       if (existingBase && (existingBase.name === 'obsidian' || existingBase.name === 'bedrock')) {
-        this.state = 'CRYSTAL_PLACE_CRYSTAL';
+        this._enterState('CRYSTAL_PLACE_CRYSTAL');
         return true;
       }
 
@@ -293,8 +311,7 @@ const crystalSkillMethods = {
 
       const aimStatus = this.aimer.stepTowardsPoint(plan.obsidianRef.aimPos, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.2
       });
       const equipRes = this._ensureItemHeld(obsItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -317,7 +334,7 @@ const crystalSkillMethods = {
       }
 
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = 'CRYSTAL_PLACE_CRYSTAL';
+      this._enterState('CRYSTAL_PLACE_CRYSTAL');
       return true;
     }
 
@@ -325,7 +342,6 @@ const crystalSkillMethods = {
     if (this.state === 'CRYSTAL_PLACE_CRYSTAL') {
       const baseBlock = this.bot.blockAt(plan.basePos);
       if (!baseBlock || (baseBlock.name !== 'obsidian' && baseBlock.name !== 'bedrock')) {
-        // Wait briefly for server block update if we just placed obsidian
         if (this.stateTicks < 10) return true;
         this._resetOffensiveState(true);
         return false;
@@ -346,8 +362,7 @@ const crystalSkillMethods = {
       const topFaceAim = topVis.aimPos;
       const aimStatus = this.aimer.stepTowardsPoint(topFaceAim, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.2
       });
       const equipRes = this._ensureItemHeld(crystalItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -357,8 +372,6 @@ const crystalSkillMethods = {
       this._markOwnPlacement(plan.basePos);
       this._markOwnPlacement(plan.basePos.offset(0, 1, 0));
 
-      // In Mineflayer, End Crystals are placed on Obsidian/Bedrock via activateBlock on the top face (0, 1, 0).
-      // Using placeEntity fails/throws on end_crystal in Mineflayer 4.x.
       if (typeof this.bot.activateBlock === 'function') {
         Promise.resolve(this.bot.activateBlock(baseBlock, new Vec3(0, 1, 0))).catch(() => {});
       } else if (typeof this.bot.placeBlock === 'function') {
@@ -367,9 +380,8 @@ const crystalSkillMethods = {
         Promise.resolve(this.bot.placeEntity(baseBlock, new Vec3(0, 1, 0))).catch(() => {});
       }
 
-      // Detonate strictly on the next tick (sequential anticheat safety)
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = 'CRYSTAL_DETONATE';
+      this._enterState('CRYSTAL_DETONATE');
       return true;
     }
 
@@ -381,8 +393,7 @@ const crystalSkillMethods = {
       const aimPos = crystalEntity ? crystalEntity.position.offset(0, 0.5, 0) : plan.blastPos.offset(0, 0.5, 0);
       const aimStatus = this.aimer.stepTowardsPoint(aimPos, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.3,
-        force: true
+        toleranceRad: 0.3
       });
 
       if (!crystalEntity || (this.stepDelayTicks > 0 && !plan.spawnedCrystal) || !aimStatus.aligned) {
@@ -394,8 +405,6 @@ const crystalSkillMethods = {
       }
       this.lastCrystalTime = Date.now();
 
-      // HT1 Double-Pop / Triple-Pop: immediately chain another crystal onto the same obsidian block
-      // on the very next tick while the opponent is airborne / popped (zero re-scan delay!)
       const nextChain = (plan.chainCount || 0) + 1;
       if (plan.basePos && this._canContinueDoublePop(target, plan.basePos, nextChain)) {
         this.activePlan = {
@@ -408,8 +417,7 @@ const crystalSkillMethods = {
           spawnedCrystal: null,
           chainCount: nextChain
         };
-        this.state = 'CRYSTAL_PLACE_CRYSTAL';
-        this.stateTicks = 0;
+        this._enterState('CRYSTAL_PLACE_CRYSTAL');
         this.stepDelayTicks = this.placeDelayTicks;
         return true;
       }

@@ -1,11 +1,20 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { HOTBAR_START, SWORD_PRIORITY, AXE_PRIORITY, getItemMetadataText, hasItemEnchant } = require('./constants');
+const { SWORD_PRIORITY, AXE_PRIORITY, BLAST_SHIELD_BLOCK_PRIORITY, hasItemEnchant } = require('./constants');
+const {
+  getHotbarStart,
+  isSlotInHotbar,
+  getInventoryItems,
+  findInventoryItem,
+  countInventoryItem,
+  isCrossbowCharged,
+  ensureItemHeld
+} = require('./inventory_utils');
 const { canSeeBlockFace } = require('./placement_los');
 
 const RAIL_NAMES = ['rail', 'powered_rail', 'detector_rail', 'activator_rail'];
-const SHIELD_BLOCK_PRIORITY = ['obsidian', 'cobbled_deepslate', 'cobblestone', 'stone', 'deepslate'];
+const SHIELD_BLOCK_PRIORITY = BLAST_SHIELD_BLOCK_PRIORITY;
 const ARROW_NAMES = ['arrow', 'spectral_arrow', 'tipped_arrow'];
 
 const CART_STATES = Object.freeze({
@@ -89,42 +98,28 @@ class CartModule {
   }
 
   _getHotbarStart() {
-    return (this.bot && this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
+    return getHotbarStart(this.bot);
   }
 
   _getItems() {
-    if (!this.bot || !this.bot.inventory || typeof this.bot.inventory.items !== 'function') return [];
-    return this.bot.inventory.items().filter(Boolean);
+    return getInventoryItems(this.bot);
   }
 
   _isInHotbar(item) {
-    const start = this._getHotbarStart();
-    return Boolean(item && typeof item.slot === 'number' && item.slot >= start && item.slot < start + 9);
+    return Boolean(item && isSlotInHotbar(this.bot, item.slot));
   }
 
   _findItem(names, hotbarOnly = false) {
-    const items = this._getItems();
-    for (const name of names) {
-      const hb = items.find((i) => i.name === name && this._isInHotbar(i));
-      if (hb) return hb;
-    }
-    if (hotbarOnly) return null;
-    for (const name of names) {
-      const inv = items.find((i) => i.name === name);
-      if (inv) return inv;
-    }
-    return null;
+    const found = findInventoryItem(this.bot, names, { hotbarOnly });
+    return found ? found.item : null;
   }
 
   countTntCarts() {
-    return this._getItems().reduce((sum, i) => (i.name === 'tnt_minecart' ? sum + (i.count || 1) : sum), 0);
+    return countInventoryItem(this.bot, 'tnt_minecart');
   }
 
   isCrossbowCharged(item) {
-    if (!item || item.name !== 'crossbow') return false;
-    const raw = getItemMetadataText(item);
-    return (raw.includes('charged_projectiles') || raw.includes('charged')) &&
-      (raw.includes('arrow') || raw.includes('firework'));
+    return isCrossbowCharged(item);
   }
 
   _hasArrows() {
@@ -192,24 +187,10 @@ class CartModule {
    */
   _equipSequential(item) {
     if (!item || !this.bot) return { ready: false, swapped: false };
-    if (this._isHoldingExact(item)) return { ready: true, swapped: false };
     if (this.swappedThisTick) return { ready: false, swapped: false };
-
-    const start = this._getHotbarStart();
-    if (this._isInHotbar(item) && typeof this.bot.setQuickBarSlot === 'function') {
-      this.bot.setQuickBarSlot(item.slot - start);
-      this.swappedThisTick = true;
-      return { ready: false, swapped: true };
-    }
-
-    if (!this.equipBusy && typeof this.bot.equip === 'function') {
-      this.equipBusy = true;
-      this.swappedThisTick = true;
-      Promise.resolve(this.bot.equip(item, 'hand'))
-        .catch(() => {})
-        .finally(() => { this.equipBusy = false; });
-    }
-    return { ready: false, swapped: true };
+    const eq = ensureItemHeld(this.bot, { item }, { exactCrossbowCharge: true });
+    if (eq.swapped) this.swappedThisTick = true;
+    return { ready: eq.held, swapped: eq.swapped };
   }
 
   /**
@@ -380,14 +361,8 @@ class CartModule {
 
   tick(target) {
     this.swappedThisTick = false;
-    this.cancel();
-    return false;
-  }
-
-  _legacyTick(target) {
-    this.swappedThisTick = false;
-    if (this.cartCfg.enabled === false || !this.bot || !this.bot.entity || !target || !target.isValid) {
-      this.cancel();
+    if (this.cartCfg.enabled !== true || !this.bot || !this.bot.entity || !target || !target.isValid) {
+      if (this.state !== CART_STATES.IDLE) this.cancel();
       return false;
     }
 

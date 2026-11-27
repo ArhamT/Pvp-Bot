@@ -3,7 +3,7 @@
 const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('../aim');
 const { hasItemEnchant } = require('../constants');
-const { evaluateShieldCounter, shouldConserveElytra } = require('../mace_elytra');
+const { shouldConserveElytra } = require('../mace_elytra');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 /**
@@ -23,8 +23,10 @@ const elytraMaceMethods = {
     const { inWater, inLava } = this._getEnvironmentFlags();
     if (inWater || inLava) return false;
 
-    // Must carry elytra, chestplate (or already wearing elytra), and mace
+    // Must carry healthy elytra, chestplate (or already wearing elytra), and mace
     if (!this._hasElytraAvailable()) return false;
+    const conserveInfo = shouldConserveElytra(this.bot, Math.min(12, this.aerialCfg.elytraConserveThreshold || 50));
+    if (conserveInfo.low && conserveInfo.remaining <= 8) return false;
     if (!this._hasChestplateAvailable()) return false;
     if (!this._findMace()) return false;
 
@@ -310,22 +312,6 @@ const elytraMaceMethods = {
       const dynamicStrikeHeight = strikeHeight + speedMargin;
       const dynamicSwapReach = 5.5 + speedMargin * 0.6;
 
-      // Elytra durability conservation: alternate Chestplate / Elytra mid-flight when remaining < threshold
-      const conserveInfo = shouldConserveElytra(this.bot, this.aerialCfg.elytraConserveThreshold || 50);
-      if (conserveInfo.low && this._hasChestplateAvailable()) {
-        this.elytraConserveTicks++;
-        const mod = this.elytraConserveTicks % 5;
-        if (mod === 1 && this._isWearingElytra()) {
-          this._restoreChestplate(true);
-        } else if (mod === 4 && !this._isWearingElytra()) {
-          const elySel = this._findItemByName('elytra');
-          if (elySel) {
-            this._equipTorso(elySel.item, true);
-            this._sendStartElytraFlying();
-          }
-        }
-      }
-
       // HT1 mid-dive rocket acceleration if target sprinted far away (>15b) and we're losing speed
       const rocketSel = this._findItemByName('firework_rocket');
       const rocketCooldown = this.aerialCfg.elytraRocketCooldownMs !== undefined ? this.aerialCfg.elytraRocketCooldownMs : 1000;
@@ -419,18 +405,7 @@ const elytraMaceMethods = {
 
       const { aimStatus } = this._steerAirborneToward(target, 1);
 
-      // Shield counter: stun-slam with Axe -> Density Mace if opponent shields frontally
-      const counter = evaluateShieldCounter(this.bot, this.targetState, {
-        hasAxe: Boolean(this._findAxe()),
-        hasMace: Boolean(this._findDensityMace()),
-        isAirborne: !onGround,
-        isGliding: false
-      });
-      if (counter.strategy === 'STUN_SLAM' && reachDist <= 4.0) {
-        this.mode = AERIAL_MODES.STUN_SLAM;
-        this.stage = 'AXE_BREAK';
-        this.stageTicks = 0;
-        this.stunSlamAxeSwapped = false;
+      if (reachDist <= 4.0 && this._tryEnterStunSlam(target, 1.8)) {
         return this._tickStunSlam(target);
       }
 
@@ -448,17 +423,17 @@ const elytraMaceMethods = {
         this.bot.attack(target);
         this._resetFallAfterSmash();
 
-        // If Mace has Wind Burst, chain immediately into airborne bounce/re-dive!
-        if (this.aerialCfg.windBurstChainEnabled && maceSel && hasItemEnchant(maceSel.item, 'wind_burst')) {
+        if (this.aerialCfg.windBurstChainEnabled !== false && maceSel && hasItemEnchant(maceSel.item, 'wind_burst')) {
           this.mode = AERIAL_MODES.MACE_LAUNCH;
           this.stage = 'WIND_BURST_BOUNCE';
           this.stageTicks = 0;
           return true;
         }
 
-        // Loop back into Launch/Glide immediately to lock down non-elytra targets
+        // Only re-loop Elytra Dive when outside immediate melee range (>= 5.5b) so we never strip Chestplate in-face!
         if (
           this.aerialCfg.loopDiveOnGrounded !== false &&
+          pos.distanceTo(target.position) >= 5.5 &&
           this.targetState &&
           !this.targetState.isGliding &&
           this._hasElytraAvailable() &&
@@ -553,45 +528,6 @@ const elytraMaceMethods = {
     this.stage = (densityMace && this._isHoldingSelection(densityMace))
       ? 'STRIKE_SMASH'
       : 'STRIKE_EQUIP_MACE';
-    return true;
-  },
-
-  /**
-   * Elytra Wind-Charge Boost & B-Hopping height preservation loop.
-   */
-  _tickElytraBoost(target) {
-    this.stageTicks++;
-    const { onGround, inWater } = this._getEnvironmentFlags();
-    if (onGround || inWater || this.stageTicks > 20) {
-      this._resetState();
-      return false;
-    }
-
-    const yaw = (target && target.position)
-      ? Math.atan2(-(target.position.x - this.bot.entity.position.x), -(target.position.z - this.bot.entity.position.z))
-      : this.bot.entity.yaw;
-
-    if (this.stage === 'BOOST_SNAP_DOWN') {
-      const windSel = this._findItemByName('wind_charge');
-      if (windSel) {
-        const eq = this._equipHand(windSel);
-        this.aimer.stepTowardsAngles(yaw, -Math.PI / 2, { force: true });
-        if (eq.ready && !eq.swapped) {
-          if (typeof this.bot.activateItem === 'function') {
-            this.bot.activateItem(false);
-          }
-          this.stage = 'BOOST_SNAP_UP';
-        }
-        return true;
-      }
-      this.stage = 'BOOST_SNAP_UP';
-    }
-
-    this.aimer.stepTowardsAngles(yaw, 65 * DEG_TO_RAD, { force: true });
-    this.bHopTicks++;
-    if (this.bHopTicks >= 4) {
-      this._resetState();
-    }
     return true;
   }
 };

@@ -5,65 +5,11 @@ const { ROAM_HAZARD_BLOCKS, clearMovementControls, inspectColumnStep } = require
 const { normalizeAngle } = require('../aim');
 
 /**
- * Packet-quiet IDLE spawn roaming & randomized duel chat advertisement mixin for PvPBotController.
+ * Packet-quiet IDLE spawn roaming mixin for PvPBotController (`modules/controller/spawn_roam.js`).
  * Always keeps IDLE sprint off and roam looks throttled <= 10 Hz (`force: false`).
+ * (Duel chat advertisements live cleanly in `modules/controller/duel_chat.js`.)
  */
 const spawnRoamMethods = {
-  _clearAdvertiseTimer() {
-    if (this.advertiseTimer) {
-      clearTimeout(this.advertiseTimer);
-      this.advertiseTimer = null;
-    }
-  },
-
-  _countOtherOnlinePlayers() {
-    if (!this.bot || !this.bot.players) return 0;
-    const selfName = (this.bot.username || '').toLowerCase();
-    return Object.keys(this.bot.players).filter((name) => name && name.toLowerCase() !== selfName).length;
-  },
-
-  _scheduleAdvertise() {
-    this._clearAdvertiseTimer();
-    if (!this.advertiseEnabled || this.shuttingDown) return;
-
-    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
-    const minDelay = Number.isFinite(advCfg.minDelayMs) ? advCfg.minDelayMs : 60000;
-    const maxDelay = Number.isFinite(advCfg.maxDelayMs) ? Math.max(minDelay, advCfg.maxDelayMs) : 180000;
-    const delayMs = Math.round(this._randRange(minDelay, maxDelay));
-
-    this.advertiseTimer = setTimeout(() => {
-      this.advertiseTimer = null;
-      this._sendAdvertise();
-      this._scheduleAdvertise();
-    }, delayMs);
-  },
-
-  _sendAdvertise() {
-    if (!this.advertiseEnabled || this.shuttingDown || !this.bot || !this.bot.entity) return false;
-    if (this.state !== 'IDLE' || this.inDuelArena) return false;
-    if (this.loginPassword && !this.loginAttempted) return false;
-    if (this._countOtherOnlinePlayers() === 0) return false;
-
-    const advCfg = (this.config.bot && this.config.bot.advertise) || {};
-    const messages = Array.isArray(advCfg.messages) ? advCfg.messages.filter((m) => typeof m === 'string' && m.trim()) : [];
-    if (messages.length === 0) return false;
-
-    let idx = Math.floor(Math.random() * messages.length);
-    if (messages.length > 1 && idx === this.lastAdvertiseIndex) {
-      idx = (idx + 1 + Math.floor(Math.random() * (messages.length - 1))) % messages.length;
-    }
-    this.lastAdvertiseIndex = idx;
-
-    let text = messages[idx].replace(/\{name\}/g, this.bot.username || 'me').trim();
-    const colorPrefix = typeof advCfg.colorPrefix === 'string' ? advCfg.colorPrefix : '&b';
-    if (colorPrefix && !/^&[0-9a-fk-orx]/i.test(text)) {
-      text = `${colorPrefix}${text}`;
-    }
-    this.bot.chat(text);
-    this.log(`[ADS] ${text}`);
-    return true;
-  },
-
   _randRange(minVal, maxVal) {
     return minVal + Math.random() * Math.max(0, maxVal - minVal);
   },
@@ -79,6 +25,7 @@ const spawnRoamMethods = {
     const pauseMax = botCfg.roamPauseMaxMs !== undefined ? botCfg.roamPauseMaxMs : 4800;
     const now = Date.now();
     this._stopSpawnRoam();
+    this._roamCollideTicks = 0;
     this.roamPhase = 'PAUSED';
     this.roamPhaseUntil = now + this._randRange(Math.min(1200, pauseMin), pauseMax);
     this.roamNextGlanceAt = now + this._randRange(1800, 3200);
@@ -99,39 +46,33 @@ const spawnRoamMethods = {
     const pos = this.bot.entity.position;
     const baseY = Math.floor(pos.y);
 
-    const feetBlock = this.bot.blockAt(new Vec3(pos.x, baseY, pos.z));
+    const feetBlock = this.bot.blockAt(new Vec3(Math.floor(pos.x), baseY, Math.floor(pos.z)));
     if (feetBlock && ROAM_HAZARD_BLOCKS.has(feetBlock.name)) {
       return { safe: false, shouldStepUp: false };
     }
 
-    // Sample both near (0.55b — catches walls the bot is currently touching!) and far (1.1b)
     let shouldStepUp = false;
     for (const dist of [0.55, 1.1]) {
       const stepX = pos.x - Math.sin(yaw) * dist;
       const stepZ = pos.z - Math.cos(yaw) * dist;
 
-      const aheadFeet = this.bot.blockAt(new Vec3(stepX, baseY, stepZ));
-      const aheadHead = this.bot.blockAt(new Vec3(stepX, baseY + 1, stepZ));
-      const aheadFloor0 = this.bot.blockAt(new Vec3(stepX, baseY - 1, stepZ));
-      const aheadFloor1 = this.bot.blockAt(new Vec3(stepX, baseY - 2, stepZ));
-
-      if (
-        (aheadFeet && ROAM_HAZARD_BLOCKS.has(aheadFeet.name)) ||
-        (aheadHead && ROAM_HAZARD_BLOCKS.has(aheadHead.name)) ||
-        (aheadFloor0 && ROAM_HAZARD_BLOCKS.has(aheadFloor0.name))
-      ) {
-        return { safe: false, shouldStepUp: false };
-      }
-
       const col = inspectColumnStep(this.bot, stepX, pos.y, stepZ);
-      if (col.blocked) {
+      if (col.blocked || col.hasHazard) {
         return { safe: false, shouldStepUp: false };
       }
 
-      const hasSupport =
-        col.hasFloor ||
-        Boolean(aheadFloor0 && aheadFloor0.boundingBox === 'block') ||
-        Boolean(aheadFloor1 && aheadFloor1.boundingBox === 'block');
+      // Check water explicitly (ROAM_HAZARD_BLOCKS adds water over HAZARD_BLOCKS)
+      const b0 = this.bot.blockAt(new Vec3(Math.floor(stepX), baseY, Math.floor(stepZ)));
+      const bFloor = this.bot.blockAt(new Vec3(Math.floor(stepX), baseY - 1, Math.floor(stepZ)));
+      if ((b0 && ROAM_HAZARD_BLOCKS.has(b0.name)) || (bFloor && ROAM_HAZARD_BLOCKS.has(bFloor.name))) {
+        return { safe: false, shouldStepUp: false };
+      }
+
+      let hasSupport = col.hasFloor;
+      if (!hasSupport) {
+        const b2 = this.bot.blockAt(new Vec3(Math.floor(stepX), baseY - 2, Math.floor(stepZ)));
+        hasSupport = Boolean(b2 && b2.boundingBox === 'block');
+      }
       if (!hasSupport) {
         return { safe: false, shouldStepUp: false };
       }
@@ -158,7 +99,6 @@ const spawnRoamMethods = {
       typeof cfgCenter.z === 'number'
     ) {
       const configured = new Vec3(cfgCenter.x, cfgCenter.y, cfgCenter.z);
-      // Use configured spawn center whenever in the same spawn region (within 80 blocks)
       if (!pos || Math.hypot(pos.x - configured.x, pos.z - configured.z) <= 80) {
         return configured;
       }

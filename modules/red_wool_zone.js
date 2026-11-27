@@ -146,7 +146,7 @@ class RedWoolZoneModule {
       }
     }
 
-    const scanRadius = this.cfg.ringScanRadius !== undefined ? this.cfg.ringScanRadius : 22;
+    const scanRadius = this.cfg.ringScanRadius !== undefined ? this.cfg.ringScanRadius : 14;
     const rays = [];
     let cardinalHits = 0;
     let totalHits = 0;
@@ -342,7 +342,7 @@ class RedWoolZoneModule {
 
     if (!this.activeExitGoal) {
       const recheckMs = this.cfg.recheckCooldownMs !== undefined ? this.cfg.recheckCooldownMs : 250;
-      if ((now - this.lastCheckedAt) < recheckMs && (now - this.lastExitCompletedAt) < recheckMs) {
+      if ((now - this.lastCheckedAt) < recheckMs) {
         return false;
       }
       this.lastCheckedAt = now;
@@ -367,8 +367,9 @@ class RedWoolZoneModule {
     const dz = this.activeExitGoal.exitPos.z - pos.z;
     const horizDist = Math.sqrt(dx * dx + dz * dz);
 
-    const currentInfo = this.inspectPosition(pos);
-    if ((horizDist <= 1.1 && !currentInfo.inZone) || this.exitTicks > maxExitTicks) {
+    const shouldInspectNow = horizDist <= 1.6 || (this.exitTicks % 4 === 0);
+    const stillInZone = shouldInspectNow ? this.inspectPosition(pos).inZone : true;
+    if ((horizDist <= 1.1 && !stillInZone) || this.exitTicks > maxExitTicks) {
       this.activeExitGoal = null;
       this.exitTicks = 0;
       this.lastExitCompletedAt = now;

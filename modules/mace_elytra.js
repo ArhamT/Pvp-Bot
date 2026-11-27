@@ -4,149 +4,14 @@ const {
   HOTBAR_START,
   SWORD_PRIORITY,
   AXE_PRIORITY,
-  getItemMetadataText
+  hasStatusEffect
 } = require('./constants');
+const {
+  parseItemEnchantments,
+  getItemDurabilityInfo
+} = require('./enchant_utils');
 
 const ELYTRA_MAX_DURABILITY = 432;
-
-const TRACKED_ENCHANTS = [
-  'protection',
-  'blast_protection',
-  'density',
-  'breach',
-  'wind_burst',
-  'unbreaking',
-  'mending'
-];
-
-function unwrapNbt(val) {
-  let cur = val;
-  while (cur && typeof cur === 'object' && 'value' in cur && !Array.isArray(cur)) {
-    cur = cur.value;
-  }
-  return cur;
-}
-
-function normalizeEnchantName(raw) {
-  if (typeof raw !== 'string') return '';
-  const lower = raw.trim().toLowerCase();
-  return lower.startsWith('minecraft:') ? lower.slice('minecraft:'.length) : lower;
-}
-
-/**
- * Parses Minecraft 1.21+ item `components` (Array, Map, or object), `enchants`, legacy `nbt`,
- * and fallback metadata text into normalized enchantment levels.
- */
-function parseItemEnchantments(item) {
-  const result = {
-    protection: 0,
-    blast_protection: 0,
-    density: 0,
-    breach: 0,
-    wind_burst: 0,
-    unbreaking: 0,
-    mending: 0
-  };
-  if (!item) return result;
-
-  const record = (nameRaw, lvlRaw) => {
-    const name = normalizeEnchantName(nameRaw);
-    if (!name || !Object.prototype.hasOwnProperty.call(result, name)) return;
-    const lvl = Math.max(0, Number(unwrapNbt(lvlRaw)) || 1);
-    if (lvl > result[name]) {
-      result[name] = lvl;
-    }
-  };
-
-  const inspectContainer = (container) => {
-    const unwrapped = unwrapNbt(container);
-    if (!unwrapped) return;
-
-    if (Array.isArray(unwrapped)) {
-      for (const entry of unwrapped) {
-        if (!entry || typeof entry !== 'object') continue;
-        const id = unwrapNbt(entry.id !== undefined ? entry.id : entry.name);
-        const lvl = entry.level !== undefined ? entry.level : entry.lvl;
-        record(id, lvl);
-      }
-      return;
-    }
-
-    if (unwrapped instanceof Map) {
-      for (const [key, val] of unwrapped.entries()) {
-        record(key, val);
-      }
-      return;
-    }
-
-    if (typeof unwrapped === 'object') {
-      if (unwrapped.levels) inspectContainer(unwrapped.levels);
-      if (unwrapped.enchantments) inspectContainer(unwrapped.enchantments);
-      for (const [key, val] of Object.entries(unwrapped)) {
-        if (key === 'levels' || key === 'enchantments') continue;
-        record(key, val);
-      }
-    }
-  };
-
-  if (Array.isArray(item.enchants)) {
-    inspectContainer(item.enchants);
-  }
-
-  if (Array.isArray(item.components)) {
-    for (const comp of item.components) {
-      if (!comp || typeof comp !== 'object') continue;
-      const type = normalizeEnchantName(comp.type || '');
-      if (type === 'enchantments' || type === 'stored_enchantments') {
-        inspectContainer(comp.data || comp.value || comp);
-      }
-    }
-  } else if (item.components && typeof item.components === 'object') {
-    inspectContainer(item.components.enchantments || item.components['minecraft:enchantments']);
-    inspectContainer(item.components.stored_enchantments || item.components['minecraft:stored_enchantments']);
-  }
-
-  if (item.componentMap instanceof Map) {
-    inspectContainer(item.componentMap.get('enchantments') || item.componentMap.get('minecraft:enchantments'));
-  }
-
-  if (item.nbt && typeof item.nbt === 'object') {
-    const nbtVal = unwrapNbt(item.nbt);
-    if (nbtVal && typeof nbtVal === 'object') {
-      if (nbtVal.Enchantments) inspectContainer(nbtVal.Enchantments);
-      if (nbtVal.ench) inspectContainer(nbtVal.ench);
-    }
-  }
-
-  // Fallback text extraction (strip specialized protection types before matching generic 'protection')
-  const rawText = getItemMetadataText(item);
-  if (rawText) {
-    const bpMatch = rawText.match(/blast_protection[^0-9]{0,20}(\d+)/);
-    if (bpMatch && Number(bpMatch[1]) > result.blast_protection) {
-      result.blast_protection = Number(bpMatch[1]);
-    } else if (rawText.includes('blast_protection') && result.blast_protection === 0) {
-      result.blast_protection = 1;
-    }
-
-    const stripped = rawText
-      .replace(/blast_protection/g, '')
-      .replace(/fire_protection/g, '')
-      .replace(/projectile_protection/g, '');
-
-    for (const key of TRACKED_ENCHANTS) {
-      if (key === 'blast_protection') continue;
-      const re = new RegExp(`${key}[^0-9]{0,20}(\\d+)`);
-      const m = stripped.match(re);
-      if (m && Number(m[1]) > result[key]) {
-        result[key] = Number(m[1]);
-      } else if (stripped.includes(key) && result[key] === 0) {
-        result[key] = 1;
-      }
-    }
-  }
-
-  return result;
-}
 
 /**
  * Scans inventory for all Maces (Density / Breach / Wind Burst), Axes, and Swords,
@@ -390,22 +255,10 @@ function evaluateShieldCounter(bot, targetState, equipInfo = {}) {
 }
 
 /**
- * Checks `bot.entity.effects` for Slow Falling (effect id 28 / 'slow_falling').
+ * Checks `bot.entity.effects` for Slow Falling (MC 1.20.4 id 28 / 1.20.5+ id 27).
  */
 function hasSlowFalling(bot) {
-  if (!bot || !bot.entity || !bot.entity.effects) return false;
-  const effects = bot.entity.effects;
-  if (effects instanceof Map) {
-    return effects.has(28) || effects.has('28') || effects.has('slow_falling');
-  }
-  if (Array.isArray(effects)) {
-    return effects.some((e) => e && (e.id === 28 || e.name === 'slow_falling'));
-  }
-  if (typeof effects === 'object') {
-    if (effects[28] || effects['28'] || effects.slow_falling) return true;
-    return Object.values(effects).some((e) => e && (e.id === 28 || e.name === 'slow_falling'));
-  }
-  return false;
+  return hasStatusEffect(bot, 'slow_falling');
 }
 
 /**
@@ -440,19 +293,11 @@ function getElytraDurabilityInfo(item) {
   if (!item || item.name !== 'elytra') {
     return { valid: false, remaining: 0, max: ELYTRA_MAX_DURABILITY };
   }
-  let used = 0;
-  if (typeof item.durabilityUsed === 'number') {
-    used = item.durabilityUsed;
-  } else if (item.components && typeof item.components.damage === 'number') {
-    used = item.components.damage;
-  } else if (item.nbt && item.nbt.value && item.nbt.value.Damage && typeof item.nbt.value.Damage.value === 'number') {
-    used = item.nbt.value.Damage.value;
-  }
-  const max = typeof item.maxDurability === 'number' ? item.maxDurability : ELYTRA_MAX_DURABILITY;
+  const info = getItemDurabilityInfo(item, ELYTRA_MAX_DURABILITY);
   return {
-    valid: true,
-    remaining: Math.max(0, max - used),
-    max
+    valid: info.valid,
+    remaining: info.remaining,
+    max: info.max
   };
 }
 
@@ -587,7 +432,7 @@ function detectIncomingMaceAttack(bot, target, targetState = null, weaponCooldow
   const enemyHeldName = enemyHeld && enemyHeld.name ? String(enemyHeld.name).toLowerCase() : '';
   const holdingMace = enemyHeldName === 'mace';
   const holdingAxe = enemyHeldName.endsWith('_axe');
-  const isGliding = Boolean((state && state.isElytraGliding) || target.elytraFlying);
+  const isGliding = Boolean((state && state.isGliding) || target.elytraFlying);
 
   const estTicks = dy <= 3.0
     ? 2

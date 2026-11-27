@@ -1,28 +1,13 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { OFFHAND_SLOT, isAirLike: isConstantsAirLike, inspectColumnStep } = require('../constants');
-
-const BLAST_SHIELD_BLOCK_PRIORITY = [
-  'obsidian',
-  'glowstone',
-  'cobbled_deepslate',
-  'cobblestone',
-  'stone',
-  'deepslate',
-  'end_stone'
-];
-
-function isNonNullAir(block) {
-  return Boolean(block) && isConstantsAirLike(block);
-}
-
-function sameBlockPos(a, b) {
-  if (!a || !b) return false;
-  return Math.floor(a.x) === Math.floor(b.x) &&
-    Math.floor(a.y) === Math.floor(b.y) &&
-    Math.floor(a.z) === Math.floor(b.z);
-}
+const {
+  OFFHAND_SLOT,
+  BLAST_SHIELD_BLOCK_PRIORITY,
+  isNonNullAir,
+  sameBlockPos,
+  inspectColumnStep
+} = require('../constants');
 
 /**
  * Evaluates and plans Feet Blast-Shielding before detonating an explosive within <= 3.5b on the same Y-level.
@@ -106,7 +91,7 @@ function findFeetBlastShieldSpot(burst, blastPos, excludedPos = null) {
 /**
  * HT1 CPvP Footwork, Totem-Pop Punish, & DPS-Weighted Selection (`modules/burst/cpvp_footwork.js`):
  * - Detects enemy Totem pops (`entityStatus === 35`) for aggressive punish windows.
- * - Maintains dynamic 2.6–3.8b CPvP spacing & cover footwork during Crystal/Anchor sequences.
+ * - Maintains dynamic 2.6–3.8b CPvP spacing & hazard-safe cover footwork.
  * - Scores Crystal vs Anchor candidates by net damage per tick.
  */
 const cpvpFootworkMethods = {
@@ -129,7 +114,6 @@ const cpvpFootworkMethods = {
   },
 
   _handleEntityStatus(entity, status) {
-    // Vanilla Minecraft entity status 35 = Totem of Undying activation
     if (status !== 35 || !entity || !this.bot || !this.bot.entity) return;
     if (entity.id === this.bot.entity.id) return;
     if (this.lastTargetId !== null && entity.id === this.lastTargetId) {

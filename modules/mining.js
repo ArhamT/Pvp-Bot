@@ -5,11 +5,11 @@ const {
   SWORD_PRIORITY,
   AXE_PRIORITY,
   clearMovementControls,
-  getItemMetadataText,
   isAirLike,
   inspectColumnStep
 } = require('./constants');
-const { ensureItemHeld } = require('./inventory_utils');
+const { getEnchantmentLevel } = require('./enchant_utils');
+const { ensureItemHeld, getInventoryItems } = require('./inventory_utils');
 const { findVisibleBlockFace } = require('./placement_los');
 
 const UNBREAKABLE_BLOCKS = new Set([
@@ -103,9 +103,7 @@ const TOOL_BASE_SPEED = {
 
 function getEfficiencyLevel(item) {
   if (!item) return 0;
-  const meta = getItemMetadataText(item);
-  const m = meta.match(/efficiency["':\s,=\]]*(\d)/);
-  return m ? Math.min(5, Number(m[1]) || 0) : 0;
+  return Math.min(5, getEnchantmentLevel(item, 'efficiency'));
 }
 
 function getToolSpeedScore(item, priorityList) {
@@ -177,11 +175,6 @@ function getCategoryPriority(blockName) {
     return AXE_PRIORITY;
   }
   return PICKAXE_PRIORITY;
-}
-
-function getInventoryItems(bot) {
-  if (!bot || !bot.inventory || typeof bot.inventory.items !== 'function') return [];
-  return bot.inventory.items() || [];
 }
 
 function hasAnyItem(bot, names) {

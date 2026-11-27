@@ -4,13 +4,18 @@ const { Vec3 } = require('vec3');
 const { clamp, DEG_TO_RAD } = require('./aim');
 const {
   TORSO_SLOT,
-  HOTBAR_START: DEFAULT_HOTBAR_START,
   SWORD_PRIORITY,
   AXE_PRIORITY,
-  CHESTPLATE_PRIORITY,
   isSpearItem,
-  hasItemEnchant
+  clearMovementControls
 } = require('./constants');
+const {
+  getHotbarStart,
+  getInventoryItems,
+  findInventoryItem,
+  findItemByPredicate,
+  ensureItemHeld
+} = require('./inventory_utils');
 const {
   scanWeaponEnchantments,
   selectMaceForFall,
@@ -18,22 +23,8 @@ const {
   hasSlowFalling,
   detectEnemyDiveBomb
 } = require('./mace_elytra');
-const {
-  AERIAL_MODES,
-  resolveStartFallFlyingActionId,
-  sendStartElytraFlying
-} = require('./aerial/constants');
-
-/**
- * Advanced aerial PvP module implementing:
- * 1. Accurate per-tick fallDistance tracking (airborne descent, reset on ground/water/cobweb).
- * 2. Stun Slam: airborne Axe shield-break -> next-tick Breach Mace smash -> Sword swap-back.
- * 3. Spear-to-Mace Chain: mid-range Spear/Trident thrust -> -90 deg Wind Charge launch ->
- *    Stun Slam or Mace Smash on descent with Water Bucket / Wind Charge clutch fallback.
- * 4. Elytra Mace Dive: sequential Chestplate/Elytra swap (slot 6) -> 1-2 tick settle ->
- *    start_fall_flying (actionId 8) -> 65-75 deg firework climb -> -75 to -85 deg predictive dive ->
- *    sequential Chestplate restore + Mace smash at <= 3.5b -> fall-damage clutch on miss.
- */
+const { AERIAL_MODES } = require('./aerial/constants');
+const { elytraFlightMethods } = require('./aerial/elytra_flight');
 const { pearlCatchMethods } = require('./aerial/pearl_catch');
 const { maceComboMethods } = require('./aerial/mace_combos');
 const { spearMaceMethods } = require('./aerial/spear_mace');
@@ -41,6 +32,16 @@ const { elytraMaceMethods } = require('./aerial/elytra_mace');
 const { elytraSpearMethods } = require('./aerial/elytra_spear');
 const { defenseClutchMethods } = require('./aerial/defense_clutch');
 
+/**
+ * Modular HT1 Aerial PvP Coordinator combining:
+ * - `aerial/elytra_flight.js` — shared torso swap, chestplate restore, takeoff & obstacle raycast
+ * - `aerial/mace_combos.js`   — Wind Charge Mace Launch, 3-Branch Shield Stun-Slam, Wind Burst chains
+ * - `aerial/spear_mace.js`    — Spear-to-Mace 5-stage chain
+ * - `aerial/elytra_mace.js`   — Elytra Mace Dive (7-Block Density/Breach rule)
+ * - `aerial/elytra_spear.js`  — Elytra Rocket Spear jousting
+ * - `aerial/pearl_catch.js`   — Enemy-pearl intercept & Sky-Pearl Wind Catch
+ * - `aerial/defense_clutch.js`— Multi-tool Fall Clutch (with MLG water pickup) & Dive-Bomb Dodge
+ */
 class AerialModule {
   constructor(bot, config, aimer, prediction = null, combat = null) {
     this.bot = bot;
@@ -63,27 +64,25 @@ class AerialModule {
     this.stage = null;
     this.stageTicks = 0;
 
-    // Inventory / async equip guards
+    // Inventory / async equip guards (cached weapon enchantments with dirty flag!)
     this.equipBusy = false;
     this.swappedThisTick = false;
-
-    // Stun Slam state
-    this.stunSlamAxeSwapped = false;
+    this._weaponEnchantDirty = true;
+    this.weaponEnchantments = scanWeaponEnchantments(bot);
 
     // Spear-to-Mace, Wind Burst Chain & Direct Mace Launch state
     this.lastSpearMaceTime = 0;
     this.lastMaceLaunchTime = 0;
-    this.spearThrustDone = false;
     this.spearLaunchTicks = 0;
     this.windBurstBounceTicks = 0;
     this.windBurstChainCount = 0;
     this.maceJumpTicks = 0;
 
-    // Wind Burst Pearl Catching state (both self-pearl catch & enemy-pearl interception)
+    // Pearl Catching state
     this.lastPearlCatchTime = 0;
     this.pearlCatchLandingTarget = null;
-    this.pearlCatchTicks = 0;
-    this.trackedEnemyPearl = null; // { entity, landingPos, expiresAt }
+    this.trackedEnemyPearl = null;
+    this.pearlInterceptVec = null;
 
     // Elytra Mace Dive & Elytra Spear state
     this.savedChestplateName = null;
@@ -105,21 +104,14 @@ class AerialModule {
     this.elytraSpearHitTarget = false;
     this.elytraSpearTargetId = null;
     this.elytraSpearAttackNextTick = false;
+    this.elytraTakeoffYaw = 0;
     this.elytraPullUpYaw = 0;
 
-    // Fall-damage clutch state
-    this.clutchItemName = null;
-    this.clutchActivated = false;
-
-    // 1.21+ Mace & Elytra-Rocket state tracking
+    // Defense / clutch state
+    this._clutchUsedWater = false;
     this.targetState = null;
-    this.weaponEnchantments = scanWeaponEnchantments(bot);
-    this.pearlInterceptVec = null;
-    this.elytraConserveTicks = 0;
-    this.bHopTicks = 0;
     this.lastDiveDodgeTime = 0;
 
-    // Bind death/respawn cleanup, inventory enchant rescan, target hurt confirmation, & enemy Ender Pearl tracking
     this._onDeath = this._handleDeathOrRespawn.bind(this);
     this._onEntitySpawn = this._handleEntitySpawn.bind(this);
     this._onEntityHurt = (entity) => {
@@ -133,8 +125,9 @@ class AerialModule {
       }
     };
     this._onUpdateSlot = () => {
-      this.weaponEnchantments = scanWeaponEnchantments(this.bot);
+      this._weaponEnchantDirty = true;
     };
+
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.on === 'function') {
       this.bot.inventory.on('updateSlot', this._onUpdateSlot);
     }
@@ -146,23 +139,14 @@ class AerialModule {
     }
   }
 
-  /**
-   * Attaches or updates the trajectory prediction module.
-   */
   setPrediction(prediction) {
     this.prediction = prediction;
   }
 
-  /**
-   * Attaches or updates the combat module reference.
-   */
   setCombat(combat) {
     this.combat = combat;
   }
 
-  /**
-   * Cleans up event listeners and transient aerial state cleanly.
-   */
   dispose() {
     if (this.bot && this.bot.inventory && typeof this.bot.inventory.removeListener === 'function') {
       this.bot.inventory.removeListener('updateSlot', this._onUpdateSlot);
@@ -191,48 +175,29 @@ class AerialModule {
       : null;
     this.trackedEnemyPearl = null;
     this.windBurstChainCount = 0;
-    this._resetState();
+    this._weaponEnchantDirty = true;
+    this._resetState(true);
     this.elytraSwappedIn = false;
     this.pendingChestplateRestore = false;
     this.savedChestplateName = null;
   }
 
-  /**
-   * Returns true while actively executing a Stun Slam, Spear-Mace chain,
-   * Elytra Mace Dive, or fall-damage clutch.
-   */
   isBusy() {
     return this.mode !== AERIAL_MODES.IDLE;
   }
 
-  /**
-   * Aborts offensive aerial actions cleanly, re-equipping the chestplate
-   * if mid-elytra-swap when safe to do so.
-   */
   cancel() {
     const wasBusy = this.isBusy();
 
     if (wasBusy && this.bot) {
-      if (typeof this.bot.setControlState === 'function') {
-        this.bot.setControlState('jump', false);
-        this.bot.setControlState('forward', false);
-        this.bot.setControlState('sprint', false);
-      }
-      if (
-        this.elytraSpearCharging &&
-        typeof this.bot.deactivateItem === 'function'
-      ) {
-        try {
-          this.bot.deactivateItem();
-        } catch (_) {}
+      clearMovementControls(this.bot);
+      if (this.elytraSpearCharging && typeof this.bot.deactivateItem === 'function') {
+        try { this.bot.deactivateItem(); } catch (_) {}
       }
     }
 
-    // Only restore a Chestplate if we explicitly swapped one off (e.g. Elytra Mace Dive),
-    // never strip an Elytra worn natively in an Elytra Spear kit!
     if (this.elytraSwappedIn && this.savedChestplateName) {
-      const safeToRestore = this._isSafeToRestoreChestplate();
-      if (safeToRestore) {
+      if (this._isSafeToRestoreChestplate()) {
         if (!this._restoreChestplate(true)) {
           this.pendingChestplateRestore = true;
         }
@@ -241,15 +206,16 @@ class AerialModule {
       }
     }
 
-    this._resetState();
+    this._resetState(false);
   }
 
-  _resetState() {
+  _resetState(releaseControls = false) {
+    if (releaseControls && this.bot) {
+      clearMovementControls(this.bot);
+    }
     this.mode = AERIAL_MODES.IDLE;
     this.stage = null;
     this.stageTicks = 0;
-    this.stunSlamAxeSwapped = false;
-    this.spearThrustDone = false;
     this.spearLaunchTicks = 0;
     this.elytraEquipTicks = 0;
     this.takeoffJumped = false;
@@ -264,13 +230,9 @@ class AerialModule {
     this.elytraSpearHitTarget = false;
     this.elytraSpearTargetId = null;
     this.elytraSpearAttackNextTick = false;
-    this.clutchItemName = null;
-    this.clutchActivated = false;
+    this._clutchUsedWater = false;
   }
 
-  /**
-   * Returns currently tracked airborne fall distance in blocks.
-   */
   getFallDistance() {
     return this.fallDistance;
   }
@@ -308,7 +270,6 @@ class AerialModule {
       this.lastY = pos.y;
       return;
     }
-
     if (inLava) {
       this.lastY = pos.y;
       return;
@@ -320,11 +281,9 @@ class AerialModule {
       if (dy > 0 && velY <= 0) {
         this.fallDistance += dy;
       } else if (dy < -0.05) {
-        // Ascending (e.g. jump, wind charge launch, firework boost) resets accumulated descent
         this.fallDistance = 0;
       }
     }
-
     this.lastY = pos.y;
   }
 
@@ -366,21 +325,17 @@ class AerialModule {
     return true;
   }
 
-  /**
-   * Notifies the aerial controller that a server teleport packet just arrived.
-   * Suppresses Elytra takeoff/packets briefly so teleport confirmation settles cleanly.
-   */
   notifyTeleport(waitTicks = 4) {
     this.teleportedThisTick = true;
     this.postTeleportWaitTicks = Math.max(this.postTeleportWaitTicks, waitTicks);
     if (this.mode === AERIAL_MODES.ELYTRA_SPEAR || this.mode === AERIAL_MODES.ELYTRA_DIVE) {
-      this._releaseSpearChargeIfActive();
-      this._resetState();
+      // Use cancel() so chestplate is safely restored / flagged for restore instead of lost!
+      this.cancel();
     }
   }
 
   _getHotbarStart() {
-    return (this.bot && this.bot.inventory && this.bot.inventory.hotbarStart) || DEFAULT_HOTBAR_START;
+    return getHotbarStart(this.bot);
   }
 
   _getTorsoSlotIndex() {
@@ -391,14 +346,7 @@ class AerialModule {
   }
 
   _getInventoryItems() {
-    if (!this.bot || !this.bot.inventory) return [];
-    if (typeof this.bot.inventory.items === 'function') {
-      return this.bot.inventory.items().filter(Boolean);
-    }
-    if (Array.isArray(this.bot.inventory.slots)) {
-      return this.bot.inventory.slots.filter(Boolean);
-    }
-    return [];
+    return getInventoryItems(this.bot);
   }
 
   _getSlotItem(slotIndex) {
@@ -409,24 +357,6 @@ class AerialModule {
     return this._getInventoryItems().find((i) => i.slot === slotIndex) || null;
   }
 
-  _getTorsoItem() {
-    return this._getSlotItem(this._getTorsoSlotIndex());
-  }
-
-  _isWearingElytra() {
-    const torso = this._getTorsoItem();
-    return Boolean(torso && torso.name === 'elytra');
-  }
-
-  _isSafeToRestoreChestplate() {
-    if (!this.bot || !this.bot.entity) return true;
-    const { onGround, inWater } = this._getEnvironmentFlags();
-    const clutchMin = this.aerialCfg.clutchMinFallDistance !== undefined
-      ? this.aerialCfg.clutchMinFallDistance
-      : 4.0;
-    return onGround || inWater || !this.isGliding || this.fallDistance < clutchMin;
-  }
-
   _getCombatHotbarSlots() {
     if (this.combat && typeof this.combat.getHotbarSlots === 'function') {
       return this.combat.getHotbarSlots() || null;
@@ -434,8 +364,12 @@ class AerialModule {
     return null;
   }
 
-  _hasBreachEnchant(item) {
-    return Boolean(item && item.name === 'mace' && hasItemEnchant(item, 'breach'));
+  _getWeaponEnchantments() {
+    if (this._weaponEnchantDirty || !this.weaponEnchantments) {
+      this.weaponEnchantments = scanWeaponEnchantments(this.bot);
+      this._weaponEnchantDirty = false;
+    }
+    return this.weaponEnchantments;
   }
 
   _makeSelection(item) {
@@ -451,78 +385,36 @@ class AerialModule {
   }
 
   _findItemByName(name) {
-    const items = this._getInventoryItems();
-    const hotbarStart = this._getHotbarStart();
-
-    const hotbarItem = items.find(
-      (i) => i.name === name && typeof i.slot === 'number' && i.slot >= hotbarStart && i.slot < hotbarStart + 9
-    );
-    if (hotbarItem) return this._makeSelection(hotbarItem);
-
-    const invItem = items.find((i) => i.name === name);
-    return invItem ? this._makeSelection(invItem) : null;
+    const found = findInventoryItem(this.bot, name);
+    return found ? { item: found.item, hotbarIndex: found.quickBarSlot } : null;
   }
 
   _findBestByPriority(priorityList, preferredHotbarSlot = -1) {
     const hotbarStart = this._getHotbarStart();
-
     if (typeof preferredHotbarSlot === 'number' && preferredHotbarSlot >= 0 && preferredHotbarSlot <= 8) {
       const slotItem = this._getSlotItem(hotbarStart + preferredHotbarSlot);
       if (slotItem && priorityList.includes(slotItem.name)) {
         return { item: slotItem, hotbarIndex: preferredHotbarSlot };
       }
     }
-
-    const items = this._getInventoryItems();
-    for (const name of priorityList) {
-      const hotbarItem = items.find(
-        (i) => i.name === name && typeof i.slot === 'number' && i.slot >= hotbarStart && i.slot < hotbarStart + 9
-      );
-      if (hotbarItem) return this._makeSelection(hotbarItem);
-    }
-
-    for (const name of priorityList) {
-      const invItem = items.find((i) => i.name === name);
-      if (invItem) return this._makeSelection(invItem);
-    }
-    return null;
+    const found = findInventoryItem(this.bot, priorityList);
+    return found ? { item: found.item, hotbarIndex: found.quickBarSlot } : null;
   }
 
-  _hasWindBurstEnchant(item) {
-    if (!item || item.name !== 'mace') return false;
-    if (this.combat && typeof this.combat._getEnchantmentLevel === 'function') {
-      return this.combat._getEnchantmentLevel(item, 'wind_burst') >= 1;
-    }
-    return hasItemEnchant(item, 'wind_burst');
-  }
-
-  /**
-   * Selects the optimal Mace using the 7-Block Enchantment Rule:
-   * - `fallDistance > 7` -> Density Mace (per-block scaling damage)
-   * - `fallDistance <= 7` -> Breach Mace (armor bypass)
-   */
   _findMace(preferWindBurst = true) {
-    this.weaponEnchantments = scanWeaponEnchantments(this.bot);
-    return selectMaceForFall(this.fallDistance, this.weaponEnchantments, {
+    const map = this._getWeaponEnchantments();
+    return selectMaceForFall(this.fallDistance, map, {
       preferWindBurst: preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false
     });
   }
 
-  /**
-   * Explicitly prefers the highest-Density Mace for high-altitude Elytra / Pearl-Catch dive smashes,
-   * falling back to `_findMace()` when no Density Mace is carried.
-   */
   _findDensityMace() {
-    this.weaponEnchantments = scanWeaponEnchantments(this.bot);
-    if (
-      this.weaponEnchantments &&
-      this.weaponEnchantments.densityMace &&
-      this.weaponEnchantments.densityMace.density > 0
-    ) {
+    const map = this._getWeaponEnchantments();
+    if (map && map.densityMace && map.densityMace.density > 0) {
       return {
-        item: this.weaponEnchantments.densityMace.item,
-        hotbarIndex: this.weaponEnchantments.densityMace.hotbarIndex,
-        slot: this.weaponEnchantments.densityMace.slot,
+        item: map.densityMace.item,
+        hotbarIndex: map.densityMace.hotbarIndex,
+        slot: map.densityMace.slot,
         isDensity: true
       };
     }
@@ -542,56 +434,8 @@ class AerialModule {
   }
 
   _findSpear() {
-    const items = this._getInventoryItems();
-    const hotbarStart = this._getHotbarStart();
-
-    const hotbarSpear = items.find(
-      (i) => isSpearItem(i) &&
-        typeof i.slot === 'number' &&
-        i.slot >= hotbarStart &&
-        i.slot < hotbarStart + 9
-    );
-    if (hotbarSpear) return this._makeSelection(hotbarSpear);
-
-    const invSpear = items.find(isSpearItem);
-    return invSpear ? this._makeSelection(invSpear) : null;
-  }
-
-  _findChestplate(preferredName = null) {
-    const items = this._getInventoryItems();
-    const torsoSlot = this._getTorsoSlotIndex();
-
-    if (preferredName) {
-      const exact = items.find((i) => i.name === preferredName && i.slot !== torsoSlot);
-      if (exact) return exact;
-    }
-
-    for (const name of CHESTPLATE_PRIORITY) {
-      const found = items.find((i) => i.name === name && i.slot !== torsoSlot);
-      if (found) return found;
-    }
-
-    const fallback = items.find((i) => i.name && i.name.endsWith('_chestplate') && i.slot !== torsoSlot);
-    return fallback || null;
-  }
-
-  _hasChestplateAvailable() {
-    const torso = this._getTorsoItem();
-    if (torso && torso.name && torso.name.endsWith('_chestplate')) return true;
-    return Boolean(this._findChestplate(this.savedChestplateName));
-  }
-
-  _resolveStartFallFlyingActionId() {
-    return resolveStartFallFlyingActionId(this.bot);
-  }
-
-  _sendStartElytraFlying() {
-    return sendStartElytraFlying(this.bot);
-  }
-
-  _hasElytraAvailable() {
-    if (this._isWearingElytra()) return true;
-    return Boolean(this._findItemByName('elytra'));
+    const found = findItemByPredicate(this.bot, isSpearItem);
+    return found ? { item: found.item, hotbarIndex: found.quickBarSlot } : null;
   }
 
   _isHoldingSelection(selection) {
@@ -608,72 +452,19 @@ class AerialModule {
   }
 
   /**
-   * Anticheat-safe hand equip: at most one swap per tick.
-   * Returns { ready: boolean, swapped: boolean }.
+   * Strictly anti-cheat-safe hand equip: at most one swap per tick.
+   * NEVER returns `ready: true` when `swapped: true` (enforces 1-tick post-swap settle everywhere).
    */
   _equipHand(selection) {
     if (!selection || !selection.item) return { ready: false, swapped: false };
     if (this._isHoldingSelection(selection)) return { ready: true, swapped: false };
     if (this.swappedThisTick) return { ready: false, swapped: false };
 
-    if (selection.hotbarIndex >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
-      this.bot.setQuickBarSlot(selection.hotbarIndex);
+    const eq = ensureItemHeld(this.bot, { item: selection.item, quickBarSlot: selection.hotbarIndex });
+    if (eq.swapped) {
       this.swappedThisTick = true;
-      return { ready: true, swapped: true };
     }
-
-    if (!this.equipBusy && typeof this.bot.equip === 'function') {
-      this.equipBusy = true;
-      this.swappedThisTick = true;
-      Promise.resolve(this.bot.equip(selection.item, 'hand'))
-        .catch(() => {})
-        .finally(() => {
-          this.equipBusy = false;
-        });
-    }
-    return { ready: false, swapped: true };
-  }
-
-  /**
-   * Anticheat-safe torso (slot 6) equip.
-   */
-  _equipTorso(item, ignoreTickGuard = false) {
-    if (!item || this.equipBusy || (!ignoreTickGuard && this.swappedThisTick)) return false;
-    const torso = this._getTorsoItem();
-    if (torso && torso.name === item.name) return true;
-    if (typeof this.bot.equip !== 'function') return false;
-
-    this.equipBusy = true;
-    this.swappedThisTick = true;
-    Promise.resolve(this.bot.equip(item, 'torso'))
-      .catch(() => {})
-      .finally(() => {
-        this.equipBusy = false;
-      });
-    return true;
-  }
-
-  _restoreChestplate(ignoreTickGuard = false) {
-    const torso = this._getTorsoItem();
-    if (torso && torso.name && torso.name.endsWith('_chestplate')) {
-      this.elytraSwappedIn = false;
-      this.pendingChestplateRestore = false;
-      return true;
-    }
-
-    const chestplate = this._findChestplate(this.savedChestplateName);
-    if (!chestplate) {
-      this.elytraSwappedIn = false;
-      this.pendingChestplateRestore = false;
-      return false;
-    }
-
-    const initiated = this._equipTorso(chestplate, ignoreTickGuard);
-    if (initiated) {
-      this.elytraSwappedIn = false;
-      this.pendingChestplateRestore = false;
-    }
-    return initiated;
+    return { ready: eq.held, swapped: eq.swapped };
   }
 
   _getReachDistance(target) {
@@ -685,8 +476,7 @@ class AerialModule {
       ? this.aimer.getEyePosition()
       : this.bot.entity.position.offset(0, 1.62, 0);
     const halfWidth = 0.3;
-    const tState = buildTargetState(target);
-    const height = (tState && tState.height) || target.height || 1.8;
+    const height = (this.targetState && this.targetState.height) || target.height || 1.8;
 
     const cx = clamp(eye.x, target.position.x - halfWidth, target.position.x + halfWidth);
     const cy = clamp(eye.y, target.position.y, target.position.y + height);
@@ -695,8 +485,7 @@ class AerialModule {
   }
 
   _isTargetRaisingShield(target) {
-    const tState = buildTargetState(target);
-    if (tState && tState.isBlocking) return true;
+    if (this.targetState && this.targetState.isBlocking) return true;
     if (this.combat && typeof this.combat.isTargetRaisingShield === 'function') {
       return this.combat.isTargetRaisingShield(target);
     }
@@ -722,15 +511,14 @@ class AerialModule {
       return { aligned: false, yawErrorDeg: 180, pitchErrorDeg: 90 };
     }
     const predPos = this._getPredictedPosition(target, leadTicks);
-    const tState = buildTargetState(target);
-    const tHeight = (tState && tState.height) || target.height || 1.8;
+    const tHeight = (this.targetState && this.targetState.height) || target.height || 1.8;
     const heightOffset = options.heightOffset !== undefined
       ? options.heightOffset
       : tHeight * 0.65;
     return this.aimer.stepTowardsPoint(predPos.offset(0, heightOffset, 0), {
-      speedMultiplier: options.speedMultiplier || 1.35,
+      speedMultiplier: options.speedMultiplier || 1.5,
       toleranceRad: options.toleranceRad !== undefined ? options.toleranceRad : 0.25,
-      force: options.force !== undefined ? options.force : true
+      force: options.force
     });
   }
 
@@ -748,11 +536,6 @@ class AerialModule {
     this.bot.setControlState('sprint', sprint);
   }
 
-  /**
-   * 20-TPS aerial handler.
-   * Always updates `fallDistance` every tick.
-   * Returns `true` if `AerialModule` took control this tick.
-   */
   tick(target) {
     this.swappedThisTick = false;
 
@@ -760,10 +543,12 @@ class AerialModule {
       return false;
     }
 
-    // 1. Always track accurate fall distance, targetState & teleport jumps every tick
+    // 1. Track fall distance, single-pass targetState, & elytra-aware teleport jumps
     this._updateFallDistance();
     const curPos = this.bot.entity.position;
-    this.teleportedThisTick = Boolean(this.lastBotPos && curPos.distanceTo(this.lastBotPos) > 2.5);
+    const glidingNow = Boolean(this.isGliding || this.bot.entity.elytraFlying);
+    const tpThreshold = glidingNow ? 6.5 : 2.5;
+    this.teleportedThisTick = Boolean(this.lastBotPos && curPos.distanceTo(this.lastBotPos) > tpThreshold);
     if (this.teleportedThisTick) {
       this.notifyTeleport(4);
     } else if (this.postTeleportWaitTicks > 0) {
@@ -776,13 +561,12 @@ class AerialModule {
       this.trackedEnemyPearl = null;
     }
 
-    // Complete deferred safe chestplate restore if we cancelled mid-air earlier
     if (this.mode === AERIAL_MODES.IDLE && this.pendingChestplateRestore && this._isSafeToRestoreChestplate()) {
       this._restoreChestplate();
       return true;
     }
 
-    // 1b. HARD ABORT (Threat Matrix): Slow Falling (effect id 28) disables all Mace dives & stays evasive
+    // 1b. Slow Falling Threat Matrix: disable Mace dives & weave evasively
     if (hasSlowFalling(this.bot)) {
       if (
         this.mode !== AERIAL_MODES.IDLE &&
@@ -795,10 +579,10 @@ class AerialModule {
         return this._tickSlowFallEvade(target);
       }
     } else if (this.mode === AERIAL_MODES.SLOW_FALL_EVADE) {
-      this._resetState();
+      this._resetState(true);
     }
 
-    // 1c. HARD THREAT CHECK: Dodge incoming Enemy Dive Bombs (dy > 5 && vy < -0.6) via Pearl / Wind Charge
+    // 1c. Incoming Enemy Dive Bomb Dodge
     if (
       this.aerialCfg.diveBombDodgeEnabled !== false &&
       this.mode !== AERIAL_MODES.CLUTCH &&
@@ -816,34 +600,15 @@ class AerialModule {
       }
     }
 
-    // 2. Continue active aerial state machine if already engaged
-    if (this.mode === AERIAL_MODES.CLUTCH) {
-      return this._tickClutch();
-    }
-    if (this.mode === AERIAL_MODES.DIVE_DODGE) {
-      return this._tickDiveDodge(target);
-    }
-    if (this.mode === AERIAL_MODES.ELYTRA_BOOST) {
-      return this._tickElytraBoost(target);
-    }
-    if (this.mode === AERIAL_MODES.PEARL_CATCH) {
-      return this._tickPearlCatch(target);
-    }
-    if (this.mode === AERIAL_MODES.STUN_SLAM) {
-      return this._tickStunSlam(target);
-    }
-    if (this.mode === AERIAL_MODES.MACE_LAUNCH) {
-      return this._tickMaceLaunch(target);
-    }
-    if (this.mode === AERIAL_MODES.SPEAR_MACE) {
-      return this._tickSpearMace(target);
-    }
-    if (this.mode === AERIAL_MODES.ELYTRA_DIVE) {
-      return this._tickElytraDive(target);
-    }
-    if (this.mode === AERIAL_MODES.ELYTRA_SPEAR) {
-      return this._tickElytraSpear(target);
-    }
+    // 2. Continue active aerial state machine
+    if (this.mode === AERIAL_MODES.CLUTCH) return this._tickClutch();
+    if (this.mode === AERIAL_MODES.DIVE_DODGE) return this._tickDiveDodge(target);
+    if (this.mode === AERIAL_MODES.PEARL_CATCH) return this._tickPearlCatch(target);
+    if (this.mode === AERIAL_MODES.STUN_SLAM) return this._tickStunSlam(target);
+    if (this.mode === AERIAL_MODES.MACE_LAUNCH) return this._tickMaceLaunch(target);
+    if (this.mode === AERIAL_MODES.SPEAR_MACE) return this._tickSpearMace(target);
+    if (this.mode === AERIAL_MODES.ELYTRA_DIVE) return this._tickElytraDive(target);
+    if (this.mode === AERIAL_MODES.ELYTRA_SPEAR) return this._tickElytraSpear(target);
 
     // 3. Standalone lethal fall-damage clutch safety check when idle
     if (this._shouldTriggerClutch(target)) {
@@ -855,24 +620,20 @@ class AerialModule {
       return false;
     }
 
-    // 4. Evaluate offensive aerial triggers in tactical priority order:
-    //    (a) Shield Countering (BACKSTAB / STUN_SLAM / SHIELD_DRAIN) when airborne descending onto shielded enemy
+    // 4. Evaluate offensive aerial triggers in tactical priority order
     if (this._canStartStunSlam(target)) {
       this.mode = AERIAL_MODES.STUN_SLAM;
       this.stage = 'AXE_BREAK';
       this.stageTicks = 0;
-      this.stunSlamAxeSwapped = false;
       return this._tickStunSlam(target);
     }
 
-    //    (a1) Wind Burst Pearl Catch (high airborne + enemy dodged horizontally OR threw escape pearl!)
     const pearlCatchPlan = this._evaluatePearlCatchTrigger(target);
     if (pearlCatchPlan) {
       this._enterPearlCatch(pearlCatchPlan);
       return this._tickPearlCatch(target);
     }
 
-    //    (a2) Opportunistic Aerial Mace Smash (already falling >1.8b near unshielded enemy with Mace!)
     if (this._canStartOpportunisticMaceSmash(target)) {
       this.mode = AERIAL_MODES.MACE_LAUNCH;
       this.stage = 'AIRBORNE_DESCENT';
@@ -881,25 +642,21 @@ class AerialModule {
       return this._tickMaceLaunch(target);
     }
 
-    //    (b) Elytra Mace Dive (> 18b away or after vertical launch, when carrying Mace + Chestplate)
     if (this._canStartElytraDive(target)) {
       this._enterElytraDive();
       return this._tickElytraDive(target);
     }
 
-    //    (b2) Elytra Rocket Spear Mode (Elytra + Firework Rocket + Spear/Trident — no Mace or Chestplate required!)
     if (this._canStartElytraSpear(target)) {
       this._enterElytraSpear();
       return this._tickElytraSpear(target);
     }
 
-    //    (c) HT1 Spear-to-Mace Chain (2.4-6.2b with Spear/Trident + Wind Charge + Mace)
     if (this._canStartSpearMace(target)) {
       this._enterSpearMace();
       return this._tickSpearMace(target);
     }
 
-    //    (d) Direct Jump -> Airborne Angled Wind Charge Mace Launch -> Wind Burst Chain / Pearl Catch
     if (this._canStartMaceLaunch(target)) {
       this.mode = AERIAL_MODES.MACE_LAUNCH;
       this.stage = 'JUMP_INIT';
@@ -913,17 +670,10 @@ class AerialModule {
     return false;
   }
 
-  /**
-   * Full 360-degree 3D airborne steering: snaps smoothly toward target's predicted hitbox
-   * (`force: true`) and projects the horizontal vector onto the bot's local forward/right axes
-   * so WASD + sprint air-control drifts directly onto the opponent on every airborne tick
-   * (during Wind Burst jumps, Pearl Catches, and post-Elytra Mace smashes).
-   */
   _steerAirborneToward(target, leadTicks = 2) {
     const aimStatus = this._aimAtTarget(target, leadTicks, {
       speedMultiplier: 2.0,
-      toleranceRad: 0.36,
-      force: true
+      toleranceRad: 0.36
     });
 
     const pos = this.bot.entity.position;
@@ -946,14 +696,10 @@ class AerialModule {
         const rightDot = nx * rx + nz * rz;
 
         const moveFwd = fwdDot > 0.25;
-        const moveBack = fwdDot < -0.35;
-        const moveRight = rightDot > 0.25;
-        const moveLeft = rightDot < -0.25;
-
         this.bot.setControlState('forward', moveFwd);
-        this.bot.setControlState('back', moveBack);
-        this.bot.setControlState('right', moveRight);
-        this.bot.setControlState('left', moveLeft);
+        this.bot.setControlState('back', fwdDot < -0.35);
+        this.bot.setControlState('right', rightDot > 0.25);
+        this.bot.setControlState('left', rightDot < -0.25);
         this.bot.setControlState('sprint', moveFwd && horizDist > 1.35);
       } else {
         this.bot.setControlState('forward', false);
@@ -970,6 +716,7 @@ class AerialModule {
 
 Object.assign(
   AerialModule.prototype,
+  elytraFlightMethods,
   pearlCatchMethods,
   maceComboMethods,
   spearMaceMethods,

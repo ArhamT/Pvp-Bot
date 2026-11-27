@@ -5,7 +5,6 @@ const { canSeeBlockFace } = require('../placement_los');
 const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
 const {
   ANCHOR_POWER,
-  COVER_BLOCK_PRIORITY,
   posKey,
   isAirLike
 } = require('./shared');
@@ -109,51 +108,14 @@ const anchorSkillMethods = {
     return !dim.includes('nether');
   },
 
-  _findOptionalCoverSpot(blastPos) {
-    if (!this.bot || !this.bot.entity || typeof this.bot.blockAt !== 'function') return null;
-    const botPos = this.bot.entity.position;
-    // Only need a cover block if bot is NOT at lower Y than blast
-    if (botPos.y < blastPos.y - 0.25) return null;
-
-    const coverRecord = this._findItem(COVER_BLOCK_PRIORITY);
-    if (!coverRecord) return null;
-
-    const toBlast = blastPos.minus(botPos);
-    const horizLen = Math.sqrt(toBlast.x * toBlast.x + toBlast.z * toBlast.z);
-    if (horizLen < 1.2) return null;
-
-    const coverPos = new Vec3(
-      Math.floor(botPos.x + (toBlast.x / horizLen) * 1.0),
-      Math.floor(botPos.y),
-      Math.floor(botPos.z + (toBlast.z / horizLen) * 1.0)
-    );
-
-    if (this._intersectsEntityHitbox(coverPos, botPos)) return null;
-    if (!isAirLike(this.bot.blockAt(coverPos))) return null;
-
-    const eyePos = this.aimer ? this.aimer.getEyePosition() : botPos.offset(0, 1.62, 0);
-    if (eyePos.distanceTo(coverPos.offset(0.5, 0.5, 0.5)) > 4.5) return null;
-
-    const ref = this._findPlacementRef(coverPos);
-    if (!ref) return null;
-
-    return {
-      blockRecord: coverRecord,
-      placePos: coverPos,
-      refPos: ref.refPos,
-      face: ref.face,
-      aimPos: ref.aimPos
-    };
-  },
-
   _findBestAnchorPlacement(target, predictedFeet) {
     if (!this._canUseRespawnAnchor()) return null;
     const now = Date.now();
-    if ((now - this.lastAnchorTime) < (this.burstCfg.anchorCooldownMs || 250)) return null;
+    const anchorCd = this.burstCfg.anchorCooldownMs !== undefined ? this.burstCfg.anchorCooldownMs : 120;
+    if ((now - this.lastAnchorTime) < anchorCd) return null;
 
     const anchorItem = this._findItem('respawn_anchor');
     const glowstoneItem = this._findItem('glowstone');
-    if (!anchorItem || !glowstoneItem) return null;
     if (!this.bot || typeof this.bot.blockAt !== 'function') return null;
 
     const botPos = this.bot.entity.position;
@@ -192,7 +154,9 @@ const anchorSkillMethods = {
             if (!this._findVisibleBlockFace(anchorPos)) continue;
             needsPlace = false;
             alreadyCharged = this._getAnchorCharges(existing) >= 1;
-          } else if (isAirLike(existing)) {
+            // Allow detonating already-charged field anchors even without glowstone/anchors!
+            if (!alreadyCharged && !glowstoneItem) continue;
+          } else if (isAirLike(existing) && anchorItem && glowstoneItem) {
             if (this._intersectsEntityHitbox(anchorPos, botPos)) continue;
             if (this._intersectsEntityHitbox(anchorPos, target.position, target.height || 1.8)) continue;
             anchorRef = this._findPlacementRef(anchorPos);
@@ -239,6 +203,25 @@ const anchorSkillMethods = {
     return best;
   },
 
+  _tryChainCrystalAfterAnchor(target) {
+    this.lastAnchorTime = Date.now();
+    if (this.burstCfg.crystalEnabled !== false && this._findItem('end_crystal') && target && target.isValid) {
+      const followCrystal = this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 1));
+      if (followCrystal) {
+        this.activePlan = followCrystal;
+        this.stepDelayTicks = this.placeDelayTicks;
+        this._enterState(
+          followCrystal.coverSpot
+            ? 'CRYSTAL_COVER'
+            : (followCrystal.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL')
+        );
+        return true;
+      }
+    }
+    this._resetOffensiveState(true);
+    return true;
+  },
+
   _tickAnchorState(target = null) {
     if (!this._canUseRespawnAnchor()) {
       this._resetOffensiveState(true);
@@ -275,18 +258,17 @@ const anchorSkillMethods = {
         : (plan.alreadyCharged ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE');
       const cover = plan.coverSpot;
       if (!cover || plan.coverPlaced) {
-        this.state = nextState;
+        this._enterState(nextState);
         return true;
       }
 
       const aimStatus = this.aimer.stepTowardsPoint(cover.aimPos, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.2
       });
       const equipRes = this._ensureItemHeld(cover.blockRecord);
       if (!equipRes.found) {
-        this.state = nextState;
+        this._enterState(nextState);
         return true;
       }
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -307,7 +289,7 @@ const anchorSkillMethods = {
       }
       plan.coverPlaced = true;
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = nextState;
+      this._enterState(nextState);
       return true;
     }
 
@@ -315,7 +297,7 @@ const anchorSkillMethods = {
     if (this.state === 'ANCHOR_PLACE') {
       const existing = this.bot.blockAt(plan.anchorPos);
       if (existing && existing.name === 'respawn_anchor') {
-        this.state = this._getAnchorCharges(existing) >= 1 ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE';
+        this._enterState(this._getAnchorCharges(existing) >= 1 ? 'ANCHOR_SWITCH_SLOT' : 'ANCHOR_CHARGE');
         return true;
       }
 
@@ -327,8 +309,7 @@ const anchorSkillMethods = {
 
       const aimStatus = this.aimer.stepTowardsPoint(plan.anchorRef.aimPos, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.2
       });
       const equipRes = this._ensureItemHeld(anchorItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -351,7 +332,7 @@ const anchorSkillMethods = {
       }
 
       this.stepDelayTicks = this.placeDelayTicks;
-      this.state = 'ANCHOR_CHARGE';
+      this._enterState('ANCHOR_CHARGE');
       return true;
     }
 
@@ -366,9 +347,8 @@ const anchorSkillMethods = {
 
       if (this._getAnchorCharges(anchorBlock) >= 1) {
         plan.chargeInFlight = false;
-        plan.charged = true;
         this.stepDelayTicks = this.placeDelayTicks;
-        this.state = 'ANCHOR_SWITCH_SLOT';
+        this._enterState('ANCHOR_SWITCH_SLOT');
         return true;
       }
 
@@ -384,7 +364,6 @@ const anchorSkillMethods = {
         if ((plan.chargeRetries || 0) < 1) {
           plan.chargeRetries = (plan.chargeRetries || 0) + 1;
           plan.chargeAttempted = false;
-          plan.charged = false;
           plan.chargeWaitTicks = 0;
         } else {
           this._markFailedAnchor(plan.anchorPos, 5000);
@@ -407,8 +386,7 @@ const anchorSkillMethods = {
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.2,
-        force: true
+        toleranceRad: 0.2
       });
       const equipRes = this._ensureItemHeld(glowstoneItem);
       if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
@@ -423,22 +401,18 @@ const anchorSkillMethods = {
           .finally(() => {
             plan.chargeInFlight = false;
             plan.chargeAttempted = true;
-            plan.charged = true;
           });
       } else {
         plan.chargeInFlight = false;
         plan.chargeAttempted = true;
-        plan.charged = true;
       }
 
-      // If synchronous mock already charged the block, advance on next tick cleanly
       const updatedBlock = this.bot.blockAt(plan.anchorPos);
       if (updatedBlock && updatedBlock.name === 'respawn_anchor' && this._getAnchorCharges(updatedBlock) >= 1) {
         plan.chargeInFlight = false;
         plan.chargeAttempted = true;
-        plan.charged = true;
         this.stepDelayTicks = this.placeDelayTicks;
-        this.state = 'ANCHOR_SWITCH_SLOT';
+        this._enterState('ANCHOR_SWITCH_SLOT');
       }
       return true;
     }
@@ -451,7 +425,7 @@ const anchorSkillMethods = {
         return false;
       }
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
-      this.aimer.stepTowardsPoint(faceAim, { speedMultiplier: 1.35, toleranceRad: 0.16 });
+      this.aimer.stepTowardsPoint(faceAim, { speedMultiplier: 1.5, toleranceRad: 0.18 });
       if (this.stepDelayTicks > 0) return true;
 
       const heldName = this.bot.heldItem ? this.bot.heldItem.name : '';
@@ -467,18 +441,17 @@ const anchorSkillMethods = {
         this.stepDelayTicks = Math.max(1, this.placeDelayTicks);
       }
 
-      this.state = 'ANCHOR_DETONATE';
+      this._enterState('ANCHOR_DETONATE');
       return true;
     }
 
-    // Step 4: Detonate Respawn Anchor on the following tick (activateBlock with non-glowstone slot)
+    // Step 4: Detonate Respawn Anchor on the following tick + HT1 Anchor -> Crystal Chain!
     if (this.state === 'ANCHOR_DETONATE') {
       const anchorBlock = this.bot.blockAt(plan.anchorPos);
       if (!anchorBlock || anchorBlock.name !== 'respawn_anchor') {
         if (plan.detonateAttempted || plan.detonateInFlight) {
-          this.lastAnchorTime = Date.now();
-          this._resetOffensiveState(true);
-          return true;
+          // Real server confirmed detonation on next tick -> chain straight into Crystal follow-up!
+          return this._tryChainCrystalAfterAnchor(target);
         }
         this._resetOffensiveState(true);
         return false;
@@ -505,7 +478,6 @@ const anchorSkillMethods = {
         }
       }
 
-      // Safety check: ensure we are NOT holding glowstone
       if (this.bot.heldItem && this.bot.heldItem.name === 'glowstone') {
         const safeSlot = this._findNonGlowstoneHotbarSlot();
         if (safeSlot >= 0 && typeof this.bot.setQuickBarSlot === 'function') {
@@ -525,8 +497,7 @@ const anchorSkillMethods = {
       const faceAim = plan.anchorPos.offset(0.5 + face.x * 0.5, 0.5 + face.y * 0.5, 0.5 + face.z * 0.5);
       const aimStatus = this.aimer.stepTowardsPoint(faceAim, {
         speedMultiplier: 2.0,
-        toleranceRad: 0.22,
-        force: true
+        toleranceRad: 0.22
       });
 
       if (this.stepDelayTicks > 0 || !aimStatus.aligned) {
@@ -547,23 +518,9 @@ const anchorSkillMethods = {
         plan.detonateAttempted = true;
       }
 
-      // If anchor already popped, chain straight into HT1 Crystal follow-up or finish cleanly
       const afterBlock = this.bot.blockAt(plan.anchorPos);
       if (!afterBlock || afterBlock.name !== 'respawn_anchor') {
-        this.lastAnchorTime = Date.now();
-        if (this.burstCfg.crystalEnabled !== false && this._findItem('end_crystal') && target && target.isValid) {
-          const followCrystal = this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 1));
-          if (followCrystal) {
-            this.activePlan = followCrystal;
-            this.stateTicks = 0;
-            this.stepDelayTicks = this.placeDelayTicks;
-            this.state = followCrystal.coverSpot
-              ? 'CRYSTAL_COVER'
-              : (followCrystal.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL');
-            return true;
-          }
-        }
-        this._resetOffensiveState(true);
+        return this._tryChainCrystalAfterAnchor(target);
       }
       return true;
     }

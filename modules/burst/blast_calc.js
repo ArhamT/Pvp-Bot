@@ -2,12 +2,16 @@
 
 const { Vec3 } = require('vec3');
 const { clamp } = require('../aim');
-const { getItemMetadataText } = require('../constants');
+const { getStatusEffectAmplifier } = require('../constants');
+const { getArmorBlastEPF } = require('../enchant_utils');
 const { CRYSTAL_POWER, ARMOR_STATS, posKey } = require('./shared');
 
 /**
- * Explosion Physics & Blast Damage Calculator (`modules/burst/blast_calc.js`):
- * Shared by Crystal, Hit-Crystal, Anchor, Surround Pressure, and Anti-Explosive Defense.
+ * Optimized Explosion Physics & Blast Damage Calculator (`modules/burst/blast_calc.js`):
+ * - Uses WeakMap-cached `enchant_utils.getArmorBlastEPF`
+ * - Caches per-entity armor/EPF/Resistance stats per physics tick
+ * - Zero `new Vec3` per-step allocations inside `_isRayOccluded`
+ * - Accurately models Resistance effect (-20%/lvl) & pure raycast exposure
  */
 const blastCalcMethods = {
   _getArmorItems(entity) {
@@ -41,102 +45,95 @@ const blastCalcMethods = {
   },
 
   _extractArmorBlastEPF(item) {
-    if (!item) return 0;
-    let blastProt = 0;
-    let genericProt = 0;
+    return getArmorBlastEPF(item);
+  },
 
-    const inspectEntry = (nameRaw, lvlRaw) => {
-      const name = String(nameRaw || '').toLowerCase();
-      const lvl = Math.max(0, Math.min(5, Number(lvlRaw) || 0));
-      if (!lvl) return;
-      if (name.includes('blast_protection')) {
-        blastProt = Math.max(blastProt, lvl);
-      } else if (
-        name === 'protection' ||
-        name === 'minecraft:protection' ||
-        (name.endsWith(':protection') && !name.includes('blast') && !name.includes('fire') && !name.includes('projectile'))
-      ) {
-        genericProt = Math.max(genericProt, lvl);
-      }
-    };
-
-    if (Array.isArray(item.enchants)) {
-      for (const e of item.enchants) {
-        if (e) inspectEntry(e.name || e.id, e.lvl !== undefined ? e.lvl : e.level);
-      }
+  _getCachedEntityDefense(entity) {
+    if (!entity) return { armorPoints: 0, armorToughness: 0, totalEPF: 0, resistanceMult: 1.0 };
+    const now = Date.now();
+    if (!this._entityDefenseCache) {
+      this._entityDefenseCache = new Map();
+      this._entityDefenseCacheAt = 0;
+    }
+    if ((now - this._entityDefenseCacheAt) > 45) {
+      this._entityDefenseCache.clear();
+      this._entityDefenseCacheAt = now;
     }
 
-    if (Array.isArray(item.components)) {
-      for (const comp of item.components) {
-        if (!comp) continue;
-        const type = String(comp.type || '').toLowerCase();
-        if (type.includes('enchantment')) {
-          const data = comp.data || comp.value || comp;
-          const list = data && (data.enchantments || data.levels || data);
-          if (Array.isArray(list)) {
-            for (const e of list) {
-              if (e) inspectEntry(e.name || e.id, e.lvl !== undefined ? e.lvl : e.level);
-            }
-          } else if (list && typeof list === 'object') {
-            for (const [k, v] of Object.entries(list)) {
-              inspectEntry(k, v);
-            }
-          }
-        }
+    const key = entity.id !== undefined ? entity.id : (entity.username || 'self');
+    const cached = this._entityDefenseCache.get(key);
+    if (cached) return cached;
+
+    const armorItems = this._getArmorItems(entity);
+    let armorPoints = 0;
+    let armorToughness = 0;
+    let totalEPF = 0;
+
+    for (let i = 0; i < armorItems.length; i++) {
+      const piece = armorItems[i];
+      const stats = ARMOR_STATS[piece.name];
+      if (stats) {
+        armorPoints += stats.armor;
+        armorToughness += stats.toughness;
       }
-    } else if (item.components && typeof item.components === 'object') {
-      const enchObj = item.components.enchantments || item.components['minecraft:enchantments'];
-      const levels = enchObj && (enchObj.levels || enchObj);
-      if (levels && typeof levels === 'object') {
-        for (const [k, v] of Object.entries(levels)) {
-          inspectEntry(k, v);
-        }
-      }
+      totalEPF += getArmorBlastEPF(piece);
     }
 
-    if (blastProt === 0 && genericProt === 0 && (item.nbt || item.components)) {
-      const raw = getItemMetadataText(item);
-      const blastMatch = raw.match(/blast_protection[^0-9]{0,24}(\d+)/);
-      if (blastMatch) {
-        blastProt = Math.min(5, parseInt(blastMatch[1], 10));
-      }
-      const stripped = raw.replace(/blast_protection/g, '').replace(/fire_protection/g, '').replace(/projectile_protection/g, '');
-      const protMatch = stripped.match(/protection[^0-9]{0,24}(\d+)/);
-      if (protMatch) {
-        genericProt = Math.min(5, parseInt(protMatch[1], 10));
-      }
-    }
+    // Factor Minecraft Resistance status effect (-20% per level, e.g., Enchanted Gapple / Turtle Master)
+    const resAmp = getStatusEffectAmplifier(this.bot, 'resistance', entity);
+    const resistanceMult = resAmp >= 0 ? Math.max(0, 1.0 - (resAmp + 1) * 0.2) : 1.0;
 
-    return blastProt * 2 + genericProt;
+    const result = { armorPoints, armorToughness, totalEPF, resistanceMult };
+    this._entityDefenseCache.set(key, result);
+    return result;
   },
 
   _isRayOccluded(fromPos, toPos, virtualSolidKeys = null) {
     if (!this.bot || typeof this.bot.blockAt !== 'function') return false;
 
-    const delta = toPos.minus(fromPos);
-    const length = delta.norm();
+    const dx = toPos.x - fromPos.x;
+    const dy = toPos.y - fromPos.y;
+    const dz = toPos.z - fromPos.z;
+    const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (length < 0.2) return false;
 
     const stepSize = 0.25;
     const steps = Math.floor(length / stepSize);
-    const originVoxel = posKey(fromPos);
-    const destVoxel = posKey(toPos);
+    const ox = Math.floor(fromPos.x);
+    const oy = Math.floor(fromPos.y);
+    const oz = Math.floor(fromPos.z);
+    const ex = Math.floor(toPos.x);
+    const ey = Math.floor(toPos.y);
+    const ez = Math.floor(toPos.z);
+
+    const probe = this._rayProbeVec || (this._rayProbeVec = new Vec3(0, 0, 0));
+    let lastBx = ox;
+    let lastBy = oy;
+    let lastBz = oz;
 
     for (let i = 1; i < steps; i++) {
       const t = (i * stepSize) / length;
-      const sample = new Vec3(
-        fromPos.x + delta.x * t,
-        fromPos.y + delta.y * t,
-        fromPos.z + delta.z * t
-      );
-      const key = posKey(sample);
-      if (key === originVoxel || key === destVoxel) continue;
+      const bx = Math.floor(fromPos.x + dx * t);
+      const by = Math.floor(fromPos.y + dy * t);
+      const bz = Math.floor(fromPos.z + dz * t);
+
+      if (bx === lastBx && by === lastBy && bz === lastBz) continue;
+      lastBx = bx;
+      lastBy = by;
+      lastBz = bz;
+
+      if ((bx === ox && by === oy && bz === oz) || (bx === ex && by === ey && bz === ez)) continue;
+
       if (virtualSolidKeys) {
+        const key = `${bx},${by},${bz}`;
         if (typeof virtualSolidKeys === 'string' && key === virtualSolidKeys) return true;
         if (typeof virtualSolidKeys.has === 'function' && virtualSolidKeys.has(key)) return true;
       }
 
-      const block = this.bot.blockAt(sample);
+      probe.x = bx;
+      probe.y = by;
+      probe.z = bz;
+      const block = this.bot.blockAt(probe);
       if (block && block.boundingBox === 'block') {
         return true;
       }
@@ -145,18 +142,21 @@ const blastCalcMethods = {
   },
 
   /**
-   * Estimates Minecraft explosion damage from `blastPos` to an entity at `entityPos`, factoring:
+   * Estimates vanilla Minecraft explosion damage from `blastPos` to an entity at `entityPos`, factoring:
    * - Euclidean distance vs explosion diameter (`power * 2`)
    * - Multi-point raycast block occlusion between blast center and entity feet/torso/head
-   * - Lower Y-level blast reduction (feet below blast plane take substantially less damage)
-   * - Worn armor defense points, armor toughness, and Blast Protection / Protection EPF
+   * - Worn armor defense points, armor toughness, Protection/Blast Protection EPF, and Resistance effect
    */
   estimateBlastDamage(blastPos, entityPos, entity = null, power = CRYSTAL_POWER, virtualSolidPos = null) {
     if (!blastPos || !entityPos) return 0;
 
     const doubleRadius = power * 2.0;
-    const dist = blastPos.distanceTo(entityPos);
-    if (dist >= doubleRadius) return 0;
+    const dx = blastPos.x - entityPos.x;
+    const dy = blastPos.y - entityPos.y;
+    const dz = blastPos.z - entityPos.z;
+    const distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq >= doubleRadius * doubleRadius) return 0;
+    const dist = Math.sqrt(distSq);
 
     const height = (entity && entity.height) || 1.8;
     const halfW = 0.25;
@@ -171,61 +171,51 @@ const blastCalcMethods = {
       virtualSolidKeys = posKey(virtualSolidPos);
     }
 
-    const samplePoints = [
-      entityPos.offset(0, 0.1, 0),
-      entityPos.offset(halfW, 0.15, 0),
-      entityPos.offset(-halfW, 0.15, 0),
-      entityPos.offset(0, 0.15, halfW),
-      entityPos.offset(0, 0.15, -halfW),
-      entityPos.offset(0, height * 0.45, 0),
-      entityPos.offset(0, height * 0.72, 0),
-      entityPos.offset(0, height * 0.92, 0)
+    const pt = this._samplePtVec || (this._samplePtVec = new Vec3(0, 0, 0));
+    const offsets = [
+      [0, 0.1, 0],
+      [halfW, 0.15, 0],
+      [-halfW, 0.15, 0],
+      [0, 0.15, halfW],
+      [0, 0.15, -halfW],
+      [0, height * 0.45, 0],
+      [0, height * 0.72, 0],
+      [0, height * 0.92, 0]
     ];
 
     let visibleCount = 0;
-    for (const pt of samplePoints) {
+    for (let i = 0; i < offsets.length; i++) {
+      pt.x = entityPos.x + offsets[i][0];
+      pt.y = entityPos.y + offsets[i][1];
+      pt.z = entityPos.z + offsets[i][2];
       if (!this._isRayOccluded(blastPos, pt, virtualSolidKeys)) {
         visibleCount++;
       }
     }
 
-    const exposure = visibleCount / samplePoints.length;
+    const exposure = visibleCount / offsets.length;
     if (exposure <= 0) return 0;
 
     const impact = (1.0 - dist / doubleRadius) * exposure;
     let damage = ((impact * impact + impact) / 2.0) * 7.0 * doubleRadius + 1.0;
 
-    const yDelta = blastPos.y - entityPos.y;
-    if (yDelta > 0.25) {
-      const lowerYMultiplier = clamp(1.0 - yDelta * 0.35, 0.35, 0.85);
-      damage *= lowerYMultiplier;
-    }
+    const def = this._getCachedEntityDefense(entity);
 
-    const armorItems = this._getArmorItems(entity);
-    let armorPoints = 0;
-    let armorToughness = 0;
-    let totalEPF = 0;
-
-    for (const piece of armorItems) {
-      const stats = ARMOR_STATS[piece.name];
-      if (stats) {
-        armorPoints += stats.armor;
-        armorToughness += stats.toughness;
-      }
-      totalEPF += this._extractArmorBlastEPF(piece);
-    }
-
-    if (armorPoints > 0) {
+    if (def.armorPoints > 0) {
       const effectiveArmor = clamp(
-        armorPoints - damage / (2.0 + armorToughness / 4.0),
-        armorPoints / 5.0,
+        def.armorPoints - damage / (2.0 + def.armorToughness / 4.0),
+        def.armorPoints / 5.0,
         20.0
       );
       damage *= 1.0 - effectiveArmor / 25.0;
     }
 
-    if (totalEPF > 0) {
-      const clampedEPF = Math.min(20, totalEPF);
+    if (def.resistanceMult < 1.0) {
+      damage *= def.resistanceMult;
+    }
+
+    if (def.totalEPF > 0) {
+      const clampedEPF = Math.min(20, def.totalEPF);
       damage *= 1.0 - clampedEPF * 0.04;
     }
 

@@ -1,7 +1,7 @@
 'use strict';
 
 const { DEG_TO_RAD } = require('../aim');
-const { selectMaceForFall, evaluateShieldCounter } = require('../mace_elytra');
+const { selectMaceForFall } = require('../mace_elytra');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 /**
@@ -173,10 +173,9 @@ const spearMaceMethods = {
       const launchPitchDeg = horizDist < 3.2 ? -87 : (horizDist < 6.0 ? -81 : -75);
       const eq = this._equipHand(windSel);
 
-      this.aimer.stepTowardsAngles(yawToTarget, launchPitchDeg * DEG_TO_RAD, {
-        speedMultiplier: 2.0,
-        toleranceRad: 0.18,
-        force: true
+      const aimStatus = this.aimer.stepTowardsAngles(yawToTarget, launchPitchDeg * DEG_TO_RAD, {
+        speedMultiplier: 2.2,
+        toleranceRad: 0.22
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -186,8 +185,8 @@ const spearMaceMethods = {
         this.bot.setControlState('jump', onGround);
       }
 
-      // Wait 1 settle tick after swapping to wind_charge, then launch immediately
-      if (eq.ready && !eq.swapped) {
+      // Wait for BOTH 1-tick slot settle AND downward pitch alignment before firing Wind Charge!
+      if (eq.ready && !eq.swapped && aimStatus.pitchErrorDeg <= 14) {
         if (typeof this.bot.activateItem === 'function') {
           this.bot.activateItem(false);
         }
@@ -253,23 +252,7 @@ const spearMaceMethods = {
       const maceSel = this._selectBestSpearMaceWeapon(target);
 
       if (velY < -0.05) {
-        // Branch A: 3-Branch Shield Countering (STUN_SLAM / BACKSTAB / SHIELD_DRAIN)
-        const counter = evaluateShieldCounter(this.bot, this.targetState, {
-          hasAxe: Boolean(this._findAxe()),
-          hasMace: Boolean(maceSel),
-          isAirborne: !onGround,
-          isGliding: Boolean(this.bot.entity && this.bot.entity.elytraFlying)
-        });
-        if (
-          this.aerialCfg.stunSlamEnabled !== false &&
-          counter.strategy === 'STUN_SLAM' &&
-          this.fallDistance > minFall &&
-          reachDist <= 4.2
-        ) {
-          this.mode = AERIAL_MODES.STUN_SLAM;
-          this.stage = 'AXE_BREAK';
-          this.stageTicks = 0;
-          this.stunSlamAxeSwapped = false;
+        if (reachDist <= 4.2 && this._tryEnterStunSlam(target, minFall)) {
           return this._tickStunSlam(target);
         }
 

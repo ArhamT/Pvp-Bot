@@ -1,10 +1,9 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { isAirLike: isConstantsAirLike } = require('../constants');
 const { findVisibleBlockFace } = require('../placement_los');
 const { canMineBlock } = require('../mining');
-const { CRYSTAL_POWER, isCrystalEntity } = require('./shared');
+const { CRYSTAL_POWER, isCrystalEntity, isAirLike, isNonNullAir, sameBlockPos } = require('./shared');
 const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
 
 const SURROUND_SOLID_BLOCKS = new Set([
@@ -36,25 +35,31 @@ const CARDINAL_OFFSETS = [
   new Vec3(0, 0, -1)
 ];
 
-function isNonNullAir(block) {
-  return Boolean(block) && isConstantsAirLike(block);
-}
-
-function sameBlockPos(a, b) {
-  if (!a || !b) return false;
-  return Math.floor(a.x) === Math.floor(b.x) &&
-    Math.floor(a.y) === Math.floor(b.y) &&
-    Math.floor(a.z) === Math.floor(b.z);
-}
-
-function hasExistingCrystalAt(bot, blockPos) {
-  if (!bot || !bot.entities || !blockPos) return false;
-  const center = blockPos.offset(0.5, 0, 0.5);
+function collectCrystalPositions(bot) {
+  const out = [];
+  if (!bot || !bot.entities) return out;
   for (const entity of Object.values(bot.entities)) {
-    if (!isCrystalEntity(entity) || !entity.position) continue;
-    if (sameBlockPos(entity.position.floored(), blockPos) || entity.position.distanceTo(center) <= 0.8) {
-      return true;
+    if (isCrystalEntity(entity) && entity.position) {
+      out.push(entity.position);
     }
+  }
+  return out;
+}
+
+function hasExistingCrystalAt(bot, blockPos, precollectedPositions = null) {
+  if (!blockPos) return false;
+  const list = precollectedPositions || collectCrystalPositions(bot);
+  if (list.length === 0) return false;
+  const cx = blockPos.x + 0.5;
+  const cy = blockPos.y;
+  const cz = blockPos.z + 0.5;
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (sameBlockPos(p, blockPos)) return true;
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    const dz = p.z - cz;
+    if ((dx * dx + dy * dy + dz * dz) <= 0.64) return true;
   }
   return false;
 }
@@ -127,6 +132,7 @@ function planSurroundPressurePlacement(burst, target, predictedFeet) {
   ];
 
   let best = null;
+  const liveCrystals = collectCrystalPositions(burst.bot);
 
   for (const spec of candidateSpecs) {
     const basePos = new Vec3(tx + spec.offset.x, ty + spec.offset.y, tz + spec.offset.z);
@@ -136,7 +142,7 @@ function planSurroundPressurePlacement(burst, target, predictedFeet) {
     const crystalSpace = basePos.offset(0, 1, 0);
     const aboveBlock = burst.bot.blockAt(crystalSpace);
     if (!baseBlock || !isNonNullAir(aboveBlock)) continue;
-    if (hasExistingCrystalAt(burst.bot, crystalSpace)) continue;
+    if (hasExistingCrystalAt(burst.bot, crystalSpace, liveCrystals)) continue;
     if (burst._intersectsEntityHitbox(crystalSpace, botPos)) continue;
     if (burst._intersectsEntityHitbox(crystalSpace, target.position, target.height || 1.8)) continue;
 
@@ -253,17 +259,18 @@ const surroundCityMethods = {
     }
 
     const block = this.bot.blockAt(plan.cityPos);
-    if (!block || isConstantsAirLike(block) || block.boundingBox !== 'block') {
+    if (!block || isAirLike(block) || block.boundingBox !== 'block') {
       if (this.miner) this.miner.cancel();
       const predictedFeet = this._getPredictedTargetFeet(target, 1);
       const crystalPlan = this._findBestCrystalPlacement(target, predictedFeet);
       if (crystalPlan) {
         this.activePlan = crystalPlan;
-        this.stateTicks = 0;
         this.stepDelayTicks = 0;
-        this.state = crystalPlan.coverSpot
-          ? 'CRYSTAL_COVER'
-          : (crystalPlan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL');
+        this._enterState(
+          crystalPlan.coverSpot
+            ? 'CRYSTAL_COVER'
+            : (crystalPlan.needsObsidian ? 'CRYSTAL_PLACE_OBSIDIAN' : 'CRYSTAL_PLACE_CRYSTAL')
+        );
         return this._tickCrystalState(target);
       }
       this._resetOffensiveState(false);
@@ -284,6 +291,7 @@ module.exports = {
   SURROUND_SOLID_BLOCKS,
   CITY_BREAKABLE_BLOCKS,
   CARDINAL_OFFSETS,
+  collectCrystalPositions,
   hasExistingCrystalAt,
   isTargetInSurround,
   planSurroundPressurePlacement,

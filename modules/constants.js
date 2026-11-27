@@ -37,6 +37,55 @@ const CHESTPLATE_PRIORITY = [
   'leather_chestplate'
 ];
 
+/**
+ * Blast-resistant solid cover priority (obsidian/ancient debris first; NEVER cobweb).
+ */
+const BLAST_SHIELD_BLOCK_PRIORITY = [
+  'obsidian',
+  'crying_obsidian',
+  'respawn_anchor',
+  'ancient_debris',
+  'ender_chest',
+  'cobbled_deepslate',
+  'cobblestone',
+  'deepslate',
+  'stone',
+  'end_stone',
+  'netherrack',
+  'dirt'
+];
+
+/**
+ * General solid building/cover/escape block priority (cheap solid blocks first, obsidian fallback).
+ */
+const COVER_BLOCK_PRIORITY = [
+  'cobblestone',
+  'cobbled_deepslate',
+  'netherrack',
+  'dirt',
+  'stone',
+  'oak_planks',
+  'spruce_planks',
+  'birch_planks',
+  'jungle_planks',
+  'acacia_planks',
+  'dark_oak_planks',
+  'mangrove_planks',
+  'cherry_planks',
+  'bamboo_planks',
+  'crimson_planks',
+  'warped_planks',
+  'end_stone',
+  'deepslate',
+  'sandstone',
+  'blackstone',
+  'basalt',
+  'andesite',
+  'diorite',
+  'granite',
+  'obsidian'
+];
+
 const HAZARD_BLOCKS = new Set([
   'lava',
   'flowing_lava',
@@ -52,6 +101,21 @@ const HAZARD_BLOCKS = new Set([
 ]);
 
 const ROAM_HAZARD_BLOCKS = new Set([...HAZARD_BLOCKS, 'water', 'flowing_water']);
+
+/**
+ * Canonical status effect ID tables for MC <=1.20.4 (1-based) vs MC 1.20.5–1.21.11+ (0-based).
+ */
+const EFFECT_IDS = Object.freeze({
+  speed: { zero: 0, one: 1, names: ['speed', 'swiftness'] },
+  slowness: { zero: 1, one: 2, names: ['slowness'] },
+  strength: { zero: 4, one: 5, names: ['strength'] },
+  instant_health: { zero: 5, one: 6, names: ['instant_health', 'instanthealth', 'healing'] },
+  regeneration: { zero: 9, one: 10, names: ['regeneration'] },
+  resistance: { zero: 10, one: 11, names: ['resistance', 'damage_resistance'] },
+  fire_resistance: { zero: 11, one: 12, names: ['fire_resistance', 'fireresistance', 'fire resistance'] },
+  water_breathing: { zero: 12, one: 13, names: ['water_breathing', 'waterbreathing'] },
+  slow_falling: { zero: 27, one: 28, names: ['slow_falling', 'slowfalling', 'slow falling'] }
+});
 
 const _itemMetaTextCache = new WeakMap();
 
@@ -116,9 +180,147 @@ function hasItemEnchant(item, enchantName) {
 }
 
 /**
- * Checks the bot's full 0.6-wide player hitbox (center + 4 corners at ±0.29) across feet (y)
- * and head (y+1) and returns the first block matching `predicate`, or null.
- * Prevents missing cobwebs, water, lava, or solid blocks that clip the edge of the player hitbox.
+ * Determines whether the connected Minecraft server uses 0-based effect IDs (MC 1.20.5+).
+ */
+function usesZeroBasedEffectIds(bot) {
+  if (bot && bot.registry && bot.registry.effectsByName) {
+    const speed = bot.registry.effectsByName.Speed || bot.registry.effectsByName.speed;
+    if (speed && typeof speed.id === 'number') {
+      return speed.id === 0;
+    }
+  }
+  const ver = String((bot && bot.version) || '');
+  return !ver || /^1\.(20\.[5-9]|21|2[2-9])/.test(ver);
+}
+
+/**
+ * Returns the active effect entry (or null) for `effectKey` on `entity` (defaults to `bot.entity`),
+ * strictly respecting MC 1.20.4 (1-based) vs MC 1.20.5+ (0-based) IDs and `bot.registry`.
+ */
+function getStatusEffect(bot, effectKey, entity = null) {
+  const ent = entity || (bot && bot.entity);
+  if (!ent || !ent.effects) return null;
+  const spec = EFFECT_IDS[effectKey];
+  if (!spec) return null;
+
+  const effects = ent.effects;
+  let targetId = null;
+
+  if (bot && bot.registry && bot.registry.effectsByName) {
+    for (const candidateName of spec.names) {
+      const camel = candidateName.replace(/(^|_)([a-z])/g, (_, __, c) => c.toUpperCase());
+      const reg = bot.registry.effectsByName[camel] || bot.registry.effectsByName[candidateName];
+      if (reg && typeof reg.id === 'number') {
+        targetId = reg.id;
+        break;
+      }
+    }
+  }
+
+  if (targetId === null) {
+    targetId = usesZeroBasedEffectIds(bot) ? spec.zero : spec.one;
+  }
+
+  if (effects instanceof Map) {
+    if (effects.has(targetId)) return effects.get(targetId);
+    if (effects.has(String(targetId))) return effects.get(String(targetId));
+    for (const n of spec.names) {
+      if (effects.has(n)) return effects.get(n);
+    }
+    return null;
+  }
+
+  if (Array.isArray(effects)) {
+    for (const e of effects) {
+      if (!e) continue;
+      if (Number(e.id) === targetId) return e;
+      const n = String(e.name || e.displayName || '').toLowerCase();
+      if (n && spec.names.some((k) => n.includes(k))) return e;
+    }
+    return null;
+  }
+
+  if (typeof effects === 'object') {
+    if (effects[targetId]) return effects[targetId];
+    if (effects[String(targetId)]) return effects[String(targetId)];
+    for (const n of spec.names) {
+      if (effects[n]) return effects[n];
+    }
+    for (const [key, eff] of Object.entries(effects)) {
+      if (!eff) continue;
+      const eid = eff.id !== undefined ? Number(eff.id) : Number(key);
+      if (eid === targetId) return eff;
+      const n = String(eff.name || eff.displayName || '').toLowerCase();
+      if (n && spec.names.some((k) => n.includes(k))) return eff;
+      if (bot && bot.registry && bot.registry.effects && bot.registry.effects[eid]) {
+        const regName = String(bot.registry.effects[eid].name || bot.registry.effects[eid].displayName || '').toLowerCase();
+        if (regName && spec.names.some((k) => regName.includes(k))) return eff;
+      }
+    }
+  }
+
+  return null;
+}
+
+function hasStatusEffect(bot, effectKey, entity = null) {
+  return Boolean(getStatusEffect(bot, effectKey, entity));
+}
+
+function getStatusEffectAmplifier(bot, effectKey, entity = null) {
+  const eff = getStatusEffect(bot, effectKey, entity);
+  if (!eff) return -1;
+  return typeof eff.amplifier === 'number' ? eff.amplifier : 0;
+}
+
+/**
+ * Single-pass hitbox sample across feet (0.05), torso (0.9), and head (1.78) corners.
+ * Returns `{ inLava, inFire, inWater, cobweb }` with zero duplicate block lookups per tick.
+ */
+function sampleBodyHazards(bot) {
+  const res = { inLava: false, inFire: false, inWater: false, cobweb: null };
+  if (!bot || !bot.entity || !bot.entity.position) return res;
+
+  if (bot.entity.isInLava) res.inLava = true;
+  if (bot.entity.isInWater) res.inWater = true;
+  if (bot.entity.onFire || bot.entity.isOnFire || (bot.entity.metadata && (Number(bot.entity.metadata[0]) & 0x01))) {
+    res.inFire = true;
+  }
+
+  if (typeof bot.blockAt !== 'function') return res;
+
+  const pos = bot.entity.position;
+  const seen = new Set();
+  const offsets = [0, -0.29, 0.29];
+  const probe = new Vec3(0, 0, 0);
+
+  for (const dy of [0.05, 0.9, 1.78]) {
+    const by = Math.floor(pos.y + dy);
+    for (const ox of offsets) {
+      const bx = Math.floor(pos.x + ox);
+      for (const oz of offsets) {
+        const bz = Math.floor(pos.z + oz);
+        const key = ((bx & 0x1fffff) * 1099511627776) + ((by & 0xfff) * 2097152) + (bz & 0x1fffff);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        probe.x = bx;
+        probe.y = by;
+        probe.z = bz;
+        const b = bot.blockAt(probe);
+        if (!b || !b.name) continue;
+        const name = b.name;
+        if (name === 'lava' || name === 'flowing_lava') res.inLava = true;
+        else if (name === 'fire' || name === 'soul_fire') res.inFire = true;
+        else if (name === 'water' || name === 'flowing_water') res.inWater = true;
+        else if (name === 'cobweb' && !res.cobweb) res.cobweb = b;
+      }
+    }
+  }
+  return res;
+}
+
+/**
+ * Checks the bot's full 0.6-wide player hitbox (center + 4 corners at ±0.29) across feet,
+ * torso, and head and returns the first block matching `predicate`, or null.
  */
 function findOverlappingBlock(bot, predicate) {
   if (!bot || !bot.entity || !bot.entity.position || typeof bot.blockAt !== 'function' || typeof predicate !== 'function') {
@@ -127,18 +329,21 @@ function findOverlappingBlock(bot, predicate) {
   const pos = bot.entity.position;
   const seen = new Set();
   const offsets = [0, -0.29, 0.29];
-  // Check feet (0.05), torso (0.9), and top of 1.8b player head (1.78) so jumping into
-  // a 3-block-high cobweb or overhead hazard is immediately detected.
+  const probe = new Vec3(0, 0, 0);
+
   for (const dy of [0.05, 0.9, 1.78]) {
     const by = Math.floor(pos.y + dy);
     for (const ox of offsets) {
+      const bx = Math.floor(pos.x + ox);
       for (const oz of offsets) {
-        const bx = Math.floor(pos.x + ox);
         const bz = Math.floor(pos.z + oz);
         const key = `${bx},${by},${bz}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const block = bot.blockAt(new Vec3(bx, by, bz));
+        probe.x = bx;
+        probe.y = by;
+        probe.z = bz;
+        const block = bot.blockAt(probe);
         if (block && predicate(block)) {
           return block;
         }
@@ -152,6 +357,15 @@ function posKey(pos) {
   return `${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`;
 }
 
+function sameBlockPos(a, b) {
+  return Boolean(
+    a && b &&
+    Math.floor(a.x) === Math.floor(b.x) &&
+    Math.floor(a.y) === Math.floor(b.y) &&
+    Math.floor(a.z) === Math.floor(b.z)
+  );
+}
+
 function isAirLike(block) {
   return Boolean(
     !block ||
@@ -159,6 +373,14 @@ function isAirLike(block) {
     block.name === 'cave_air' ||
     block.name === 'void_air'
   );
+}
+
+function isNonNullAir(block) {
+  return Boolean(block) && isAirLike(block);
+}
+
+function isHazardBlock(block) {
+  return Boolean(block && block.name && HAZARD_BLOCKS.has(block.name));
 }
 
 /**
@@ -183,8 +405,7 @@ const PARTIAL_NON_SUFFOCATING_PATTERN = /slab|stairs|trapdoor|carpet|snow|farmla
 
 /**
  * Returns the world-space vertical collision bounds `{ minY, maxY }` of a solid block,
- * or `null` if non-solid/passable. Uses `block.shapes` (exact prismarine-block AABBs)
- * when available, with accurate fallbacks for slabs, trapdoors, stairs, carpets, paths, etc.
+ * or `null` if non-solid/passable.
  */
 function getBlockCollisionBounds(block) {
   if (!block || block.boundingBox !== 'block') return null;
@@ -288,8 +509,7 @@ function isPlayerEmbeddedInBlock(pos, block) {
 
 /**
  * Evaluates walkability, auto-step (<= 0.6b), jumpable ledge (0.6..1.25b), headroom,
- * and immediate floor support at column `(x, z)` from feet height `y`.
- * Handles slabs, trapdoors, stairs, carpets, snow layers, paths, and floating slab bridges.
+ * hazards (lava/fire/cobweb/cactus), and immediate floor support at column `(x, z)` from feet height `y`.
  */
 function inspectColumnStep(bot, x, y, z) {
   const result = {
@@ -297,6 +517,7 @@ function inspectColumnStep(bot, x, y, z) {
     needsJump: false,
     blocked: false,
     hasFloor: false,
+    hasHazard: false,
     stepHeight: 0,
     targetFeetY: y
   };
@@ -313,6 +534,9 @@ function inspectColumnStep(bot, x, y, z) {
   for (let dy = -1; dy <= 2; dy++) {
     const b = bot.blockAt(new Vec3(bx, by + dy, bz));
     if (!b) continue;
+    if (dy >= -1 && dy <= 1 && HAZARD_BLOCKS.has(b.name)) {
+      result.hasHazard = true;
+    }
     const bounds = getBlockCollisionBounds(b);
     if (!bounds) continue;
     solids.push(bounds);
@@ -360,6 +584,41 @@ function inspectColumnStep(bot, x, y, z) {
   return result;
 }
 
+/**
+ * Checks whether standing/stepping at `pos` is safe (no hazards, no wall block, no >maxDrop void cliff).
+ */
+function isPositionSafe(bot, pos, maxDrop = 3) {
+  if (!bot || typeof bot.blockAt !== 'function' || !pos) return true;
+  const col = inspectColumnStep(bot, pos.x, pos.y, pos.z);
+  if (col.hasHazard || col.blocked) return false;
+  if (col.hasFloor) return true;
+
+  const bx = Math.floor(pos.x);
+  const by = Math.floor(pos.y);
+  const bz = Math.floor(pos.z);
+  for (let drop = 2; drop <= maxDrop; drop++) {
+    const b = bot.blockAt(new Vec3(bx, by - drop, bz));
+    if (b && HAZARD_BLOCKS.has(b.name)) return false;
+    if (b && b.boundingBox === 'block') return true;
+  }
+  return false;
+}
+
+/**
+ * Samples along normalized horizontal direction `(dirX, dirZ)` up to `dist` blocks from bot feet.
+ */
+function isDirectionSafe(bot, dirX, dirZ, dist = 2.0, maxDrop = 3) {
+  if (!bot || !bot.entity || !bot.entity.position) return true;
+  const pos = bot.entity.position;
+  const steps = Math.max(1, Math.ceil(dist));
+  for (let i = 1; i <= steps; i++) {
+    const d = Math.min(dist, i * 0.9);
+    const sample = new Vec3(pos.x + dirX * d, pos.y, pos.z + dirZ * d);
+    if (!isPositionSafe(bot, sample, maxDrop)) return false;
+  }
+  return true;
+}
+
 module.exports = {
   OFFHAND_SLOT,
   HOTBAR_START,
@@ -370,17 +629,30 @@ module.exports = {
   SWORD_PRIORITY,
   AXE_PRIORITY,
   CHESTPLATE_PRIORITY,
+  BLAST_SHIELD_BLOCK_PRIORITY,
+  COVER_BLOCK_PRIORITY,
   HAZARD_BLOCKS,
   ROAM_HAZARD_BLOCKS,
+  EFFECT_IDS,
   isSpearItem,
   clearMovementControls,
   getItemMetadataText,
   hasItemEnchant,
+  usesZeroBasedEffectIds,
+  getStatusEffect,
+  hasStatusEffect,
+  getStatusEffectAmplifier,
+  sampleBodyHazards,
   findOverlappingBlock,
   posKey,
+  sameBlockPos,
   isAirLike,
+  isNonNullAir,
+  isHazardBlock,
   isLiquidSource,
   getBlockCollisionBounds,
   isPlayerEmbeddedInBlock,
-  inspectColumnStep
+  inspectColumnStep,
+  isPositionSafe,
+  isDirectionSafe
 };

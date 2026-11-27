@@ -1,23 +1,11 @@
 'use strict';
 
 const { Vec3 } = require('vec3');
-const { posKey, isLiquidSource } = require('./constants');
+const { posKey, isLiquidSource, COVER_BLOCK_PRIORITY } = require('./constants');
 const { findInventoryItem, ensureItemHeld, findNearestLiquidSource } = require('./inventory_utils');
 const { canSeeBlockFace, findVisiblePlacementRef, hasClearRaySegment } = require('./placement_los');
 
-const SOLID_DENY_BLOCKS = [
-  'cobblestone',
-  'cobbled_deepslate',
-  'netherrack',
-  'dirt',
-  'stone',
-  'oak_planks',
-  'spruce_planks',
-  'birch_planks',
-  'end_stone',
-  'deepslate',
-  'obsidian'
-];
+const SOLID_DENY_BLOCKS = COVER_BLOCK_PRIORITY;
 
 /**
  * Liquid Denial skill:

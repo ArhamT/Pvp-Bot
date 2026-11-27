@@ -76,31 +76,6 @@ const elytraSpearMethods = {
     this.elytraSpearAttackNextTick = false;
   },
 
-  /**
-   * 3D forward obstacle raycast along `(yaw, pitch)` to keep Elytra Spear flight
-   * from slamming into walls, pillars, trees, or ceilings.
-   */
-  _hasFlightObstacleAhead(yaw, pitch, maxDist = 4.5) {
-    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
-      return false;
-    }
-    const origin = this.bot.entity.position.offset(0, 0.5, 0);
-    const cosP = Math.cos(pitch);
-    const dx = -Math.sin(yaw) * cosP;
-    const dy = Math.sin(pitch);
-    const dz = -Math.cos(yaw) * cosP;
-
-    for (const d of [1.2, 2.2, 3.4, maxDist]) {
-      const sample = origin.offset(dx * d, dy * d, dz * d);
-      const b0 = this.bot.blockAt(sample);
-      const b1 = this.bot.blockAt(sample.offset(0, 0.6, 0));
-      if ((b0 && b0.boundingBox === 'block') || (b1 && b1.boundingBox === 'block')) {
-        return true;
-      }
-    }
-    return false;
-  },
-
   _releaseSpearChargeIfActive() {
     if (this.elytraSpearCharging) {
       this.elytraSpearCharging = false;
@@ -209,6 +184,7 @@ const elytraSpearMethods = {
       const dz = target.position.z - pos.z;
       const horizDist = Math.sqrt(dx * dx + dz * dz);
       const desiredYaw = horizDist < 4.5 ? Math.atan2(dx, dz) : Math.atan2(-dx, -dz);
+      this.elytraTakeoffYaw = desiredYaw;
 
       this.aimer.stepTowardsAngles(desiredYaw, 32 * DEG_TO_RAD, { speedMultiplier: 1.65 });
 
@@ -265,14 +241,16 @@ const elytraSpearMethods = {
     if (this.stage === 'BOOST_IGNITE') {
       if (onGround && this.stageTicks > 2) {
         this.lastElytraTakeoffTime = now;
-        this._resetState();
+        this._resetState(true);
         return false;
       }
 
       const dx = target.position.x - pos.x;
       const dz = target.position.z - pos.z;
-      const yawToTarget = Math.atan2(-dx, -dz);
-      this.aimer.stepTowardsAngles(yawToTarget, 28 * DEG_TO_RAD, { speedMultiplier: 1.7 });
+      const horizDist = Math.sqrt(dx * dx + dz * dz);
+      // Preserve runway yaw when launching close so we gain kinetic run-up instead of slamming into enemy shield!
+      const boostYaw = horizDist < 5.0 ? this.elytraTakeoffYaw : Math.atan2(-dx, -dz);
+      this.aimer.stepTowardsAngles(boostYaw, 28 * DEG_TO_RAD, { speedMultiplier: 1.7 });
 
       if (!onGround && this.bot.entity.elytraFlying === false && !this.elytraGlideRetrySent && this.stageTicks === 3) {
         this._sendStartElytraFlying();
@@ -319,7 +297,7 @@ const elytraSpearMethods = {
 
       if (onGround && this.elytraFlightTicks > 5) {
         this._releaseSpearChargeIfActive();
-        this._resetState();
+        this._resetState(true);
         return true;
       }
 
@@ -332,7 +310,7 @@ const elytraSpearMethods = {
       if (this.elytraSpearStuckTicks >= 4) {
         this._releaseSpearChargeIfActive();
         this.lastElytraTakeoffTime = now;
-        this._resetState();
+        this._resetState(true);
         return false;
       }
 
@@ -541,7 +519,7 @@ const elytraSpearMethods = {
       this._releaseSpearChargeIfActive();
 
       if (onGround && this.stageTicks > 2) {
-        this._resetState();
+        this._resetState(true);
         return true;
       }
 
@@ -552,7 +530,7 @@ const elytraSpearMethods = {
       }
       if (this.elytraSpearStuckTicks >= 4) {
         this.lastElytraTakeoffTime = now;
-        this._resetState();
+        this._resetState(true);
         return false;
       }
 
@@ -601,8 +579,8 @@ const elytraSpearMethods = {
         }
       }
 
-      // Loop back onto the opponent for the next high-speed Spear fly-by!
-      if (this.stageTicks >= 12 || (this.stageTicks >= 7 && horizDist >= 11.0 && heightAboveGround >= 4.5)) {
+      // Build >= 12.5b separation so kinetic joust re-entry reaches lethal velocity
+      if (this.stageTicks >= 14 || (this.stageTicks >= 8 && horizDist >= 12.5 && heightAboveGround >= 4.5)) {
         this.stage = 'FLY_APPROACH';
         this.stageTicks = 0;
       }

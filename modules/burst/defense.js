@@ -3,7 +3,6 @@
 const { Vec3 } = require('vec3');
 const { canSeeBlockFace } = require('../placement_los');
 const {
-  CRYSTAL_POWER,
   DEFENSE_BLOCK_PRIORITY,
   posKey,
   isAirLike,
@@ -12,16 +11,19 @@ const {
 
 /**
  * Dedicated Anti-Crystal & Anti-Anchor Defense Module (`modules/burst/defense.js`):
- * Tracks enemy explosive placements (`obsidian`, `respawn_anchor`, `end_crystal`),
- * places feet blast-shield cover blocks (`DEFENSE_BLOCK`), or raises shield (`DEFENSE_SHIELD`).
+ * - Event-driven (`blockUpdate` + `entitySpawn`) + throttled fallback scan (eliminates 9,680 blockAt/sec!)
+ * - Places SOLID feet blast-shield blocks (NEVER cobweb!)
+ * - Delegates shield raising to `survival.requestShield(...)` when attached (synced shield state!)
  */
 const burstDefenseMethods = {
   _markOwnPlacement(pos, ttlMs = 2500) {
     if (!pos) return;
     const now = Date.now();
     this.ownPlacements.set(posKey(pos), now + ttlMs);
-    for (const [k, exp] of this.ownPlacements.entries()) {
-      if (exp < now) this.ownPlacements.delete(k);
+    if (this.ownPlacements.size > 48) {
+      for (const [k, exp] of this.ownPlacements.entries()) {
+        if (exp < now) this.ownPlacements.delete(k);
+      }
     }
   },
 
@@ -51,6 +53,15 @@ const burstDefenseMethods = {
     const blockCenter = newBlock.position.offset(0.5, 0.5, 0.5);
     const dist = botPos.distanceTo(blockCenter);
     const yDiff = Math.abs(newBlock.position.y - botPos.y);
+
+    // For obsidian, only preempt if dangerously close to our feet (<= 3.5b) and air above it
+    if (name === 'obsidian') {
+      if (dist > Math.min(3.5, radius) || yDiff > 1.8) return;
+      if (typeof this.bot.blockAt === 'function') {
+        const above = this.bot.blockAt(newBlock.position.offset(0, 1, 0));
+        if (!isAirLike(above)) return;
+      }
+    }
 
     if (dist <= radius && yDiff <= 2.5) {
       const blastOrigin = name === 'obsidian'
@@ -127,8 +138,10 @@ const burstDefenseMethods = {
     if (!key) return;
     const now = Date.now();
     this.defendedThreats.set(key, now + ttlMs);
-    for (const [k, exp] of this.defendedThreats.entries()) {
-      if (exp <= now) this.defendedThreats.delete(k);
+    if (this.defendedThreats.size > 48) {
+      for (const [k, exp] of this.defendedThreats.entries()) {
+        if (exp <= now) this.defendedThreats.delete(k);
+      }
     }
   },
 
@@ -146,22 +159,23 @@ const burstDefenseMethods = {
 
   _scanNearbyExplosiveThreats(target) {
     if (!this.bot || !this.bot.entity || !this.bot.entity.position) return null;
+    const now = Date.now();
     const botPos = this.bot.entity.position;
     const radius = this.burstCfg.antiExplosiveRadius || 4.5;
+    const radiusSq = radius * radius;
 
-    // 1. Live End Crystal entities near bot's feet
+    // 1. Live End Crystal entities near bot's feet (cheap entity loop every tick)
     if (this.bot.entities) {
       let closestCrystal = null;
-      let closestDist = Infinity;
+      let closestDistSq = Infinity;
       for (const entity of Object.values(this.bot.entities)) {
         if (!isCrystalEntity(entity) || !entity.position) continue;
+        const dSq = botPos.distanceSquared(entity.position);
+        if (dSq > radiusSq || dSq >= closestDistSq) continue;
         const cFloor = entity.position.floored();
         if (this._isOwnPlacement(cFloor) || this._isOwnPlacement(cFloor.offset(0, -1, 0))) continue;
-        const d = botPos.distanceTo(entity.position);
-        if (d <= radius && d < closestDist) {
-          closestDist = d;
-          closestCrystal = entity;
-        }
+        closestDistSq = dSq;
+        closestCrystal = entity;
       }
       if (closestCrystal) {
         return {
@@ -169,72 +183,82 @@ const burstDefenseMethods = {
           entityId: closestCrystal.id,
           blockPos: closestCrystal.position.floored().offset(0, -1, 0),
           blastOrigin: closestCrystal.position.clone(),
-          detectedAt: Date.now()
+          detectedAt: now
         };
       }
     }
 
-    // 2. Nearby Respawn Anchors (and enemy-held crystal obsidian traps)
+    // 2. Throttle 3D block scan to every 200ms (blockUpdate catches fresh anchors/obsidian instantly!)
+    if ((now - (this._lastThreatBlockScanAt || 0)) < 200) {
+      return null;
+    }
+    // Skip block scan completely if no target within 10 blocks
+    if (target && target.position && botPos.distanceSquared(target.position) > 100.0) {
+      return null;
+    }
+    this._lastThreatBlockScanAt = now;
+
     if (typeof this.bot.blockAt === 'function') {
       const bx = Math.floor(botPos.x);
       const by = Math.floor(botPos.y);
       const bz = Math.floor(botPos.z);
       const rInt = Math.ceil(radius);
 
-      const targetHoldingCrystal = Boolean(
-        target &&
-        target.isValid &&
-        Array.isArray(target.equipment) &&
-        target.equipment.some((eq) => eq && eq.name === 'end_crystal')
-      );
-      const targetHoldingGlowstone = Boolean(
-        target &&
-        target.isValid &&
-        Array.isArray(target.equipment) &&
-        target.equipment.some((eq) => eq && eq.name === 'glowstone')
-      );
+      const targetEq = (target && target.isValid && Array.isArray(target.equipment)) ? target.equipment : [];
+      const targetHoldingCrystal = targetEq.some((eq) => eq && eq.name === 'end_crystal');
+      const targetHoldingGlowstone = targetEq.some((eq) => eq && eq.name === 'glowstone');
 
       let anchorThreat = null;
-      let anchorDist = Infinity;
+      let anchorDistSq = Infinity;
       let obsThreat = null;
-      let obsDist = Infinity;
+      let obsDistSq = Infinity;
+      const probe = new Vec3(0, 0, 0);
 
       for (let dx = -rInt; dx <= rInt; dx++) {
+        const x = bx + dx;
+        const ddx = (x + 0.5) - botPos.x;
         for (let dy = -1; dy <= 2; dy++) {
+          const y = by + dy;
+          const ddy = (y + 0.5) - botPos.y;
           for (let dz = -rInt; dz <= rInt; dz++) {
-            const pos = new Vec3(bx + dx, by + dy, bz + dz);
-            const center = pos.offset(0.5, 0.5, 0.5);
-            const dist = botPos.distanceTo(center);
-            if (dist > radius) continue;
-            if (this._isOwnPlacement(pos)) continue;
+            const z = bz + dz;
+            const ddz = (z + 0.5) - botPos.z;
+            const distSq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if (distSq > radiusSq) continue;
 
-            const block = this.bot.blockAt(pos);
+            probe.x = x;
+            probe.y = y;
+            probe.z = z;
+            if (this._isOwnPlacement(probe)) continue;
+
+            const block = this.bot.blockAt(probe);
             if (!block) continue;
 
-            if (block.name === 'respawn_anchor' && dist < anchorDist) {
+            if (block.name === 'respawn_anchor' && distSq < anchorDistSq) {
               const charges = this._getAnchorCharges(block);
-              // Ignore uncharged abandoned anchors unless opponent is actively holding glowstone
               if (charges < 1 && !targetHoldingGlowstone) continue;
+              const pos = new Vec3(x, y, z);
               const cand = {
                 type: 'respawn_anchor',
                 blockPos: pos,
-                blastOrigin: center,
-                detectedAt: Date.now()
+                blastOrigin: new Vec3(x + 0.5, y + 0.5, z + 0.5),
+                detectedAt: now
               };
               if (this._isDefendedThreat(cand)) continue;
-              anchorDist = dist;
+              anchorDistSq = distSq;
               anchorThreat = cand;
-            } else if (targetHoldingCrystal && block.name === 'obsidian' && dist < obsDist) {
-              const above = this.bot.blockAt(pos.offset(0, 1, 0));
+            } else if (targetHoldingCrystal && block.name === 'obsidian' && distSq < obsDistSq && distSq <= 3.5 * 3.5) {
+              const above = this.bot.blockAt(new Vec3(x, y + 1, z));
               if (isAirLike(above)) {
+                const pos = new Vec3(x, y, z);
                 const cand = {
                   type: 'obsidian',
                   blockPos: pos,
-                  blastOrigin: pos.offset(0.5, 1.0, 0.5),
-                  detectedAt: Date.now()
+                  blastOrigin: new Vec3(x + 0.5, y + 1.0, z + 0.5),
+                  detectedAt: now
                 };
                 if (this._isDefendedThreat(cand)) continue;
-                obsDist = dist;
+                obsDistSq = distSq;
                 obsThreat = cand;
               }
             }
@@ -286,8 +310,6 @@ const burstDefenseMethods = {
     const horizLen = Math.sqrt(toBlast.x * toBlast.x + toBlast.z * toBlast.z);
 
     const candidatePositions = [];
-
-    // 1. Place blocking block directly between bot's feet and explosive origin
     if (horizLen >= 0.8) {
       const stepDist = Math.min(1.2, horizLen * 0.5);
       const midPos = new Vec3(
@@ -298,7 +320,6 @@ const burstDefenseMethods = {
       candidatePositions.push(midPos);
     }
 
-    // 2. If threat is enemy obsidian (no crystal yet), block directly on top of the obsidian
     if (threat.type === 'obsidian' && threat.blockPos) {
       candidatePositions.push(threat.blockPos.offset(0, 1, 0));
     }
@@ -324,19 +345,12 @@ const burstDefenseMethods = {
     return null;
   },
 
-  /**
-   * High-priority anti-crystal / anti-anchor defense tick.
-   * Returns true if BurstModule is actively taking defensive action against an explosive threat.
-   */
   tickDefense(target) {
-    this._updateFallDistance();
-
     if (this.burstCfg.antiExplosiveEnabled === false || !this.bot || !this.bot.entity) {
       this._clearDefenseState();
       return false;
     }
 
-    // Scan for live threats and merge with event-detected threats
     const scanned = this._scanNearbyExplosiveThreats(target);
     if (scanned) {
       this._registerThreat(scanned);
@@ -352,19 +366,16 @@ const burstDefenseMethods = {
       return false;
     }
 
-    // Do not interrupt our own active ANCHOR_* detonation sequence for non-crystal threats
     if (this.state.startsWith('ANCHOR_') && this.activeThreat.type !== 'end_crystal') {
       return false;
     }
 
-    // High-priority defense preempts offensive bursts (but preserves lethal fall clutch)
-    if (this.state !== 'IDLE' && this.state !== 'WIND_CLUTCH') {
+    if (this.state !== 'IDLE') {
       this._resetOffensiveState(false);
     }
 
     const threat = this.activeThreat;
 
-    // Initialize defense plan if IDLE
     if (this.defenseState === 'IDLE') {
       const blockPlan = this._planDefensiveBlock(threat);
       if (blockPlan) {
@@ -387,23 +398,22 @@ const burstDefenseMethods = {
 
     if (this.defenseState === 'DEFENSE_BLOCK' && this.defensePlan) {
       const plan = this.defensePlan;
-      this.bot.setControlState('sprint', false);
+      if (typeof this.bot.setControlState === 'function') {
+        this.bot.setControlState('sprint', false);
+      }
 
-      // Step 1: Smoothly aim at placement face & ensure blocking block is held (sequential across ticks)
       const aimStatus = this.aimer.stepTowardsPoint(plan.aimPos, {
-        speedMultiplier: 1.4,
+        speedMultiplier: 1.5,
         toleranceRad: 0.18
       });
 
       const equipRes = this._ensureItemHeld(plan.blockRecord);
       if (!equipRes.found) {
-        // Block ran out; fall back to crouch-shield
         this.defenseState = 'DEFENSE_SHIELD';
         this.defensePlan = null;
         return this._tickDefenseShield(threat);
       }
 
-      // Anticheat safety: never swap + place in the same tick
       if (equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned) {
         return true;
       }
@@ -422,7 +432,6 @@ const burstDefenseMethods = {
         }
       }
 
-      // If threat was a live crystal or respawn anchor, follow up with brief crouch-shield
       if (threat.type === 'end_crystal' || threat.type === 'respawn_anchor') {
         this.defenseState = 'DEFENSE_SHIELD';
         this.defensePlan = null;
@@ -438,22 +447,28 @@ const burstDefenseMethods = {
   },
 
   _tickDefenseShield(threat) {
-    this.bot.setControlState('sprint', false);
-    this.bot.setControlState('sneak', true);
+    if (typeof this.bot.setControlState === 'function') {
+      this.bot.setControlState('sprint', false);
+      this.bot.setControlState('sneak', true);
+    }
 
     this.aimer.stepTowardsPoint(threat.blastOrigin, {
-      speedMultiplier: 1.4,
+      speedMultiplier: 1.5,
       toleranceRad: 0.16
     });
 
-    const offhand = this._getOffhandItem();
-    const hasShield = (offhand && offhand.name === 'shield') ||
-      (this.bot.heldItem && this.bot.heldItem.name === 'shield');
-
-    if (hasShield && !this.defenseShieldRaised && typeof this.bot.activateItem === 'function') {
-      const useOffhand = Boolean(offhand && offhand.name === 'shield');
-      this.bot.activateItem(useOffhand);
-      this.defenseShieldRaised = true;
+    // Delegate shield control to SurvivalModule when attached so shield state & cooldown stay in sync!
+    if (this.survival && typeof this.survival.requestShield === 'function') {
+      this.survival.requestShield('burst_defense', Math.max(2, this.defenseTicksRemaining));
+    } else {
+      const offhand = this._getOffhandItem();
+      const hasShield = (offhand && offhand.name === 'shield') ||
+        (this.bot.heldItem && this.bot.heldItem.name === 'shield');
+      if (hasShield && !this.defenseShieldRaised && typeof this.bot.activateItem === 'function') {
+        const useOffhand = Boolean(offhand && offhand.name === 'shield');
+        this.bot.activateItem(useOffhand);
+        this.defenseShieldRaised = true;
+      }
     }
 
     if (this.defenseTicksRemaining <= 0) {
