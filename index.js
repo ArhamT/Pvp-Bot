@@ -1517,27 +1517,63 @@ class PvPBotController {
         this.targetLostAt = now;
       }
 
-      // Check if another player is right here (e.g. target respawned with a new entityId)
+      const arenaMode = this._detectArenaMode();
+      const inSpawnLobby = this._hasLobbyMenuItems();
+      const engageRange = this.config.combat.engageRange || 96.0;
+
+      // Check if same target simply refreshed its entityId (and is not in FFA red_wool safe zone)
       if (this.activeTargetName) {
         const reacquired = this._findPlayerEntity(this.activeTargetName);
-        if (reacquired) {
+        const reacquiredInSafeZone = Boolean(
+          reacquired &&
+          (arenaMode === 'FFA' || this.inFfaArena) &&
+          this.redWoolZone &&
+          this.redWoolZone.isPositionInSafeZone(reacquired.position)
+        );
+        if (reacquired && !reacquiredInSafeZone) {
           this.activeTargetEntityId = reacquired.id;
           this.targetLostAt = 0;
           return;
         }
       }
 
-      // If loot appeared right where the target stood, they were defeated
+      // Detect immediate defeat (loot dropped at target's last pos OR target died/vanished within 6 blocks)
       const nearLoot = this.config.looting.enabled ? this._findNearestLoot() : null;
-      if (nearLoot && this.targetLastSeenPos && nearLoot.position.distanceTo(this.targetLastSeenPos) <= 5.0) {
+      const lootDroppedAtTarget = Boolean(
+        nearLoot &&
+        this.targetLastSeenPos &&
+        nearLoot.position.distanceTo(this.targetLastSeenPos) <= 5.0
+      );
+      const diedRightHere = Boolean(
+        !this.targetLastSeenPos ||
+        this.bot.entity.position.distanceTo(this.targetLastSeenPos) <= 6.0
+      );
+
+      // Target is dead -> immediately engage the next nearest opponent (outside red_wool safe zone)!
+      if ((lootDroppedAtTarget || diedRightHere) && !inSpawnLobby) {
+        const nextTarget = this._pickEngageableTarget(arenaMode, engageRange);
+        if (nextTarget) {
+          this._engageTarget(nextTarget.entity, 'target defeated — engaging next nearest opponent');
+          return;
+        }
+      }
+
+      if (lootDroppedAtTarget) {
         this._clearTargetState();
         this.transitionState(STATES.LOOTING, 'target defeated, collecting drops');
         return;
       }
 
-      // Continue sprinting toward target's last seen position for up to targetHuntTimeoutMs (12s)
+      // Target vanished further away -> hunt last seen position briefly, switching immediately if another opponent is nearby
       const huntTimeout = this.config.combat.targetHuntTimeoutMs || 12000;
       if (this.targetLastSeenPos && (now - this.targetLostAt) < huntTimeout) {
+        if (!inSpawnLobby) {
+          const nearbyOpp = this._pickEngageableTarget(arenaMode, engageRange);
+          if (nearbyOpp && (nearbyOpp.dist <= 20.0 || (now - this.targetLostAt) >= 1500)) {
+            this._engageTarget(nearbyOpp.entity, 'target lost — engaging nearest opponent');
+            return;
+          }
+        }
         const distToLast = this.bot.entity.position.distanceTo(this.targetLastSeenPos);
         if (distToLast > 2.0) {
           const aimStatus = this.aimer.stepTowardsPoint(this.targetLastSeenPos.offset(0, 1.0, 0), {
@@ -1553,10 +1589,9 @@ class PvPBotController {
         }
       }
 
-      // Hunt timed out — if in FFA/Duels or !auto is ON, switch to next eligible opponent outside red_wool
-      const arenaMode = this._detectArenaMode();
-      if (this.autoFight || arenaMode === 'FFA' || arenaMode === 'DUELS') {
-        const nextTarget = this._pickEngageableTarget(arenaMode, this.config.combat.disengageRange || 96.0);
+      // Hunt timed out — engage next eligible opponent if not in spawn lobby
+      if (!inSpawnLobby) {
+        const nextTarget = this._pickEngageableTarget(arenaMode, this.config.combat.disengageRange || 160.0);
         if (nextTarget) {
           this._engageTarget(nextTarget.entity, `${arenaMode.toLowerCase()} re-acquire`);
           return;
@@ -1775,6 +1810,18 @@ class PvPBotController {
   }
 
   _tickLooting() {
+    // If another valid opponent is nearby (not in spawn lobby), immediately engage instead of looting!
+    if (!this._hasLobbyMenuItems()) {
+      const arenaMode = this._detectArenaMode();
+      if (this.autoFight || arenaMode === 'FFA' || arenaMode === 'DUELS') {
+        const nextTarget = this._pickEngageableTarget(arenaMode, this.config.combat.engageRange || 96.0);
+        if (nextTarget) {
+          this._engageTarget(nextTarget.entity, 'opponent nearby during looting');
+          return;
+        }
+      }
+    }
+
     const elapsed = Date.now() - this.lootStartedAt;
     const maxDuration = this.config.looting.maxDurationMs || 8000;
     const loot = this._findNearestLoot();
