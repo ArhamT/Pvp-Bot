@@ -2,11 +2,8 @@
 
 const { Vec3 } = require('vec3');
 const { canSeeBlockFace } = require('../placement_los');
-const {
-  hasExistingCrystalAt,
-  findFeetBlastShieldSpot,
-  planHitCrystalTrajectory
-} = require('../cpvp_tactics');
+const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
+const { hasExistingCrystalAt } = require('./surround_city');
 const {
   CRYSTAL_POWER,
   isAirLike,
@@ -160,25 +157,48 @@ const crystalSkillMethods = {
     return best;
   },
 
-  _canStartHitCrystal(target) {
-    if (this.burstCfg.hitCrystalEnabled === false || this.burstCfg.crystalEnabled === false) return false;
-    if (!target || !target.isValid || !this.bot || !this.bot.entity) return false;
+  /**
+   * Evaluates whether the bot should IMMEDIATELY Double-Pop / Triple-Pop another End Crystal
+   * onto `basePos` on the very next tick after detonation (HT1 rapid crystal chain!).
+   */
+  _canContinueDoublePop(target, basePos, currentChainCount = 0) {
+    if (this.burstCfg.doublePopEnabled === false) return false;
+    if (!target || !target.isValid || !target.position || !basePos || !this.bot || !this.bot.entity) {
+      return false;
+    }
 
-    const now = Date.now();
-    if ((now - this.lastCrystalTime) < (this.burstCfg.crystalCooldownMs || 100)) return false;
-    if ((now - this.lastHitCrystalTime) < (this.burstCfg.hitCrystalCooldownMs || 350)) return false;
-
+    const maxChain = this._isInTotemPunishWindow() ? 4 : 3;
+    if (currentChainCount >= maxChain) return false;
     if (!this._findItem('end_crystal')) return false;
-    if (!this._findBestSword()) return false;
 
-    const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
-    const reachDist = this._getReachDistanceToEntity(target);
-    if (reachDist > maxHitRange) return false;
+    const baseBlock = typeof this.bot.blockAt === 'function' ? this.bot.blockAt(basePos) : null;
+    if (!baseBlock || (baseBlock.name !== 'obsidian' && baseBlock.name !== 'bedrock')) return false;
 
-    // Only initiate hit-launch when opponent is grounded/low so sprint-knockback launches them upward
-    if (target.onGround === false && target.velocity && target.velocity.y > 0.15) return false;
+    const crystalSpace = basePos.offset(0, 1, 0);
+    if (!isAirLike(this.bot.blockAt(crystalSpace))) return false;
+    if (hasExistingCrystalAt(this.bot, crystalSpace)) return false;
 
-    return Boolean(planHitCrystalTrajectory(this, target));
+    const botPos = this.bot.entity.position;
+    if (this._intersectsEntityHitbox(crystalSpace, botPos)) return false;
+    if (this._intersectsEntityHitbox(crystalSpace, target.position, target.height || 1.8)) return false;
+
+    if (!canSeeBlockFace(this.bot, basePos, new Vec3(0, 1, 0), { aimer: this.aimer, maxReach: 4.5 })) {
+      return false;
+    }
+
+    const blastPos = basePos.offset(0.5, 1.0, 0.5);
+    const predictedFeet = this._getPredictedTargetFeet(target, 2);
+    if (blastPos.distanceTo(predictedFeet) > 4.6) return false;
+
+    const targetDmg = this.estimateBlastDamage(blastPos, predictedFeet, target, CRYSTAL_POWER);
+    const selfDmg = this.estimateBlastDamage(blastPos, botPos, this.bot.entity, CRYSTAL_POWER);
+    const minSafeHp = this._isHoldingOffhandTotem() ? 4 : 6;
+
+    if (targetDmg < 4.0) return false;
+    if (targetDmg <= selfDmg && !this._isInTotemPunishWindow()) return false;
+    if ((this.bot.health - selfDmg) <= minSafeHp) return false;
+
+    return true;
   },
 
   _findCrystalEntityNear(pos, maxDist = 2.2) {
@@ -213,65 +233,9 @@ const crystalSkillMethods = {
       return false;
     }
 
-    // Step 0 (Hit-Crystal): Sprint-knockback melee hit -> trajectory Obsidian -> End Crystal -> Spawn-Tick Detonate
+    // Step 0 (Hit-Crystal): delegated to dedicated `modules/burst/hit_crystal.js`
     if (this.state === 'CRYSTAL_HIT_LAUNCH') {
-      if (!target || !target.isValid || this.stateTicks > 10) {
-        this._resetOffensiveState(true);
-        return false;
-      }
-
-      const maxHitRange = this.burstCfg.hitCrystalMaxRange || 3.2;
-      const reachDist = this._getReachDistanceToEntity(target);
-      if (reachDist > maxHitRange + 0.35) {
-        this._resetOffensiveState(true);
-        return false;
-      }
-
-      const swordRecord = this._findBestSword();
-      if (!swordRecord) {
-        this._resetOffensiveState(true);
-        return false;
-      }
-
-      const torsoPos = target.position.offset(0, (target.height || 1.8) * 0.65, 0);
-      const aimStatus = this.aimer.stepTowardsPoint(torsoPos, { speedMultiplier: 2.0, toleranceRad: 0.22, force: true });
-      const equipRes = this._ensureItemHeld(swordRecord);
-
-      if (typeof this.bot.setControlState === 'function') {
-        this.bot.setControlState('forward', true);
-        this.bot.setControlState('sprint', this.bot.food > 6);
-      }
-
-      if (this.stepDelayTicks > 0 || equipRes.swappedThisTick || !equipRes.held || !aimStatus.aligned || reachDist > maxHitRange) {
-        return true;
-      }
-
-      if (typeof this.bot.attack === 'function') {
-        this.bot.attack(target);
-      }
-      this.lastHitCrystalTime = Date.now();
-      if (typeof this.bot.setControlState === 'function') {
-        this.bot.setControlState('sprint', false);
-        this.bot.setControlState('forward', false);
-      }
-
-      const trajPlan = planHitCrystalTrajectory(this, target) ||
-        this._findBestCrystalPlacement(target, this._getPredictedTargetFeet(target, 2));
-      if (!trajPlan) {
-        this._resetOffensiveState(true);
-        return false;
-      }
-
-      this.activePlan = trajPlan;
-      this.stepDelayTicks = 1;
-      if (trajPlan.coverSpot) {
-        this.state = 'CRYSTAL_COVER';
-      } else if (trajPlan.needsObsidian) {
-        this.state = 'CRYSTAL_PLACE_OBSIDIAN';
-      } else {
-        this.state = 'CRYSTAL_PLACE_CRYSTAL';
-      }
-      return true;
+      return this._tickHitCrystalLaunch(target);
     }
 
     this._applyCpvpFootwork(target, plan.blastPos, plan.coverSpot ? plan.coverSpot.placePos : null);

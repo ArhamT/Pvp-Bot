@@ -14,22 +14,22 @@ const {
 } = require('./placement_los');
 const { BlockMiner } = require('./mining');
 const {
-  isTargetInSurround,
-  planSurroundPressurePlacement
-} = require('./cpvp_tactics');
-const {
   CRYSTAL_POWER,
-  ANCHOR_POWER,
-  posKey,
-  isAirLike,
-  isCrystalEntity
+  ANCHOR_POWER
 } = require('./burst/shared');
+const { blastCalcMethods } = require('./burst/blast_calc');
 const { burstDefenseMethods } = require('./burst/defense');
+const { cpvpFootworkMethods } = require('./burst/cpvp_footwork');
+const {
+  isTargetInSurround,
+  planSurroundPressurePlacement,
+  surroundCityMethods
+} = require('./burst/surround_city');
+const { hitCrystalMethods } = require('./burst/hit_crystal');
 const { crystalSkillMethods } = require('./burst/crystal_skill');
 const { anchorSkillMethods } = require('./burst/anchor_skill');
 const { windChargeSkillMethods } = require('./burst/wind_charge_skill');
 const { cpvpMobilityMethods } = require('./burst/cpvp_mobility');
-const { ht1TacticsMethods } = require('./burst/ht1_tactics');
 
 class BurstModule {
   constructor(bot, config, aimer, prediction = null, combat = null) {
@@ -191,108 +191,6 @@ class BurstModule {
     this.defenseTicksRemaining = 0;
   }
 
-  _markOwnPlacement(pos, ttlMs = 2500) {
-    if (!pos) return;
-    const now = Date.now();
-    this.ownPlacements.set(posKey(pos), now + ttlMs);
-    for (const [k, exp] of this.ownPlacements.entries()) {
-      if (exp < now) this.ownPlacements.delete(k);
-    }
-  }
-
-  _isOwnPlacement(pos) {
-    if (!pos) return false;
-    const key = posKey(pos);
-    const exp = this.ownPlacements.get(key);
-    if (!exp) return false;
-    if (Date.now() > exp) {
-      this.ownPlacements.delete(key);
-      return false;
-    }
-    return true;
-  }
-
-  _handleBlockUpdate(oldBlock, newBlock) {
-    if (this.burstCfg.antiExplosiveEnabled === false) return;
-    if (!newBlock || !newBlock.position || !this.bot || !this.bot.entity || !this.bot.entity.position) return;
-
-    const name = newBlock.name;
-    if (name !== 'obsidian' && name !== 'respawn_anchor') return;
-    if (oldBlock && oldBlock.name === name) return;
-    if (this._isOwnPlacement(newBlock.position)) return;
-
-    const radius = this.burstCfg.antiExplosiveRadius || 4.5;
-    const botPos = this.bot.entity.position;
-    const blockCenter = newBlock.position.offset(0.5, 0.5, 0.5);
-    const dist = botPos.distanceTo(blockCenter);
-    const yDiff = Math.abs(newBlock.position.y - botPos.y);
-
-    if (dist <= radius && yDiff <= 2.5) {
-      const blastOrigin = name === 'obsidian'
-        ? newBlock.position.offset(0.5, 1.0, 0.5)
-        : newBlock.position.offset(0.5, 0.5, 0.5);
-      this._registerThreat({
-        type: name,
-        blockPos: newBlock.position.clone(),
-        blastOrigin,
-        detectedAt: Date.now()
-      });
-    }
-  }
-
-  _handleEntitySpawn(entity) {
-    if (!isCrystalEntity(entity) || !entity.position || !this.bot || !this.bot.entity) return;
-
-    // Immediate spawn-tick crystal registration for our own offensive crystal sequence
-    if (
-      this.activePlan &&
-      this.activePlan.kind === 'crystal' &&
-      this.activePlan.blastPos &&
-      (this.state === 'CRYSTAL_DETONATE' || this.state === 'CRYSTAL_PLACE_CRYSTAL') &&
-      entity.position.distanceTo(this.activePlan.blastPos) <= 2.5
-    ) {
-      this.activePlan.spawnedCrystal = entity;
-      this.stepDelayTicks = 0;
-      return;
-    }
-
-    if (this.burstCfg.antiExplosiveEnabled === false) return;
-
-    const crystalFloor = entity.position.floored();
-    if (this._isOwnPlacement(crystalFloor) || this._isOwnPlacement(crystalFloor.offset(0, -1, 0))) {
-      return;
-    }
-
-    const radius = this.burstCfg.antiExplosiveRadius || 4.5;
-    const dist = this.bot.entity.position.distanceTo(entity.position);
-    if (dist <= radius) {
-      this._registerThreat({
-        type: 'end_crystal',
-        entityId: entity.id,
-        blockPos: crystalFloor.offset(0, -1, 0),
-        blastOrigin: entity.position.clone(),
-        detectedAt: Date.now()
-      });
-    }
-  }
-
-  _registerThreat(threat) {
-    // Prioritize live crystal / respawn_anchor over raw obsidian
-    const priority = (t) => {
-      if (!t) return 0;
-      if (t.type === 'end_crystal') return 3;
-      if (t.type === 'respawn_anchor') return 2;
-      return 1;
-    };
-
-    if (!this.activeThreat || priority(threat) >= priority(this.activeThreat)) {
-      this.activeThreat = threat;
-      if (this.defenseState === 'IDLE') {
-        this.defensePlan = null;
-      }
-    }
-  }
-
   _getHotbarStart() {
     return (this.bot && this.bot.inventory && this.bot.inventory.hotbarStart) || HOTBAR_START;
   }
@@ -382,135 +280,12 @@ class BurstModule {
     return this._findItem(SWORD_PRIORITY, false);
   }
 
-  _getAnchorCharges(block) {
-    if (!block) return 0;
-    if (typeof block.getProperties === 'function') {
-      try {
-        const props = block.getProperties();
-        if (props && props.charges !== undefined) {
-          const val = Number(props.charges);
-          if (Number.isFinite(val)) return val;
-        }
-      } catch (_) {}
-    }
-    if (block._properties && block._properties.charges !== undefined) {
-      const val = Number(block._properties.charges);
-      if (Number.isFinite(val)) return val;
-    }
-    const meta = Number(block.metadata);
-    return Number.isFinite(meta) && meta > 0 ? meta : 0;
-  }
-
-  _markFailedAnchor(pos, ttlMs = 5000) {
-    if (!pos) return;
-    const now = Date.now();
-    this.failedAnchors.set(posKey(pos), now + ttlMs);
-    for (const [k, exp] of this.failedAnchors.entries()) {
-      if (exp <= now) this.failedAnchors.delete(k);
-    }
-  }
-
-  _isFailedAnchor(pos) {
-    if (!pos) return false;
-    const key = posKey(pos);
-    const exp = this.failedAnchors.get(key);
-    if (!exp) return false;
-    if (Date.now() > exp) {
-      this.failedAnchors.delete(key);
-      return false;
-    }
-    return true;
-  }
-
-  _threatKey(threat) {
-    if (!threat) return '';
-    const ref = threat.blockPos || threat.blastOrigin;
-    return ref ? `${threat.type}:${posKey(ref)}` : `${threat.type}`;
-  }
-
-  _markDefendedThreat(threat, ttlMs = 2500) {
-    const key = this._threatKey(threat);
-    if (!key) return;
-    const now = Date.now();
-    this.defendedThreats.set(key, now + ttlMs);
-    for (const [k, exp] of this.defendedThreats.entries()) {
-      if (exp <= now) this.defendedThreats.delete(k);
-    }
-  }
-
-  _isDefendedThreat(threat) {
-    const key = this._threatKey(threat);
-    if (!key) return false;
-    const exp = this.defendedThreats.get(key);
-    if (!exp) return false;
-    if (Date.now() > exp) {
-      this.defendedThreats.delete(key);
-      return false;
-    }
-    return true;
-  }
-
   _findVisibleBlockFace(blockPos) {
     const vis = findVisibleBlockFace(this.bot, blockPos, {
       aimer: this.aimer,
       maxReach: 4.5
     });
     return vis ? vis.face : null;
-  }
-
-  /**
-   * Mandatory non-glowstone hotbar swap selector:
-   * Strictly prioritizes non-placeable slots (Totem -> Sword -> Axe -> Empty) before blocks.
-   */
-  _findNonGlowstoneHotbarSlot() {
-    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return -1;
-    const start = this._getHotbarStart();
-
-    // 1. Totem of Undying in hotbar (non-placeable)
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (item && item.name === 'totem_of_undying') return i;
-    }
-
-    // 2. Sword slot (combat-tracked or any hotbar sword)
-    if (this.combat && typeof this.combat.getHotbarSlots === 'function') {
-      const slots = this.combat.getHotbarSlots();
-      if (slots && typeof slots.swordSlot === 'number' && slots.swordSlot >= 0) {
-        const item = this.bot.inventory.slots[start + slots.swordSlot];
-        if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
-          return slots.swordSlot;
-        }
-      }
-    }
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (item && item.name.endsWith('_sword')) return i;
-    }
-
-    // 3. Axe in hotbar (non-placeable)
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (item && item.name.endsWith('_axe')) return i;
-    }
-
-    // 4. Empty hotbar slot (non-placeable)
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (!item) return i;
-    }
-
-    // 5. Obsidian or any other non-glowstone, non-anchor hotbar slot
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (item && item.name === 'obsidian') return i;
-    }
-    for (let i = 0; i < 9; i++) {
-      const item = this.bot.inventory.slots[start + i];
-      if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
-        return i;
-      }
-    }
-    return -1;
   }
 
   /**
@@ -835,12 +610,15 @@ class BurstModule {
 
 Object.assign(
   BurstModule.prototype,
+  blastCalcMethods,
   burstDefenseMethods,
+  cpvpFootworkMethods,
+  surroundCityMethods,
+  hitCrystalMethods,
   crystalSkillMethods,
   anchorSkillMethods,
   windChargeSkillMethods,
-  cpvpMobilityMethods,
-  ht1TacticsMethods
+  cpvpMobilityMethods
 );
 
 module.exports = {

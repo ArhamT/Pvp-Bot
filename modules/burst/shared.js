@@ -2,15 +2,29 @@
 
 const { Vec3 } = require('vec3');
 const { posKey, isAirLike } = require('../constants');
-const {
-  CRYSTAL_POWER,
-  BLAST_SHIELD_BLOCK_PRIORITY,
-  isCrystalEntity
-} = require('../cpvp_tactics');
 
 const HOTBAR_END = 44;
+const CRYSTAL_POWER = 6.0;
 const ANCHOR_POWER = 5.0;
+
+const BLAST_SHIELD_BLOCK_PRIORITY = [
+  'obsidian',
+  'glowstone',
+  'cobbled_deepslate',
+  'cobblestone',
+  'stone',
+  'deepslate',
+  'end_stone'
+];
+
 const COVER_BLOCK_PRIORITY = BLAST_SHIELD_BLOCK_PRIORITY;
+
+function isCrystalEntity(entity) {
+  if (!entity || !entity.isValid) return false;
+  const name = String(entity.name || '').toLowerCase();
+  const display = String(entity.displayName || '').toLowerCase();
+  return name === 'end_crystal' || name === 'ender_crystal' || name === 'endercrystal' || display === 'end crystal';
+}
 
 const DEFENSE_BLOCK_PRIORITY = [
   'cobweb', 'obsidian', 'cobbled_deepslate', 'cobblestone', 'stone',
@@ -59,6 +73,7 @@ module.exports = {
   HOTBAR_END,
   CRYSTAL_POWER,
   ANCHOR_POWER,
+  BLAST_SHIELD_BLOCK_PRIORITY,
   COVER_BLOCK_PRIORITY,
   DEFENSE_BLOCK_PRIORITY,
   ARMOR_STATS,

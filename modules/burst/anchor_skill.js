@@ -2,14 +2,106 @@
 
 const { Vec3 } = require('vec3');
 const { canSeeBlockFace } = require('../placement_los');
-const { findFeetBlastShieldSpot } = require('../cpvp_tactics');
+const { findFeetBlastShieldSpot } = require('./cpvp_footwork');
 const {
   ANCHOR_POWER,
   COVER_BLOCK_PRIORITY,
+  posKey,
   isAirLike
 } = require('./shared');
 
+/**
+ * Dedicated Respawn Anchor PvP Skill (`modules/burst/anchor_skill.js`):
+ * Dimension guard, charge reading, failed-anchor blacklisting, mandatory non-glowstone swap,
+ * feet blast-shielding, single-charge detonation, and instant Anchor -> Crystal chaining.
+ */
 const anchorSkillMethods = {
+  _getAnchorCharges(block) {
+    if (!block) return 0;
+    if (typeof block.getProperties === 'function') {
+      try {
+        const props = block.getProperties();
+        if (props && props.charges !== undefined) {
+          const val = Number(props.charges);
+          if (Number.isFinite(val)) return val;
+        }
+      } catch (_) {}
+    }
+    if (block._properties && block._properties.charges !== undefined) {
+      const val = Number(block._properties.charges);
+      if (Number.isFinite(val)) return val;
+    }
+    const meta = Number(block.metadata);
+    return Number.isFinite(meta) && meta > 0 ? meta : 0;
+  },
+
+  _markFailedAnchor(pos, ttlMs = 5000) {
+    if (!pos) return;
+    const now = Date.now();
+    this.failedAnchors.set(posKey(pos), now + ttlMs);
+    for (const [k, exp] of this.failedAnchors.entries()) {
+      if (exp <= now) this.failedAnchors.delete(k);
+    }
+  },
+
+  _isFailedAnchor(pos) {
+    if (!pos) return false;
+    const key = posKey(pos);
+    const exp = this.failedAnchors.get(key);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      this.failedAnchors.delete(key);
+      return false;
+    }
+    return true;
+  },
+
+  _findNonGlowstoneHotbarSlot() {
+    if (!this.bot || !this.bot.inventory || !this.bot.inventory.slots) return -1;
+    const start = this._getHotbarStart();
+
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name === 'totem_of_undying') return i;
+    }
+
+    if (this.combat && typeof this.combat.getHotbarSlots === 'function') {
+      const slots = this.combat.getHotbarSlots();
+      if (slots && typeof slots.swordSlot === 'number' && slots.swordSlot >= 0) {
+        const item = this.bot.inventory.slots[start + slots.swordSlot];
+        if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
+          return slots.swordSlot;
+        }
+      }
+    }
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name.endsWith('_sword')) return i;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name.endsWith('_axe')) return i;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (!item) return i;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (item && item.name === 'obsidian') return i;
+    }
+    for (let i = 0; i < 9; i++) {
+      const item = this.bot.inventory.slots[start + i];
+      if (!item || (item.name !== 'glowstone' && item.name !== 'respawn_anchor')) {
+        return i;
+      }
+    }
+    return -1;
+  },
+
   _canUseRespawnAnchor() {
     if (this.burstCfg.anchorEnabled === false) return false;
     if (!this.bot || !this.bot.game || !this.bot.game.dimension) return false;
