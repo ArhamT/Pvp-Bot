@@ -145,7 +145,7 @@ const anchorSkillMethods = {
     return best;
   },
 
-  _tickAnchorState() {
+  _tickAnchorState(target = null) {
     if (!this._canUseRespawnAnchor()) {
       this._resetOffensiveState(true);
       return false;
@@ -159,6 +159,14 @@ const anchorSkillMethods = {
 
     this.stateTicks++;
     if (this.stateTicks > 40) {
+      this._resetOffensiveState(true);
+      return false;
+    }
+    if (
+      target && target.isValid && target.position &&
+      this.state !== 'ANCHOR_DETONATE' &&
+      this.bot.entity.position.distanceTo(target.position) > 5.5
+    ) {
       this._resetOffensiveState(true);
       return false;
     }

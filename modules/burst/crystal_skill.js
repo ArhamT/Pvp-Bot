@@ -205,6 +205,10 @@ const crystalSkillMethods = {
       this._resetOffensiveState(true);
       return false;
     }
+    if (target && target.isValid && target.position && this.bot.entity.position.distanceTo(target.position) > 5.8) {
+      this._resetOffensiveState(true);
+      return false;
+    }
 
     // Step 0 (Hit-Crystal): Sprint-knockback melee hit -> trajectory Obsidian -> End Crystal -> Spawn-Tick Detonate
     if (this.state === 'CRYSTAL_HIT_LAUNCH') {

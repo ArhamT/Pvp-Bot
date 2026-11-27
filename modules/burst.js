@@ -24,6 +24,7 @@ const { burstDefenseMethods } = require('./burst/defense');
 const { crystalSkillMethods } = require('./burst/crystal_skill');
 const { anchorSkillMethods } = require('./burst/anchor_skill');
 const { windChargeSkillMethods } = require('./burst/wind_charge_skill');
+const { cpvpMobilityMethods } = require('./burst/cpvp_mobility');
 
 class BurstModule {
   constructor(bot, config, aimer, prediction = null, combat = null) {
@@ -48,12 +49,17 @@ class BurstModule {
     this.stepDelayTicks = 0;
     this.equipBusy = false;
 
-    // Cooldowns
+    // Cooldowns & CPvP unstick mobility state
     this.lastCrystalTime = 0;
     this.lastHitCrystalTime = 0;
     this.hitCrystalTarget = null;
     this.lastAnchorTime = 0;
     this.lastWindChargeTime = 0;
+    this.lastCpvpPearlAt = 0;
+    this.cpvpStuckTicks = 0;
+    this.lastCpvpPos = null;
+    this.cpvpDigging = false;
+    this.cpvpDigStartedAt = 0;
 
     // Offensive shield/sneak state (used during anchor detonation)
     this.anchorShieldRaised = false;
@@ -685,11 +691,14 @@ class BurstModule {
         return this.state === 'WIND_CLUTCH';
       }
 
+      if (this.state.startsWith('CPVP_')) {
+        return this._tickCpvpMobility(target);
+      }
       if (this.state.startsWith('CRYSTAL_')) {
         return this._tickCrystalState(target);
       }
       if (this.state.startsWith('ANCHOR_')) {
-        return this._tickAnchorState();
+        return this._tickAnchorState(target);
       }
       if (this.state.startsWith('WIND_')) {
         return this._tickWindChargeState(target);
@@ -743,7 +752,7 @@ class BurstModule {
         } else {
           this.state = 'ANCHOR_CHARGE';
         }
-        return this._tickAnchorState();
+        return this._tickAnchorState(target);
       }
     }
 
@@ -786,6 +795,12 @@ class BurstModule {
       }
     }
 
+    // CPvP mobility & unstick: when stuck/stopped trying to reach opponent with Crystal/Anchor kit,
+    // use Ender Pearl, Walk-Jump, or Mine through blocking wall with the appropriate tool!
+    if (this._tickCpvpMobility(target)) {
+      return true;
+    }
+
     // Optional Wind Charge Mace Launch fallback (only if explicitly enabled)
     if (this.burstCfg.windChargeLaunchEnabled === true && this._canStartWindChargeLaunch(target)) {
       this.activePlan = { kind: 'wind_mace' };
@@ -804,7 +819,8 @@ Object.assign(
   burstDefenseMethods,
   crystalSkillMethods,
   anchorSkillMethods,
-  windChargeSkillMethods
+  windChargeSkillMethods,
+  cpvpMobilityMethods
 );
 
 module.exports = {
