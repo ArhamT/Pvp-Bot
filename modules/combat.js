@@ -978,21 +978,15 @@ class CombatModule {
   }
 
   /**
-   * Stops all movement controls, pathfinder goals, and transient combat states cleanly.
+   * Releases CombatModule's pathfinder & transient melee timers WITHOUT clearing
+   * active WASD/sprint/jump controls owned by AerialModule, BurstModule, RangedModule, or SurvivalModule.
    */
-  stopMovement() {
+  releaseControl() {
     if (this.usingPathfinder && this.bot.pathfinder) {
       this.bot.pathfinder.setGoal(null);
       this.usingPathfinder = false;
       this.lastPathGoalPos = null;
     }
-    this.bot.setControlState('forward', false);
-    this.bot.setControlState('back', false);
-    this.bot.setControlState('left', false);
-    this.bot.setControlState('right', false);
-    this.bot.setControlState('sprint', false);
-    this.bot.setControlState('jump', false);
-
     this.sprintResetTicksRemaining = 0;
     this.reengageSprintNextTick = false;
     this.jumpResetActive = false;
@@ -1006,6 +1000,19 @@ class CombatModule {
     this.shieldBreakActive = false;
     this.swapBackToSwordNextTick = false;
     this.cancelSpearLunge();
+  }
+
+  /**
+   * Stops all movement controls, pathfinder goals, and transient combat states cleanly.
+   */
+  stopMovement() {
+    this.releaseControl();
+    this.bot.setControlState('forward', false);
+    this.bot.setControlState('back', false);
+    this.bot.setControlState('left', false);
+    this.bot.setControlState('right', false);
+    this.bot.setControlState('sprint', false);
+    this.bot.setControlState('jump', false);
   }
 
   /**

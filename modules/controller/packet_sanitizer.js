@@ -88,8 +88,11 @@ const packetSanitizerMethods = {
     };
 
     if (typeof bot._client.on === 'function') {
-      // Fix MC 1.21.9–1.21.11+ lpVec3 entity_velocity knockback (Mineflayer 4.39.0 divides lpVec3 by 8000)
-      bot._client.on('entity_velocity', (packet) => {
+      // Fix MC 1.21.9–1.21.11+ lpVec3 entity_velocity knockback (Mineflayer 4.39.0 divides lpVec3 by 8000).
+      // CRITICAL: Mineflayer loads its built-in `entities` plugin asynchronously on `inject_allowed`
+      // (`setTimeout(..., 0)`), AFTER createBot() returns. Re-append our listener on `inject_allowed`,
+      // `login`, and `spawn` so it is ALWAYS registered AFTER Mineflayer's entities.js listener!
+      const onEntityVelocity = (packet) => {
         resolveProtocolQuirks();
         if (!usesLpVec3Velocity || !packet || !packet.velocity || typeof packet.velocity !== 'object') return;
         const v = packet.velocity;
@@ -106,7 +109,28 @@ const packetSanitizerMethods = {
           entity.velocity.y = v.y;
           entity.velocity.z = v.z;
         }
-      });
+      };
+
+      const ensureVelocityFixLast = () => {
+        if (typeof bot._client.removeListener === 'function') {
+          bot._client.removeListener('entity_velocity', onEntityVelocity);
+        }
+        bot._client.on('entity_velocity', onEntityVelocity);
+      };
+
+      ensureVelocityFixLast();
+      if (typeof bot.on === 'function') {
+        bot.on('inject_allowed', () => setImmediate(ensureVelocityFixLast));
+        bot.on('login', ensureVelocityFixLast);
+        bot.on('spawn', () => {
+          ensureVelocityFixLast();
+          resolveProtocolQuirks();
+          if (usesLpVec3Velocity && typeof this.log === 'function' && !this._loggedLpVec3Fix) {
+            this._loggedLpVec3Fix = true;
+            this.log('Applied MC 1.21.9+ lpVec3 entity_velocity knockback fix (post-plugin order).');
+          }
+        });
+      }
 
       bot._client.on('position', () => {
         this.lastTeleportAt = Date.now();

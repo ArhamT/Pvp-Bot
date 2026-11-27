@@ -1416,7 +1416,7 @@ class PvPBotController {
 
     // 1c. High-priority Anti-Crystal / Anti-Anchor defense against nearby enemy explosives
     if (!totemSwapActive && this.burst && this.burst.tickDefense(target)) {
-      if (this.combat) this.combat.stopMovement();
+      if (this.combat) this.combat.releaseControl();
       return;
     }
 
@@ -1618,19 +1618,18 @@ class PvPBotController {
       return;
     }
 
-    // Let server teleport synchronization settle for 4 ticks (~200ms) before forced combat/elytra packets
-    if (this.lastTeleportAt && (Date.now() - this.lastTeleportAt) < 200) {
+    // Let server teleport synchronization settle briefly before forced combat/elytra packets
+    // (Allow active PEARL_CATCH to continue immediately after our own pearl-catch teleport!)
+    const activeOwnPearlCatch = Boolean(this.aerial && this.aerial.mode === 'PEARL_CATCH');
+    if (!activeOwnPearlCatch && this.lastTeleportAt && (Date.now() - this.lastTeleportAt) < 200) {
       this.combat.stopMovement();
       return;
     }
 
     // 0. Inline quick-potting (Instant Health II double-pot) & combat buffs (Strength/Swiftness/FireRes)
-    //    Do NOT call combat.stopMovement() here — tickInlineCombatHeal drives its own anti-enemy-heal splash/walk controls!
+    //    Use releaseControl() so tickInlineCombatHeal's anti-enemy-heal splash/walk controls are preserved!
     if (this.survival.tickInlineCombatHeal(target)) {
-      if (this.combat && this.combat.usingPathfinder && this.bot.pathfinder) {
-        this.bot.pathfinder.setGoal(null);
-        this.combat.usingPathfinder = false;
-      }
+      if (this.combat) this.combat.releaseControl();
       return;
     }
 
@@ -1676,16 +1675,16 @@ class PvPBotController {
       return;
     }
 
-    // 2. Primary Offense: Aerial Mace / Elytra-Rocket PvP (yields immediately when no Mace/Elytra gear or no aerial trigger)
+    // 2. Primary Offense: Aerial Mace / Elytra-Rocket / Pearl-Catch / Spear-Mace PvP
+    //    CRITICAL: Use releaseControl() — NOT stopMovement() — so airborne WASD+sprint steering & jumps are NEVER wiped out!
     if (this.config.aerial && this.config.aerial.enabled !== false && this.aerial && this.aerial.tick(target)) {
-      this.combat.stopMovement();
+      this.combat.releaseControl();
       return;
     }
 
     // 3. End Crystal & Respawn Anchor PvP
-    //    (Priority 3: Anchor <= 3.6b outside Nether; Priority 4: End Crystal <= 4.5b Hit-Crystal / Surround / Place-and-Pop)
     if (this.burst && this.burst.tick(target)) {
-      this.combat.stopMovement();
+      this.combat.releaseControl();
       return;
     }
 
@@ -1695,7 +1694,7 @@ class PvPBotController {
     }
 
     if (this.ranged.tick(target)) {
-      this.combat.stopMovement();
+      this.combat.releaseControl();
       return;
     }
 
