@@ -1624,9 +1624,13 @@ class PvPBotController {
       return;
     }
 
-    // 0. Inline quick-potting (Instant Health II) & combat buffs (Strength/Swiftness/FireRes)
+    // 0. Inline quick-potting (Instant Health II double-pot) & combat buffs (Strength/Swiftness/FireRes)
+    //    Do NOT call combat.stopMovement() here — tickInlineCombatHeal drives its own anti-enemy-heal splash/walk controls!
     if (this.survival.tickInlineCombatHeal(target)) {
-      this.combat.stopMovement();
+      if (this.combat && this.combat.usingPathfinder && this.bot.pathfinder) {
+        this.bot.pathfinder.setGoal(null);
+        this.combat.usingPathfinder = false;
+      }
       return;
     }
 

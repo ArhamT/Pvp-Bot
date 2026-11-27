@@ -72,14 +72,18 @@ class SurvivalModule {
     this.pendingSplashSettleTicks = 0;
     this.pendingSplashEquipStarted = false;
     this.pendingPotRefillTime = 0;
+    this.activePotChainUntil = 0;
     this.justAteGappleAt = 0;
     this.activeBuffUntil = new Map();
     this.isXpMending = false;
     this.lastXpThrowTime = 0;
 
-    // Retreat & LOS block placement state
+    // Retreat, evasive heal-walk & LOS block placement state
     this.retreatStrafeDir = Math.random() < 0.5 ? -1 : 1;
     this.retreatStrafeTicks = 18;
+    this.retreatGapTicks = 0;
+    this.healStrafeDir = Math.random() < 0.5 ? -1 : 1;
+    this.healStrafeTicks = 7;
     this.lastLosBlockTime = 0;
     this.pendingLosBlock = null;
 
@@ -279,6 +283,8 @@ class SurvivalModule {
     this.pendingSplashCreatedAt = 0;
     this.pendingSplashSettleTicks = 0;
     this.pendingSplashEquipStarted = false;
+    this.activePotChainUntil = 0;
+    this.retreatGapTicks = 0;
     this.pendingLosBlock = null;
     this.lowerShield();
   }

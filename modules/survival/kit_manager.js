@@ -9,7 +9,8 @@ const {
   AXE_PRIORITY,
   isSpearItem,
   clearMovementControls,
-  getItemMetadataText
+  getItemMetadataText,
+  inspectColumnStep
 } = require('../constants');
 const {
   parseItemEnchantments,
@@ -242,9 +243,27 @@ const kitManagerMethods = {
       return;
     }
 
-    // 4. Priority Obsidian cover FIRST before starting gapple consumption when target is close
+    const safeHp = this.survCfg.safeHealthThreshold || 15;
+    const rapidPotCooldown = this.survCfg.rapidPotCooldownMs || 160;
+    const dist = (target && target.isValid && target.position)
+      ? this.bot.entity.position.distanceTo(target.position)
+      : Infinity;
+
+    // 4. HT1 Priority #1: Instant Health II splash potion ALWAYS fires BEFORE slow 1.6s gapple eating!
+    const healPotion = this.findHealingPotion();
+    if (
+      healPotion &&
+      this.bot.health < safeHp &&
+      (now - this.lastPotionTime) >= rapidPotCooldown
+    ) {
+      this.activePotChainUntil = now + 1400;
+      this._queueSplashPotion(healPotion, false, null);
+      this._tickSplashPotionDownward(target, false);
+      return;
+    }
+
+    // 5. Priority Obsidian / Solid cover FIRST before starting gapple consumption when target is close
     if (target && target.isValid) {
-      const dist = this.bot.entity.position.distanceTo(target.position);
       if (dist < 6.5 && !this._hasCoverBetween(target) && this._tryQueueLosBlock(target)) {
         this.bot.setControlState('forward', false);
         this.bot.setControlState('back', true);
@@ -253,24 +272,41 @@ const kitManagerMethods = {
       }
     }
 
-    // 5. Consume Enchanted Golden Apple / Golden Apple behind cover
+    // 6. If no splash pots and no cover block, create a quick sprint-jump gap when opponent is in melee range (<4.5b)
+    //    so we don't eat a slow 1.6s Golden Apple while taking 3-4 free hits!
     const gapple = this.findGoldenApple() || this.findBestHealFood();
-    if (gapple && this.bot.health < (this.survCfg.safeHealthThreshold || 15)) {
+    const drinkHeal = this.findDrinkableHealPotion();
+    const hasCover = target && target.isValid && this._hasCoverBetween(target);
+    if (
+      (gapple || drinkHeal) &&
+      !hasCover &&
+      dist < 4.5 &&
+      this.retreatGapTicks < 10 &&
+      this._isYawWalkable(this._getAwayYaw(target))
+    ) {
+      this.retreatGapTicks++;
+      const awayYaw = this._getAwayYaw(target);
+      const aimStatus = this.aimer.stepTowardsAngles(awayYaw, 0.0, { speedMultiplier: 1.6, force: true });
+      this.bot.setControlState('forward', aimStatus.yawErrorDeg < 55);
+      this.bot.setControlState('back', aimStatus.yawErrorDeg >= 55);
+      this.bot.setControlState('sprint', aimStatus.yawErrorDeg < 55 && this.bot.food > 6);
+      this.bot.setControlState('jump', aimStatus.yawErrorDeg < 55 && Boolean(this.bot.entity.onGround));
+      this.bot.setControlState('left', false);
+      this.bot.setControlState('right', false);
+      return;
+    }
+
+    // 7. Consume Enchanted Golden Apple / Golden Apple / Drinkable Heal behind cover or after opening gap
+    if (gapple && this.bot.health < safeHp) {
+      this.retreatGapTicks = 0;
       this._startEatingFood(gapple);
       this._moveAwayWalk(target);
       return;
     }
-
-    // 6. Fallback Instant Health II splash potion if out of gapples
-    const potionCooldown = this.survCfg.potionCooldownMs || 450;
-    const healPotion = this.findHealingPotion();
-    if (
-      healPotion &&
-      this.bot.health <= (this.survCfg.retreatHealthThreshold !== undefined ? this.survCfg.retreatHealthThreshold : 5) &&
-      (now - this.lastPotionTime) >= potionCooldown
-    ) {
-      this._queueSplashPotion(healPotion, false, null);
-      this._tickSplashPotionDownward(target);
+    if (drinkHeal && this.bot.health < safeHp) {
+      this.retreatGapTicks = 0;
+      this._startDrinkingPotion(drinkHeal);
+      this._moveAwayWalk(target);
       return;
     }
 
@@ -332,23 +368,25 @@ const kitManagerMethods = {
       return;
     }
 
-    const potionCooldown = this.survCfg.potionCooldownMs || 450;
+    const safeHp = this.survCfg.safeHealthThreshold || 15;
+    const rapidPotCooldown = this.survCfg.rapidPotCooldownMs || 160;
     const healPotion = this.findHealingPotion();
     if (
       healPotion &&
-      this.bot.health <= (this.survCfg.healHealthThreshold !== undefined ? this.survCfg.healHealthThreshold : 5) &&
-      (now - this.lastPotionTime) >= potionCooldown
+      this.bot.health < safeHp &&
+      (now - this.lastPotionTime) >= rapidPotCooldown
     ) {
+      this.activePotChainUntil = now + 1400;
       this._queueSplashPotion(healPotion, false, null);
-      this._tickSplashPotionDownward(target);
+      this._tickSplashPotionDownward(target, false);
       return;
     }
 
     const drinkHeal = this.findDrinkableHealPotion();
     if (
       drinkHeal &&
-      this.bot.health <= (this.survCfg.healHealthThreshold !== undefined ? this.survCfg.healHealthThreshold : 5) &&
-      (now - this.lastPotionTime) >= potionCooldown
+      this.bot.health < safeHp &&
+      (now - this.lastPotionTime) >= (this.survCfg.potionCooldownMs || 450)
     ) {
       this._startDrinkingPotion(drinkHeal);
       this._moveAwayWalk(target);
@@ -365,22 +403,69 @@ const kitManagerMethods = {
     this._moveAwayWalk(target);
   },
 
+  _isYawWalkable(yaw) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
+      return true;
+    }
+    const pos = this.bot.entity.position;
+    const fx = -Math.sin(yaw);
+    const fz = -Math.cos(yaw);
+    const sx = pos.x + fx * 1.1;
+    const sz = pos.z + fz * 1.1;
+    const col = inspectColumnStep(this.bot, sx, pos.y, sz);
+    if (col.blocked || col.needsJump) return false;
+    const fBlock = this.bot.blockAt(new Vec3(Math.floor(sx), Math.floor(pos.y), Math.floor(sz)));
+    if (fBlock && (fBlock.name.includes('lava') || fBlock.name.includes('fire') || fBlock.name === 'cobweb')) {
+      return false;
+    }
+    if (!col.hasFloor) {
+      const below1 = this.bot.blockAt(new Vec3(Math.floor(sx), Math.floor(pos.y) - 1, Math.floor(sz)));
+      const below2 = this.bot.blockAt(new Vec3(Math.floor(sx), Math.floor(pos.y) - 2, Math.floor(sz)));
+      if ((!below1 || below1.boundingBox !== 'block') && (!below2 || below2.boundingBox !== 'block')) {
+        return false;
+      }
+    }
+    return true;
+  },
+
+  /**
+   * Obstacle-aware serpentine evasive walk while eating or drinking (sprint=false for 100% NoSlow safety).
+   * Automatically routes around walls, cliffs, and lava instead of walking straight into a corner.
+   */
   _moveAwayWalk(target) {
     if (!target || !target.isValid || !this.bot.entity) {
       clearMovementControls(this.bot);
       return;
     }
 
-    const awayYaw = this._getAwayYaw(target);
-    this.aimer.stepTowardsAngles(awayYaw, 0.05);
-    const yawDiff = Math.abs(normalizeAngle(awayYaw - this.bot.entity.yaw));
+    const baseAwayYaw = this._getAwayYaw(target);
+    let chosenYaw = baseAwayYaw;
+    const offsets = [0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2, (3 * Math.PI) / 4, -(3 * Math.PI) / 4];
+    for (const off of offsets) {
+      const cand = baseAwayYaw + off;
+      if (this._isYawWalkable(cand)) {
+        chosenYaw = cand;
+        break;
+      }
+    }
+
+    this.aimer.stepTowardsAngles(chosenYaw, 0.05, { speedMultiplier: 1.5, force: true });
+    const yawDiff = Math.abs(normalizeAngle(chosenYaw - this.bot.entity.yaw));
+
+    this.healStrafeTicks = (this.healStrafeTicks || 0) - 1;
+    if (this.healStrafeTicks <= 0) {
+      this.healStrafeDir = -(this.healStrafeDir || 1);
+      this.healStrafeTicks = 6 + Math.floor(Math.random() * 5);
+    }
+
+    const canStrafe = this._isYawWalkable(chosenYaw + (this.healStrafeDir * Math.PI) / 2);
 
     this.bot.setControlState('sprint', false);
     this.bot.setControlState('jump', false);
     this.bot.setControlState('back', false);
     this.bot.setControlState('forward', yawDiff < Math.PI / 2.2);
-    this.bot.setControlState('left', false);
-    this.bot.setControlState('right', false);
+    this.bot.setControlState('left', canStrafe && this.healStrafeDir < 0);
+    this.bot.setControlState('right', canStrafe && this.healStrafeDir > 0);
   },
 
   /**

@@ -534,23 +534,27 @@ const potionsFoodMethods = {
   },
 
   /**
-   * Pulls a spare healing splash potion from main inventory (9–35) into hotbar slots 6–8 if hotbar has no healing pots.
+   * Keeps at least 2 splash healing potions buffered on hotbar slots 4–8 (refilling from main inventory
+   * every 250ms) so HT1 double-potting has zero window_click latency in combat.
    */
   _tryRefillHotbarPot() {
     if (!this.bot.inventory || this.sortingInProgress || this.totemEquipInFlight || this.totemSwapPending || this.totemDelayTimer || this.equipBusy) return;
     if (typeof this.bot.moveSlotItem !== 'function') return;
 
     const now = Date.now();
-    if ((now - this.pendingPotRefillTime) < 600) return;
+    if ((now - this.pendingPotRefillTime) < 250) return;
 
     const hotbarStart = this.bot.inventory.hotbarStart || HOTBAR_START;
     const items = this.bot.inventory.items();
-    const hasHotbarHeal = items.some((i) => {
-      if (!i || i.slot < hotbarStart || i.slot >= hotbarStart + 9) return false;
+    let hotbarHealCount = 0;
+    for (const i of items) {
+      if (!i || i.slot < hotbarStart || i.slot >= hotbarStart + 9) continue;
       const cls = this._classifyPotion(i);
-      return i.name === 'splash_potion' && (cls === 'heal2' || cls === 'heal1' || cls === 'unknown_splash');
-    });
-    if (hasHotbarHeal) return;
+      if (i.name === 'splash_potion' && (cls === 'heal2' || cls === 'heal1' || cls === 'unknown_splash')) {
+        hotbarHealCount++;
+      }
+    }
+    if (hotbarHealCount >= 2) return;
 
     const invPot = items.find((i) => {
       if (!i || i.slot >= hotbarStart) return false;
@@ -559,14 +563,18 @@ const potionsFoodMethods = {
     });
     if (!invPot) return;
 
-    // Pick first empty slot among hotbar 6–8, else slot 8
-    let destSlot = hotbarStart + 8;
-    for (const idx of [6, 7, 8]) {
+    // Prefer an empty hotbar slot among 4–8 (or overwrite slot 8 only when 0 pots are on hotbar)
+    let destSlot = -1;
+    for (const idx of [8, 7, 6, 5, 4]) {
       const s = hotbarStart + idx;
       if (!this.bot.inventory.slots || !this.bot.inventory.slots[s]) {
         destSlot = s;
         break;
       }
+    }
+    if (destSlot === -1) {
+      if (hotbarHealCount > 0) return;
+      destSlot = hotbarStart + 8;
     }
 
     this.pendingPotRefillTime = now;
@@ -576,6 +584,27 @@ const potionsFoodMethods = {
       .finally(() => {
         this.equipBusy = false;
       });
+  },
+
+  /**
+   * Immediately swaps back to the best hotbar melee weapon (Sword -> Axe) after finishing a heal/pot
+   * so zero combat ticks are wasted holding an empty glass bottle or golden apple.
+   */
+  _restoreHotbarWeapon() {
+    if (!this.bot || !this.bot.inventory || typeof this.bot.setQuickBarSlot !== 'function') return;
+    const hotbarStart = this.bot.inventory.hotbarStart || HOTBAR_START;
+    const slots = this.bot.inventory.slots || [];
+    for (const name of [...SWORD_PRIORITY, ...AXE_PRIORITY]) {
+      for (let i = 0; i < 9; i++) {
+        const item = slots[hotbarStart + i];
+        if (item && item.name === name) {
+          if (this.bot.quickBarSlot !== i) {
+            this.bot.setQuickBarSlot(i);
+          }
+          return;
+        }
+      }
+    }
   },
 
   _queueSplashPotion(potion, isBuff = false, kind = null) {
@@ -643,13 +672,22 @@ const potionsFoodMethods = {
     }
 
     const potionCooldown = this.survCfg.potionCooldownMs || 450;
+    const rapidPotCooldown = this.survCfg.rapidPotCooldownMs || 160;
+    const safeHp = this.survCfg.safeHealthThreshold || 15;
     const isGlidingAirborne = Boolean(this.bot.entity.elytraFlying && !this.bot.entity.onGround);
 
-    // 1. Inline Instant Health splash (or drinkable heal potion fallback) when HP <= inlinePotHealthThreshold (default 5)
+    // 1. HT1 Inline Instant Health II Snap-Pot & Rapid Double-Pot Chain:
+    //    - Triggers at HP <= inlinePotHealthThreshold (5 HP)
+    //    - Once triggered, chains a rapid 2nd splash pot (160ms cooldown) until HP >= safeHealthThreshold (15 HP)!
     const inlineThreshold = this.survCfg.inlinePotHealthThreshold !== undefined ? this.survCfg.inlinePotHealthThreshold : 5;
-    if (this.bot.health <= inlineThreshold && (now - this.lastPotionTime) >= potionCooldown) {
+    const inPotChain = now <= this.activePotChainUntil && this.bot.health < safeHp;
+    const shouldInlineHeal = this.bot.health <= inlineThreshold || inPotChain;
+    const effectivePotCooldown = inPotChain ? rapidPotCooldown : Math.min(potionCooldown, 220);
+
+    if (shouldInlineHeal && (now - this.lastPotionTime) >= effectivePotCooldown) {
       const healPot = !isGlidingAirborne ? this.findHealingPotion() : null;
       if (healPot) {
+        this.activePotChainUntil = now + 1400;
         this._queueSplashPotion(healPot, false, null);
         return this._tickSplashPotionDownward(target, true);
       }
@@ -660,13 +698,15 @@ const potionsFoodMethods = {
         !this.isConsuming &&
         !this.equipBusy &&
         (now - this.lastConsumeFailAt) >= 500 &&
-        (dist >= 3.0 || this.bot.health <= 11)
+        (dist >= 3.0 || this.bot.health <= inlineThreshold)
       ) {
         this.isXpMending = false;
         this._startDrinkingPotion(drinkHeal);
         this._moveAwayWalk(target);
         return true;
       }
+    } else if (this.bot.health >= safeHp) {
+      this.activePotChainUntil = 0;
     }
 
     // 2. XP Bottle armor mending when any worn armor piece drops below 45% durability (grounded/low only)
@@ -779,6 +819,7 @@ const potionsFoodMethods = {
       if (buffKind) {
         this._markBuffApplied(buffKind);
       }
+      this._restoreHotbarWeapon();
     } catch (_) {
       this.lastConsumeFailAt = Date.now();
       try { this.bot.deactivateItem(); } catch (_) {}
@@ -840,16 +881,15 @@ const potionsFoodMethods = {
   },
 
   /**
-   * Smoothly pitches downward to -90° (-PI/2) while moving forward, equips the queued
-   * Splash Potion with a 1-tick packet-order settle (never slot-swap + throw on the same tick),
-   * and throws it once aligned so the bot runs straight into its own healing/buff cloud.
-   * Returns true while handling the splash sequence.
+   * HT1 1-tick Snap-Pot: snaps pitch downward to -85° (`force: true`), turns away from close enemies
+   * (`dist < 4.5`) so 0% of the Instant Health II cloud heals the opponent, waits 1 settle tick after
+   * hotbar swap, splashes, and immediately restores hotbar weapon if no follow-up pot is needed.
    */
   _tickSplashPotionDownward(target, inlineCombat = false) {
     if (!this.pendingSplashPotion) return false;
 
     const now = Date.now();
-    if (this.pendingSplashCreatedAt && (now - this.pendingSplashCreatedAt) > 1200) {
+    if (this.pendingSplashCreatedAt && (now - this.pendingSplashCreatedAt) > 1000) {
       this.pendingSplashPotion = null;
       this.pendingSplashIsBuff = false;
       this.pendingSplashKind = null;
@@ -858,15 +898,22 @@ const potionsFoodMethods = {
     }
 
     const potion = this.pendingSplashPotion;
-    const desiredYaw = inlineCombat ? this.bot.entity.yaw : this._getAwayYaw(target);
-    const targetPitch = -Math.PI / 2; // Exact -90° straight down
+    const dist = (target && target.isValid && target.position && this.bot.entity)
+      ? this.bot.entity.position.distanceTo(target.position)
+      : Infinity;
+
+    // Anti-enemy-heal PotPvP technique: turn away when opponent is within 4.5b so splash never heals them!
+    const turnAway = !this.pendingSplashIsBuff && target && target.isValid && (!inlineCombat || dist < 4.5);
+    const desiredYaw = turnAway ? this._getAwayYaw(target) : this.bot.entity.yaw;
+    const targetPitch = -85 * (Math.PI / 180); // Slight forward-down angle so moving bot catches 100% full pot
 
     const aimStatus = this.aimer.stepTowardsAngles(desiredYaw, targetPitch, {
-      speedMultiplier: 1.85,
-      toleranceRad: 0.16
+      speedMultiplier: 2.0,
+      toleranceRad: 0.22,
+      force: true
     });
 
-    // Keep moving forward slightly so the bot runs cleanly into its own splash cloud
+    // Keep moving into our own splash cloud (away from opponent when close)
     this.bot.setControlState('forward', true);
     this.bot.setControlState('back', false);
     this.bot.setControlState('sprint', false);
@@ -897,14 +944,12 @@ const potionsFoodMethods = {
         this.pendingSplashSettleTicks = 0;
         return true;
       } else {
-        // After async bot.equip finished, check if we now hold a matching splash_potion
         holdingPotion = Boolean(
           this.bot.heldItem &&
           this.bot.heldItem.name === 'splash_potion' &&
           this._classifyPotion(this.bot.heldItem) === this._classifyPotion(potion)
         );
         if (!holdingPotion) {
-          // Equip failed or potion vanished — abort cleanly
           this.pendingSplashPotion = null;
           this.pendingSplashIsBuff = false;
           this.pendingSplashKind = null;
@@ -916,14 +961,21 @@ const potionsFoodMethods = {
 
     this.pendingSplashSettleTicks++;
 
-    // Step 2: Fire once pitched down AND at least 1 tick has elapsed since equip
-    if (holdingPotion && this.pendingSplashSettleTicks >= 1 && aimStatus.pitchErrorDeg <= 14) {
+    // Step 2: Fire immediately once pitched down AND at least 1 tick has elapsed since equip
+    if (holdingPotion && this.pendingSplashSettleTicks >= 1 && aimStatus.pitchErrorDeg <= 18) {
       const buffKind = this.pendingSplashIsBuff ? this.pendingSplashKind : null;
+      const wasBuff = this.pendingSplashIsBuff;
       this.pendingSplashPotion = null;
       this.pendingSplashIsBuff = false;
       this.pendingSplashKind = null;
       this.pendingSplashEquipStarted = false;
       this._throwSplashPotion(potion, buffKind);
+
+      // Swap straight back to weapon if buff or if this pot brings us into safe range
+      const safeHp = this.survCfg.safeHealthThreshold || 15;
+      if (wasBuff || (this.bot.health + 7) >= safeHp) {
+        this._restoreHotbarWeapon();
+      }
     }
 
     return true;
@@ -976,6 +1028,7 @@ const potionsFoodMethods = {
       if (food.name && food.name.includes('golden_apple')) {
         this.justAteGappleAt = Date.now();
       }
+      this._restoreHotbarWeapon();
     } catch (_) {
       this.lastConsumeFailAt = Date.now();
       try { this.bot.deactivateItem(); } catch (_) {}
