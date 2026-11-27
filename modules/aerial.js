@@ -403,8 +403,12 @@ class AerialModule {
 
   _findMace(preferWindBurst = true) {
     const map = this._getWeaponEnchantments();
+    const minDensityFall = this.aerialCfg.densityMinFallDistance !== undefined
+      ? this.aerialCfg.densityMinFallDistance
+      : 5.0;
     return selectMaceForFall(this.fallDistance, map, {
-      preferWindBurst: preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false
+      preferWindBurst: preferWindBurst && this.aerialCfg.windBurstChainEnabled !== false,
+      densityMinFallDistance: minDensityFall
     });
   }
 

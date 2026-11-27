@@ -148,14 +148,15 @@ function validateArmorInventory(bot) {
 }
 
 /**
- * Enforces the 7-Block Enchantment Rule:
- * - fallDistance > 7  -> Density Mace
- * - fallDistance <= 7 -> Breach Mace
+ * Selects Density vs Breach Mace by fall height:
+ * - fallDistance >= 5.0 (default, configurable via `densityMinFallDistance`) -> Density Mace
+ * - fallDistance < 5.0 -> Breach Mace
  */
 function selectMaceForFall(fallDistance, weaponMap, options = {}) {
   if (!weaponMap || !Array.isArray(weaponMap.maces) || weaponMap.maces.length === 0) return null;
   const preferWindBurst = options.preferWindBurst !== false;
-  const useDensity = fallDistance > 7.0;
+  const minDensityFall = options.densityMinFallDistance !== undefined ? options.densityMinFallDistance : 5.0;
+  const useDensity = fallDistance >= minDensityFall;
 
   const ranked = weaponMap.maces.slice().sort((a, b) => {
     if (useDensity) {

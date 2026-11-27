@@ -61,13 +61,18 @@ const spearMaceMethods = {
       ? Math.max(0, this.bot.entity.position.y - target.position.y)
       : 0;
     const effectiveFall = Math.max(this.fallDistance || 0, heightAbove);
+    const minDensityFall = this.aerialCfg.densityMinFallDistance !== undefined
+      ? this.aerialCfg.densityMinFallDistance
+      : 5.0;
     if (this.weaponEnchantments) {
-      const rule = selectMaceForFall(effectiveFall, this.weaponEnchantments);
+      const rule = selectMaceForFall(effectiveFall, this.weaponEnchantments, {
+        densityMinFallDistance: minDensityFall
+      });
       if (rule && rule.item) {
         return this._makeSelection(rule.item);
       }
     }
-    return effectiveFall > 7.0 ? this._findDensityMace() : this._findMace(true);
+    return effectiveFall >= minDensityFall ? this._findDensityMace() : this._findMace(true);
   },
 
   _tickSpearMace(target) {

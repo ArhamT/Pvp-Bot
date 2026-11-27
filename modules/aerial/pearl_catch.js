@@ -6,7 +6,10 @@ const { clearMovementControls } = require('../constants');
 const {
   canThrowPearl,
   markPearlThrown,
+  getLastPearlThrowTime,
   solvePearlBallistics,
+  simulatePearlFlight,
+  isSafePearlLanding,
   predictEntityProjectileLanding
 } = require('../pearl_ballistics');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
@@ -20,7 +23,8 @@ const pearlCatchMethods = {
     if (!name.includes('ender_pearl') && !name.includes('thrownenderpearl')) return;
 
     const eyePos = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
-    if (eyePos.distanceTo(entity.position) < 1.8) return;
+    // Ignore our own recently thrown Ender Pearl (even while sprinting/elytra gliding!)
+    if (eyePos.distanceTo(entity.position) < 3.2 || (Date.now() - getLastPearlThrowTime(this.bot)) < 450) return;
 
     const vel = entity.velocity;
     const hasVel = Boolean(vel && Math.hypot(vel.x || 0, vel.y || 0, vel.z || 0) > 0.08);
@@ -85,22 +89,23 @@ const pearlCatchMethods = {
   },
 
   /**
-   * Evaluates HT1 Pearl Catch triggers:
-   * - Case 1 (Enemy Pearl Intercept): enemy threw an Ender Pearl -> ballistic pearl onto their exact landing spot!
-   * - Case 2 (Airborne Wind-Burst Vertical Pearl Catch): airborne high above target (>= 3.5b / Wind Burst bounce)
-   *   and enemy dodged horizontally >= 4.2b -> stationary straight-up (+90°) ender_pearl + wind_charge catch!
-   * - Case 3 (Grounded HT1 Sky-Pearl Catch): grounded with clear sky, ender_pearl + wind_charge + Mace
-   *   (especially with Elytra!) and target at 5.0–24.0b -> dead-stop straight-up (+90°) Pearl+WindCharge sky launch
-   *   into Elytra Glide -> Chestplate Swap -> Density Mace Smash!
+   * Evaluates disciplined HT1 Mace Pearl Catch triggers (NEVER spams pearls on normal jumps or short ground distances!):
+   * - Case 1 (Enemy Pearl Intercept): enemy threw an Ender Pearl landing >= 8b away -> verified safe ballistic pearl
+   *   onto their exact landing spot to punish with a Mace/Sword!
+   * - Case 2 (High-Altitude Mace Dodge Catch): genuinely high airborne (`heightAboveTarget >= 5.5` — NEVER triggered
+   *   by a normal 0.42 jump!) AND enemy dodged far out of air-steering range (`horizDist >= 6.5b`) -> verified safe
+   *   ballistic intercept pearl directly onto opponent's predicted position for a lethal Density/Breach Mace Smash!
    */
   _evaluatePearlCatchTrigger(target) {
     if (this.aerialCfg.pearlCatchEnabled === false) return null;
     if (!target || !target.isValid || !this.bot || !this.bot.entity) return null;
+    // Never aggressively pearl-catch at low HP (conserve pearls for defensive escape)
+    if (this.bot.health < 10) return null;
 
     const now = Date.now();
-    const cooldownMs = this.aerialCfg.pearlCatchCooldownMs !== undefined ? this.aerialCfg.pearlCatchCooldownMs : 2200;
+    const cooldownMs = this.aerialCfg.pearlCatchCooldownMs !== undefined ? this.aerialCfg.pearlCatchCooldownMs : 5500;
     if ((now - this.lastPearlCatchTime) < cooldownMs) return null;
-    if (!canThrowPearl(this.bot, { emergency: false, reserveCount: 1, cooldownMs: Math.min(1200, cooldownMs), now })) {
+    if (!canThrowPearl(this.bot, { emergency: false, reserveCount: 2, cooldownMs: Math.min(3000, cooldownMs), now })) {
       return null;
     }
 
@@ -110,70 +115,62 @@ const pearlCatchMethods = {
     if (!this._findItemByName('ender_pearl') || !this._findMace(true)) return null;
 
     const pos = this.bot.entity.position;
-    const velY = this.bot.entity.velocity ? this.bot.entity.velocity.y : 0;
+    const eyePos = this.aimer ? this.aimer.getEyePosition() : pos.offset(0, 1.62, 0);
     const heightAboveTarget = pos.y - target.position.y;
     const dx = target.position.x - pos.x;
     const dz = target.position.z - pos.z;
     const horizDist = Math.sqrt(dx * dx + dz * dz);
 
-    const minHeight = this.aerialCfg.pearlCatchMinHeight !== undefined ? this.aerialCfg.pearlCatchMinHeight : 3.5;
-    const minHoriz = this.aerialCfg.pearlCatchMinHorizDist !== undefined ? this.aerialCfg.pearlCatchMinHorizDist : 4.2;
-    const maxDist = this.aerialCfg.pearlCatchMaxDist !== undefined ? this.aerialCfg.pearlCatchMaxDist : 64.0;
+    const minHeight = Math.max(5.5, this.aerialCfg.pearlCatchMinHeight !== undefined ? this.aerialCfg.pearlCatchMinHeight : 5.5);
+    const minHoriz = Math.max(6.5, this.aerialCfg.pearlCatchMinHorizDist !== undefined ? this.aerialCfg.pearlCatchMinHorizDist : 6.5);
+    const maxDist = this.aerialCfg.pearlCatchMaxDist !== undefined ? this.aerialCfg.pearlCatchMaxDist : 48.0;
 
-    // Case 1: Intercept an enemy-thrown Ender Pearl (works BOTH airborne AND grounded!)
+    // Case 1: Intercept a genuine enemy-thrown Ender Pearl landing far away (>= 8.0b) with verified safe flight arc
     if (
       this.trackedEnemyPearl &&
       this.trackedEnemyPearl.resolved &&
       this.trackedEnemyPearl.landingPos &&
       now <= this.trackedEnemyPearl.expiresAt
     ) {
-      const catchDist = pos.distanceTo(this.trackedEnemyPearl.landingPos);
-      if (catchDist >= 5.0 && catchDist <= maxDist) {
-        return {
-          reason: 'enemy_pearl_intercept',
-          catchPos: this.trackedEnemyPearl.landingPos.clone(),
-          useTargetVel: false
-        };
+      const catchPos = this.trackedEnemyPearl.landingPos;
+      const catchDist = pos.distanceTo(catchPos);
+      if (catchDist >= 8.0 && catchDist <= maxDist && isSafePearlLanding(this.bot, catchPos, { maxDrop: 4 })) {
+        const sol = solvePearlBallistics(eyePos, catchPos, null, 65);
+        if (sol) {
+          const sim = simulatePearlFlight(this.bot, eyePos, sol.yaw, sol.pitch, 65);
+          if (sim.hit && isSafePearlLanding(this.bot, sim.pos, { maxDrop: 4 }) && sim.pos.distanceTo(catchPos) <= 5.0) {
+            return {
+              reason: 'enemy_pearl_intercept',
+              catchPos: catchPos.clone(),
+              useTargetVel: false
+            };
+          }
+        }
       }
     }
 
-    // Case 2: Airborne Wind-Burst / high-altitude BALLISTIC Pearl Catch when enemy dodges horizontally out from under us!
+    // Case 2: High-Altitude Mace Dodge Catch (ONLY when genuinely high above target — NEVER on a normal jump!)
     if (!onGround) {
-      const hasWindBurstAltitude = heightAboveTarget >= minHeight || this.fallDistance >= minHeight || velY > 0.35;
-      if (hasWindBurstAltitude && horizDist >= minHoriz && horizDist <= maxDist) {
+      const genuinelyHigh = heightAboveTarget >= minHeight && (this.fallDistance >= 2.5 || heightAboveTarget >= 6.5);
+      if (genuinelyHigh && horizDist >= minHoriz && horizDist <= maxDist) {
         const pred = this._getPredictedPosition(target, 3);
-        return {
-          reason: 'windburst_self_pearl_catch',
-          catchPos: pred.offset(0, 1.2, 0),
-          useTargetVel: true
-        };
+        const aimPos = pred.offset(0, 1.0, 0);
+        const sol = solvePearlBallistics(eyePos, aimPos, target.velocity || null, 65);
+        if (sol) {
+          const sim = simulatePearlFlight(this.bot, eyePos, sol.yaw, sol.pitch, 65);
+          if (sim.hit && isSafePearlLanding(this.bot, sim.pos, { maxDrop: 4 }) && sim.pos.distanceTo(pred) < horizDist * 0.6) {
+            return {
+              reason: 'windburst_self_pearl_catch',
+              catchPos: aimPos,
+              useTargetVel: true
+            };
+          }
+        }
       }
       return null;
     }
 
-    // Case 3: Grounded HT1 Vertical Sky-Pearl Catch (ender_pearl + wind_charge + Mace + clear sky above)
-    // Used when we have no rockets for Elytra Dive (or in pure Mace+Pearl+WindCharge kits) to sky-launch 20+ blocks!
-    const hasWindCharge = Boolean(
-      this.aerialCfg.pearlWindInterceptEnabled !== false &&
-      this._findItemByName('wind_charge')
-    );
-    const hasFireworks = Boolean(this._findItemByName('firework_rocket'));
-    const hasElytra = this._hasElytraAvailable() && this._hasChestplateAvailable();
-    if (
-      hasWindCharge &&
-      (!hasElytra || !hasFireworks) &&
-      horizDist >= 5.0 &&
-      horizDist <= 24.0 &&
-      this._hasClearSkyAbove(12)
-    ) {
-      const pred = this._getPredictedPosition(target, 3);
-      return {
-        reason: 'ground_pearl_catch',
-        catchPos: pred.offset(0, 0.3, 0),
-        useTargetVel: true
-      };
-    }
-
+    // On ground: use Wind Charge Mace Launch / Elytra Dive instead of wasting Ender Pearls!
     return null;
   },
 

@@ -2,7 +2,7 @@
 
 const { DEG_TO_RAD } = require('../aim');
 const { findNearestLiquidSource } = require('../inventory_utils');
-const { canThrowPearl, markPearlThrown } = require('../pearl_ballistics');
+const { canThrowPearl, markPearlThrown, simulatePearlFlight, isSafePearlLanding } = require('../pearl_ballistics');
 const { DEFAULT_REACH, AERIAL_MODES } = require('./constants');
 
 const CLUTCH_ITEM_PRIORITY = [
@@ -190,30 +190,42 @@ const defenseClutchMethods = {
   },
 
   /**
-   * Enemy Dive Bomb dodge: breaks melee reach using aim-aligned Ender Pearl or Wind Charge.
+   * Enemy Dive Bomb dodge: prefers cheap Wind Charge launch FIRST; only uses Ender Pearl
+   * as fallback with verified safe landing arc so pearls are never wasted randomly!
    */
   _tickDiveDodge(target) {
     this.stageTicks++;
-    const canPearl = canThrowPearl(this.bot, { emergency: true, cooldownMs: 1200 });
-    const pearlSel = canPearl ? this._findItemByName('ender_pearl') : null;
     const windSel = this._findItemByName('wind_charge');
-    const escapeSel = pearlSel || windSel;
+    const canPearl = !windSel && canThrowPearl(this.bot, { emergency: false, reserveCount: 1, cooldownMs: 3000 });
+    const pearlSel = canPearl ? this._findItemByName('ender_pearl') : null;
+    const escapeSel = windSel || pearlSel;
     if (!escapeSel || this.stageTicks > 8) {
       this._resetState();
       return false;
     }
 
-    const eq = this._equipHand(escapeSel);
     const awayYaw = (target && target.position)
       ? Math.atan2(-(this.bot.entity.position.x - target.position.x), -(this.bot.entity.position.z - target.position.z))
       : this.bot.entity.yaw;
-    const pitch = pearlSel ? 36 * DEG_TO_RAD : -Math.PI / 2;
+
+    let pitch = -Math.PI / 2;
+    if (pearlSel && !windSel) {
+      pitch = 30 * DEG_TO_RAD;
+      const eye = this.aimer ? this.aimer.getEyePosition() : this.bot.entity.position.offset(0, 1.62, 0);
+      const sim = simulatePearlFlight(this.bot, eye, awayYaw, pitch, 55);
+      if (!sim.hit || !isSafePearlLanding(this.bot, sim.pos, { maxDrop: 4 })) {
+        this._resetState();
+        return false;
+      }
+    }
+
+    const eq = this._equipHand(escapeSel);
     const aimStatus = this.aimer.stepTowardsAngles(awayYaw, pitch, { speedMultiplier: 2.2, toleranceRad: 0.22 });
 
     if (eq.ready && !eq.swapped && aimStatus.aligned) {
       if (typeof this.bot.activateItem === 'function') {
         this.bot.activateItem(false);
-        if (pearlSel) markPearlThrown(this.bot, 'dive_dodge');
+        if (pearlSel && !windSel) markPearlThrown(this.bot, 'dive_dodge');
       }
       this.lastDiveDodgeTime = Date.now();
       this._resetState();
