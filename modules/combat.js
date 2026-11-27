@@ -1483,32 +1483,15 @@ class CombatModule {
       return;
     }
 
-    // --- Path A2b: Standalone Spear Combat (mid-range thrust / 1.21 Spear Lunge jab) ---
+    // --- Path A2b: Standalone Spear Combat (extended 4.2b mid-range thrust; no same-tick UseItem+Attack) ---
     const holdingSpear = this._isSpearItem(this.bot.heldItem);
     const spearReach = this.combatCfg.spearReach || 4.2;
-    if (holdingSpear && reachDist <= spearReach && (aimStatus.aligned || aimStatus.yawErrorDeg < 24)) {
+    if (holdingSpear && reachDist <= spearReach && (aimStatus.aligned || aimStatus.yawErrorDeg < 26)) {
       if (cooldownRatio >= (this.combatCfg.minCooldownRatio || 0.93)) {
         this.bot.setControlState('sprint', true);
         this.bot.attack(target);
         this.lastSwingTime = now;
         this.cooldownResetTime = now;
-        // Brief right-click lunge/jab pulse for 1.21+ spear lunge enchantment when closing mid-range
-        if (
-          reachDist > reach &&
-          (now - this.lastSpearLungeTime) >= 1400 &&
-          typeof this.bot.activateItem === 'function'
-        ) {
-          this.lastSpearLungeTime = now;
-          this.cancelSpearLunge();
-          try {
-            this.bot.activateItem(false);
-            this.spearLungeTimer = setTimeout(() => {
-              this.spearLungeTimer = null;
-              if (!this.bot || !this.bot.entity || !this._isSpearItem(this.bot.heldItem)) return;
-              try { this.bot.deactivateItem(); } catch (_) {}
-            }, 120);
-          } catch (_) {}
-        }
         return;
       }
     }

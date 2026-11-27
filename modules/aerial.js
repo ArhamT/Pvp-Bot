@@ -53,6 +53,7 @@ const AERIAL_MODES = Object.freeze({
  */
 const { pearlCatchMethods } = require('./aerial/pearl_catch');
 const { maceComboMethods } = require('./aerial/mace_combos');
+const { spearMaceMethods } = require('./aerial/spear_mace');
 const { elytraSkillMethods } = require('./aerial/elytra_skills');
 const { defenseClutchMethods } = require('./aerial/defense_clutch');
 
@@ -882,13 +883,9 @@ class AerialModule {
       return this._tickElytraSpear(target);
     }
 
-    //    (c) Spear-to-Mace Chain (3.1-4.6b mid-range with Spear/Trident + Wind Charge + Mace)
+    //    (c) HT1 Spear-to-Mace Chain (2.4-6.2b with Spear/Trident + Wind Charge + Mace)
     if (this._canStartSpearMace(target)) {
-      this.mode = AERIAL_MODES.SPEAR_MACE;
-      this.stage = 'SPEAR_THRUST';
-      this.stageTicks = 0;
-      this.spearThrustDone = false;
-      this.spearLaunchTicks = 0;
+      this._enterSpearMace();
       return this._tickSpearMace(target);
     }
 
@@ -965,6 +962,7 @@ Object.assign(
   AerialModule.prototype,
   pearlCatchMethods,
   maceComboMethods,
+  spearMaceMethods,
   elytraSkillMethods,
   defenseClutchMethods
 );

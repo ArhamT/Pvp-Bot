@@ -754,7 +754,7 @@ class PvPBotController {
       if (this.pendingDuelTarget) this.pendingDuelReady = true;
 
       if (this.state === STATES.IDLE && this.bot && this.bot.entity) {
-        const engageRange = this.config.combat.engageRange || 36.0;
+        const engageRange = this.config.combat.engageRange || 96.0;
         if (preferred && this.bot.entity.position.distanceTo(preferred.position) <= engageRange) {
           this._engageTarget(preferred, 'duel start cue');
           return;
@@ -1118,7 +1118,7 @@ class PvPBotController {
 
     if (this.pendingDuelTarget && this.pendingDuelReady) {
       const pending = this._findPlayerEntity(this.pendingDuelTarget);
-      if (pending && this.bot.entity.position.distanceTo(pending.position) <= (this.config.combat.engageRange || 24.0)) {
+      if (pending && this.bot.entity.position.distanceTo(pending.position) <= (this.config.combat.engageRange || 96.0)) {
         return this._engageTarget(pending, `auto-retaliate (${reason})`);
       }
     }
@@ -1458,7 +1458,7 @@ class PvPBotController {
 
   _tickIdle() {
     // Stay calm in safe LOBBY hubs, but always engage in DUELS/FFA arenas (respecting red_wool safe zone in FFA).
-    const engageRange = this.config.combat.engageRange || 36.0;
+    const engageRange = this.config.combat.engageRange || 96.0;
     const arenaMode = this._detectArenaMode();
     if (arenaMode === 'LOBBY' && this._hasLobbyMenuItems()) {
       this.inDuelArena = false;
@@ -1580,7 +1580,7 @@ class PvPBotController {
       this.redWoolZone.isPositionInSafeZone(target.position)
     ) {
       // Opponent retreated inside the FFA red_wool safe zone -> switch to an outside target or disengage
-      const alt = this._pickEngageableTarget('FFA', this.config.combat.engageRange || 36.0);
+      const alt = this._pickEngageableTarget('FFA', this.config.combat.engageRange || 96.0);
       if (alt && alt.entity.id !== target.id) {
         this._engageTarget(alt.entity, 'target entered red_wool safe zone, switching');
         return;

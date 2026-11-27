@@ -689,9 +689,35 @@ const elytraSkillMethods = {
     this.fireworkFired = false;
     this.elytraAirborneTicks = 0;
     this.elytraFlightTicks = 0;
+    this.elytraSpearStuckTicks = 0;
     this.elytraGlideRetrySent = false;
     this.elytraSpearCharging = false;
     this.elytraSpearAttackNextTick = false;
+  },
+
+  /**
+   * 3D forward obstacle raycast along `(yaw, pitch)` to keep Elytra Spear flight
+   * from slamming into walls, pillars, trees, or ceilings.
+   */
+  _hasFlightObstacleAhead(yaw, pitch, maxDist = 4.5) {
+    if (!this.bot || !this.bot.entity || !this.bot.entity.position || typeof this.bot.blockAt !== 'function') {
+      return false;
+    }
+    const origin = this.bot.entity.position.offset(0, 0.5, 0);
+    const cosP = Math.cos(pitch);
+    const dx = -Math.sin(yaw) * cosP;
+    const dy = Math.sin(pitch);
+    const dz = -Math.cos(yaw) * cosP;
+
+    for (const d of [1.2, 2.2, 3.4, maxDist]) {
+      const sample = origin.offset(dx * d, dy * d, dz * d);
+      const b0 = this.bot.blockAt(sample);
+      const b1 = this.bot.blockAt(sample.offset(0, 0.6, 0));
+      if ((b0 && b0.boundingBox === 'block') || (b1 && b1.boundingBox === 'block')) {
+        return true;
+      }
+    }
+    return false;
   },
 
   _releaseSpearChargeIfActive() {
@@ -919,6 +945,19 @@ const elytraSkillMethods = {
         return true;
       }
 
+      // Wall-crash / block-snag detector: if stuck colliding horizontally or stalled mid-air, abort cleanly!
+      if (this.elytraFlightTicks > 3 && (this.bot.entity.isCollidedHorizontally || speed < 0.08)) {
+        this.elytraSpearStuckTicks = (this.elytraSpearStuckTicks || 0) + (this.bot.entity.isCollidedHorizontally ? 2 : 1);
+      } else {
+        this.elytraSpearStuckTicks = 0;
+      }
+      if (this.elytraSpearStuckTicks >= 4) {
+        this._releaseSpearChargeIfActive();
+        this.lastElytraTakeoffTime = now;
+        this._resetState();
+        return false;
+      }
+
       const rawDist = pos.distanceTo(target.position);
       const leadTicks = clamp(Math.round(rawDist / 6), 2, 5);
       const predPos = this._getPredictedPosition(target, leadTicks);
@@ -931,7 +970,7 @@ const elytraSkillMethods = {
       const horizDist = Math.sqrt(dx * dx + dz * dz);
       const dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-      const yawToPred = Math.atan2(-dx, -dz);
+      let yawToPred = Math.atan2(-dx, -dz);
       let desiredPitch = Math.atan2(dy, Math.max(0.1, horizDist));
 
       // Terrain clearance protection: never nosedive into the floor when closing from > 7.5b away
@@ -941,9 +980,23 @@ const elytraSkillMethods = {
       }
       desiredPitch = clamp(desiredPitch, -55 * DEG_TO_RAD, 55 * DEG_TO_RAD);
 
+      // 3D obstacle avoidance: if a solid block/wall is ahead on flight path, climb & bank around it!
+      const obstacleAhead = this._hasFlightObstacleAhead(yawToPred, desiredPitch, Math.min(4.5, Math.max(2.0, dist3D - 1.0)));
+      if (obstacleAhead) {
+        const leftClear = !this._hasFlightObstacleAhead(yawToPred + 0.95, 25 * DEG_TO_RAD, 3.8);
+        const rightClear = !this._hasFlightObstacleAhead(yawToPred - 0.95, 25 * DEG_TO_RAD, 3.8);
+        if (leftClear && !rightClear) {
+          yawToPred += 0.95;
+        } else if (rightClear && !leftClear) {
+          yawToPred -= 0.95;
+        }
+        desiredPitch = 38 * DEG_TO_RAD;
+      }
+
       const aimStatus = this.aimer.stepTowardsAngles(yawToPred, desiredPitch, {
         speedMultiplier: 1.85,
-        toleranceRad: 0.24
+        toleranceRad: 0.24,
+        force: obstacleAhead
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -966,9 +1019,10 @@ const elytraSkillMethods = {
         return true;
       }
 
-      // 4b. Mid-flight Rocket Boost when distant, slow, or below target (paced by elytraRocketCooldownMs!)
+      // 4b. Mid-flight Rocket Boost when distant, slow, or below target (NEVER fire rocket into a wall!)
       const rocketSel = this._findItemByName('firework_rocket');
       const wantsBoost = Boolean(
+        !obstacleAhead &&
         rocketSel &&
         dist3D > 7.5 &&
         (now - this.lastRocketTime) >= rocketCooldownMs &&
@@ -1055,14 +1109,39 @@ const elytraSkillMethods = {
         return true;
       }
 
+      // Abort pull-up cleanly if crashed/snagged on a wall or ceiling block
+      if (this.bot.entity.isCollidedHorizontally || (this.stageTicks > 3 && speed < 0.08)) {
+        this.elytraSpearStuckTicks = (this.elytraSpearStuckTicks || 0) + (this.bot.entity.isCollidedHorizontally ? 2 : 1);
+      } else {
+        this.elytraSpearStuckTicks = 0;
+      }
+      if (this.elytraSpearStuckTicks >= 4) {
+        this.lastElytraTakeoffTime = now;
+        this._resetState();
+        return false;
+      }
+
       const heightAboveGround = this._getHeightAboveGround();
       const dx = target.position.x - pos.x;
       const dz = target.position.z - pos.z;
       const horizDist = Math.sqrt(dx * dx + dz * dz);
 
-      this.aimer.stepTowardsAngles(this.elytraPullUpYaw, 32 * DEG_TO_RAD, {
+      let pullYaw = this.elytraPullUpYaw;
+      let pullPitch = 32 * DEG_TO_RAD;
+      const pullBlocked = this._hasFlightObstacleAhead(pullYaw, pullPitch, 4.0);
+      if (pullBlocked) {
+        if (!this._hasFlightObstacleAhead(pullYaw + 1.0, 38 * DEG_TO_RAD, 3.8)) {
+          pullYaw += 1.0;
+        } else if (!this._hasFlightObstacleAhead(pullYaw - 1.0, 38 * DEG_TO_RAD, 3.8)) {
+          pullYaw -= 1.0;
+        }
+        pullPitch = 45 * DEG_TO_RAD;
+      }
+
+      this.aimer.stepTowardsAngles(pullYaw, pullPitch, {
         speedMultiplier: 1.65,
-        toleranceRad: 0.22
+        toleranceRad: 0.22,
+        force: pullBlocked
       });
 
       if (typeof this.bot.setControlState === 'function') {
@@ -1071,9 +1150,10 @@ const elytraSkillMethods = {
         this.bot.setControlState('jump', false);
       }
 
-      // Boost during pull-up if losing speed or near terrain so we stay aloft smoothly
+      // Boost during pull-up if losing speed or near terrain (never boost directly into an obstacle)
       const rocketSel = this._findItemByName('firework_rocket');
       if (
+        !pullBlocked &&
         rocketSel &&
         (now - this.lastRocketTime) >= rocketCooldownMs &&
         (speed < 0.65 || heightAboveGround < 4.5)
