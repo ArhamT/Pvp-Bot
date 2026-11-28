@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const mineflayer = require('mineflayer');
+const minecraftProtocol = require('minecraft-protocol');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { loader: autoEatLoader } = require('mineflayer-auto-eat');
 
@@ -143,6 +144,7 @@ class PvPBotController {
     this.advertiseTimer = null;
     this.lastAdvertiseIndex = -1;
     this.initializedOnSpawn = false;
+    this._viaFallbackVersion = null;
     this.loginAttempted = false;
     this.loginSentAt = 0;
     this.loginFallbackTimer = null;
@@ -183,6 +185,34 @@ class PvPBotController {
     }
   }
 
+  /**
+   * Resolves a safe minecraft-protocol version.
+   * If the user requested an unsupported newer version (e.g. Paper 26.3 when minecraft-protocol
+   * only supports up to 26.1), automatically falls back to `1.21.11` for ViaVersion/ViaBackwards.
+   */
+  _resolveBotVersion(requestedVersion) {
+    if (this._viaFallbackVersion) {
+      return this._viaFallbackVersion;
+    }
+    if (!requestedVersion || requestedVersion === 'auto' || requestedVersion === false) {
+      return null; // Let mineflayer auto-detect; error handler will auto-fallback to 1.21.11 if unsupported
+    }
+    const supported = Array.isArray(minecraftProtocol.supportedVersions)
+      ? minecraftProtocol.supportedVersions
+      : [];
+    if (supported.length > 0 && !supported.includes(requestedVersion)) {
+      const fallback = supported.includes('1.21.11')
+        ? '1.21.11'
+        : supported[supported.length - 1];
+      this.log(
+        `Version "${requestedVersion}" is not natively supported by minecraft-protocol ` +
+        `(max: ${supported[supported.length - 1]}). Auto-falling back to ${fallback} for ViaVersion/ViaBackwards.`
+      );
+      return fallback;
+    }
+    return requestedVersion;
+  }
+
   start() {
     if (this.shuttingDown) return;
     this._clearTimers();
@@ -198,11 +228,26 @@ class PvPBotController {
       username: botCfg.username,
       auth: serverCfg.auth || 'offline'
     };
-    if (serverCfg.version) {
-      botOptions.version = serverCfg.version;
+    const resolvedVersion = this._resolveBotVersion(serverCfg.version);
+    if (resolvedVersion) {
+      botOptions.version = resolvedVersion;
     }
 
-    this.bot = mineflayer.createBot(botOptions);
+    try {
+      this.bot = mineflayer.createBot(botOptions);
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      if (/not supported|unsupported|version/i.test(msg) && !this._viaFallbackVersion) {
+        this._viaFallbackVersion = '1.21.11';
+        this.log(`Protocol auto-detect failed (${msg}). Retrying with 1.21.11 for ViaVersion/ViaBackwards...`);
+        botOptions.version = '1.21.11';
+        this.bot = mineflayer.createBot(botOptions);
+      } else {
+        this.log(`Failed to create bot: ${msg}`);
+        this._scheduleReconnect();
+        return;
+      }
+    }
     this._attachPacketMonitor(this.bot);
 
     this.bot.loadPlugin(pathfinder);
@@ -392,7 +437,13 @@ class PvPBotController {
     });
 
     bot.on('error', (err) => {
-      this.log(`Bot error: ${err.message}`);
+      const msg = err && err.message ? err.message : String(err);
+      this.log(`Bot error: ${msg}`);
+      if (/not supported|unsupported|cannot read.*protocol|unknown version/i.test(msg) && !this._viaFallbackVersion) {
+        this._viaFallbackVersion = '1.21.11';
+        this.reconnectDelayMs = 1500;
+        this.log('Server uses an unsupported newer protocol (e.g. Paper 26.3). Switching to 1.21.11 for ViaVersion/ViaBackwards on reconnect...');
+      }
     });
 
     bot.on('end', (reason) => {

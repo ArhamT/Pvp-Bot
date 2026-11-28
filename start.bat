@@ -33,7 +33,7 @@ echo ============================================================
 echo.
 set /p "PVPBOT_USERNAME=Bot Name (Enter for config default): "
 set /p "PVPBOT_HOST=Cracked Server IP (host or host:port, Enter for default): "
-set /p "PVPBOT_VERSION=MC Version (e.g. 1.20.4, 1.21.1, or auto) [auto]: "
+set /p "PVPBOT_VERSION=MC Version (e.g. 1.21.11 for Paper 26.x+ViaBackwards, 1.20.4, or auto) [auto]: "
 set /p "PVPBOT_PASSWORD=Bot Login Password (for /login, Enter to skip): "
 
 if "%PVPBOT_VERSION%"=="" set "PVPBOT_VERSION=auto"

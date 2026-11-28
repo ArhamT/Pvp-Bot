@@ -127,6 +127,12 @@ const packetSanitizerMethods = {
       if ('onGround' in out && typeof out.onGround !== 'boolean') {
         out.onGround = Boolean(out.onGround);
       }
+      if (out.flags && typeof out.flags === 'object') {
+        out.flags = {
+          onGround: Boolean(out.flags.onGround),
+          hasHorizontalCollision: Boolean(out.flags.hasHorizontalCollision)
+        };
+      }
       if (fixed) this._movePacketFixes = (this._movePacketFixes || 0) + 1;
       return out;
     };
