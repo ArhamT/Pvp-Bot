@@ -12,7 +12,14 @@ const packetSanitizerMethods = {
     let cachedVersion = null;
     let isShiftedEntityAction = false;
     let usesLpVec3Velocity = false;
+    let hasTickEndPacket = false;
+    let hasReceivedServerPosition = false;
+    let justConfirmedTeleport = false;
+    let lastMoveSentAt = 0;
     this._loggedLpVec3Fix = false;
+    this._loggedTickEndFix = false;
+    this._tickEndCount = 0;
+    this._droppedDupMoveCount = 0;
     this._packetHead = 0;
 
     const resolveProtocolQuirks = () => {
@@ -21,14 +28,16 @@ const packetSanitizerMethods = {
       cachedVersion = ver;
       isShiftedEntityAction = false;
       usesLpVec3Velocity = false;
+      hasTickEndPacket = false;
       try {
         const mcData = require('minecraft-data')(ver);
-        const eaSchema = mcData &&
+        const toServerTypes = mcData &&
           mcData.protocol &&
           mcData.protocol.play &&
           mcData.protocol.play.toServer &&
-          mcData.protocol.play.toServer.types &&
-          mcData.protocol.play.toServer.types.packet_entity_action;
+          mcData.protocol.play.toServer.types;
+        hasTickEndPacket = Boolean(toServerTypes && toServerTypes.packet_tick_end);
+        const eaSchema = toServerTypes && toServerTypes.packet_entity_action;
         const actionField = Array.isArray(eaSchema) && Array.isArray(eaSchema[1])
           ? eaSchema[1].find((f) => f && f.name === 'actionId')
           : null;
@@ -50,6 +59,7 @@ const packetSanitizerMethods = {
       } catch (_) {
         isShiftedEntityAction = false;
         usesLpVec3Velocity = false;
+        hasTickEndPacket = false;
       }
     };
 
@@ -139,11 +149,37 @@ const packetSanitizerMethods = {
 
     bot._client.write = (name, params, ...rest) => {
       let outParams = params;
+      const now = Date.now();
+      const isMovePacket = MOVE_PACKETS.has(name);
 
-      if (MOVE_PACKETS.has(name)) {
+      if (isMovePacket) {
+        resolveProtocolQuirks();
+
+        // Guard 1: Never send pre-spawn (0,0,0) movement packets before server sends initial `position`
+        // (prevents "(0,0,0) -> spawn" `moved too quickly!` warnings on login/world-switch).
+        if (
+          !hasReceivedServerPosition &&
+          !justConfirmedTeleport &&
+          params &&
+          params.x === 0 &&
+          params.y === 0 &&
+          params.z === 0
+        ) {
+          this._droppedDupMoveCount = (this._droppedDupMoveCount || 0) + 1;
+          return true;
+        }
+
+        // Guard 2: Paper 26.3+ & AntiCheat TickTimer strictly enforce <= 1 movement packet per tick.
+        // Suppress duplicate movement packets within 30ms unless acknowledging a server teleport_confirm.
+        if (hasTickEndPacket && !justConfirmedTeleport && lastMoveSentAt > 0 && (now - lastMoveSentAt) < 30) {
+          this._droppedDupMoveCount = (this._droppedDupMoveCount || 0) + 1;
+          return true;
+        }
+
         outParams = sanitizeMovePacket(params);
       } else if (name === 'teleport_confirm' && params && typeof params === 'object') {
         outParams = { teleportId: Math.trunc(Number(params.teleportId) || 0) };
+        justConfirmedTeleport = true;
       } else if (name === 'entity_action' && params && typeof params === 'object') {
         if (params.actionId === 'start_elytra_flying') {
           outParams = { ...params, actionId: 'start_fall_flying' };
@@ -157,12 +193,29 @@ const packetSanitizerMethods = {
         }
       }
 
-      const now = Date.now();
       this._packetTimestamps.push(now);
       if (this._packetTimestamps.length - this._packetHead > 256) {
         this._prunePacketTimestamps(now);
       }
-      return origWrite(name, outParams, ...rest);
+      const res = origWrite(name, outParams, ...rest);
+
+      // Paper 26.3+ strictly requires `tick_end` (ClientTickEndPacket) after each movement packet
+      // to reset the per-tick movement counter and avoid "Invalid move player packet received".
+      // Emit synchronously right after the move packet so NO second move packet can ever precede it.
+      if (isMovePacket) {
+        lastMoveSentAt = now;
+        justConfirmedTeleport = false;
+        if (hasTickEndPacket && (!bot._client.state || bot._client.state === 'play')) {
+          try {
+            origWrite('tick_end', {});
+            this._tickEndCount = (this._tickEndCount || 0) + 1;
+          } catch (_) {
+            // Socket closed before tick_end flushed
+          }
+        }
+      }
+
+      return res;
     };
 
     if (typeof bot._client.on === 'function') {
@@ -208,7 +261,12 @@ const packetSanitizerMethods = {
           if (Number.isFinite(e.pitch) === false) e.pitch = 0;
         });
         bot.on('inject_allowed', () => setImmediate(ensureVelocityFixLast));
-        bot.on('login', ensureVelocityFixLast);
+        bot.on('login', () => {
+          hasReceivedServerPosition = false;
+          justConfirmedTeleport = false;
+          lastMoveSentAt = 0;
+          ensureVelocityFixLast();
+        });
         bot.on('spawn', () => {
           ensureVelocityFixLast();
           resolveProtocolQuirks();
@@ -216,10 +274,20 @@ const packetSanitizerMethods = {
             this._loggedLpVec3Fix = true;
             this.log('Applied MC 1.21.9+ lpVec3 entity_velocity knockback fix (post-plugin order).');
           }
+          if (hasTickEndPacket && typeof this.log === 'function' && !this._loggedTickEndFix) {
+            this._loggedTickEndFix = true;
+            this.log('Enabled MC 1.21.2+/26.x client tick_end packet compliance (Paper 26.3+ fix).');
+          }
         });
       }
 
-      bot._client.on('position', () => {
+      bot._client.on('position', (pkt) => {
+        hasReceivedServerPosition = true;
+        if (pkt && typeof pkt === 'object') {
+          if (Number.isFinite(pkt.x)) lastGood.x = pkt.x;
+          if (Number.isFinite(pkt.y)) lastGood.y = pkt.y;
+          if (Number.isFinite(pkt.z)) lastGood.z = pkt.z;
+        }
         this.lastTeleportAt = Date.now();
         if (this.aerial && typeof this.aerial.notifyTeleport === 'function') {
           this.aerial.notifyTeleport(4);
